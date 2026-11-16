@@ -28,6 +28,7 @@ import (
 
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/authenticator"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/paging"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/serviceurl"
 )
 
 // SecurityGroupByNameNotFound represents an error when security group is not found by name.
@@ -676,8 +677,9 @@ const serviceURLForm = "an absolute https URL of the regional VPC API, for examp
 //   - serviceURL is the VPC API endpoint including the API version path, for example
 //     https://us-south.iaas.cloud.ibm.com/v1 (endpoints.FetchVPCEndpoint returns it for a region and honours
 //     --service-endpoint). It must be an absolute https URL without user information, because auth adds a bearer
-//     token to every request and that token must never travel in plain text. It must also end at the path, without a
-//     query or fragment, because go-sdk-core appends each operation path (for example /vpcs) to it.
+//     token to every request and that token must never travel in plain text. An "@" after the host counts as user
+//     information (serviceurl.HasAtAfterHost). It must also end at the path, without a query or fragment, because
+//     go-sdk-core appends each operation path (for example /vpcs) to it.
 //   - auth authenticates every request. It must not be nil, including a typed nil such as (*core.IamAuthenticator)(nil):
 //     there is deliberately no fallback to the environment.
 //
@@ -756,25 +758,31 @@ func newServiceWithAuthenticator(serviceURL string, auth core.Authenticator) (*S
 }
 
 // validateServiceURL returns an error unless serviceURL is an absolute https URL with a host, no user information and
-// no query or fragment. The messages print the URL only in the form printableURL returns, so neither a password nor a
-// query or fragment typed into it reaches a log or a condition.
+// no query or fragment. The messages print the URL only in the form serviceurl.Printable returns, and a URL that does
+// not parse only as serviceurl.ParseFailureReason describes it, so no user information, query or fragment typed into
+// it (any of them may carry a token) reaches a log or a condition. A URL that passes holds no user information in any
+// form, so newServiceWithAuthenticator may print it as it is.
 func validateServiceURL(serviceURL string) error {
 	if serviceURL == "" {
 		return fmt.Errorf("VPC service URL is empty: pass %s", serviceURLForm)
 	}
 	parsed, err := url.Parse(serviceURL)
 	if err != nil {
-		// url.Parse returns a *url.Error whose text quotes the raw input, which may hold a password; only the reason it
-		// wraps is printed.
-		return fmt.Errorf("VPC service URL is not a valid URL (%v): pass %s", errors.Unwrap(err), serviceURLForm)
+		// url.Parse's error quotes the raw input, and several of the reasons it wraps quote a part of it (an invalid
+		// port, for example, quotes the rest of a password that holds a "/"), so only the kind of problem is printed.
+		return fmt.Errorf("VPC service URL is not a valid URL (%s): pass %s", serviceurl.ParseFailureReason(err), serviceURLForm)
 	}
-	if parsed.User != nil {
+	// User information that holds a "/", "?" or "#" leaves parsed.User nil: url.Parse ends the host there and leaves the
+	// "@" after it (serviceurl.HasAtAfterHost). It is rejected here too, and Printable does not show it; otherwise
+	// "https://<token>/<rest>@host/v1" would pass and reach the logs as it is, through newServiceWithAuthenticator's
+	// error that names the URL and through go-sdk-core's transport errors.
+	if parsed.User != nil || serviceurl.HasAtAfterHost(parsed) {
 		return fmt.Errorf("VPC service URL %q must not contain user information (credentials come only from the authenticator): pass %s",
-			printableURL(parsed), serviceURLForm)
+			serviceurl.Printable(parsed), serviceURLForm)
 	}
 	// url.Parse lower-cases the scheme, so "HTTPS://" is accepted; an opaque URL such as "https:host" has no Host.
 	if parsed.Scheme != "https" || parsed.Host == "" {
-		return fmt.Errorf("VPC service URL %q is not %s", printableURL(parsed), serviceURLForm)
+		return fmt.Errorf("VPC service URL %q is not %s", serviceurl.Printable(parsed), serviceURLForm)
 	}
 	// go-sdk-core builds each request URL by appending the operation path to the service URL string (go-sdk-core
 	// v5.25.3, core/request_builder.go), so with "https://host/v1?debug" a ListVpcs call would send GET /v1 with the
@@ -784,22 +792,7 @@ func validateServiceURL(serviceURL string) error {
 	if parsed.RawQuery != "" || parsed.ForceQuery || strings.Contains(serviceURL, "#") {
 		return fmt.Errorf("VPC service URL must end at the API version path: remove the query (?...) or fragment (#...) "+
 			"after %q, because the client appends each operation path (for example /vpcs) to the URL; pass %s",
-			printableURL(parsed), serviceURLForm)
+			serviceurl.Printable(parsed), serviceURLForm)
 	}
 	return nil
-}
-
-// printableURL returns the form of a rejected service URL that errors print: the password replaced by "xxxxx"
-// (url.URL.Redacted) and the query and fragment dropped, because both are arbitrary text that may carry a token. The
-// scheme, user name, host and path stay, so the operator still recognizes the value that was rejected.
-//
-// Parameters:
-//   - parsed is the URL as url.Parse returned it; it is not modified.
-func printableURL(parsed *url.URL) string {
-	shown := *parsed
-	shown.RawQuery = ""
-	shown.ForceQuery = false
-	shown.Fragment = ""
-	shown.RawFragment = ""
-	return shown.Redacted()
 }

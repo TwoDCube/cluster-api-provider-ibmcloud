@@ -21,7 +21,6 @@ import (
 	"crypto/x509"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"testing"
 	"time"
 
@@ -147,8 +146,8 @@ func TestNewServiceWithAuthenticator(t *testing.T) {
 			name:       "user information in the URL is rejected and redacted",
 			serviceURL: "https://user:hunter2@us-south.iaas.cloud.ibm.com/v1",
 			auth:       validAuth,
-			wantErr:    []string{"must not contain user information", "user:xxxxx@"},
-			notInErr:   []string{"hunter2"},
+			wantErr:    []string{"must not contain user information", `"https://xxxxx@us-south.iaas.cloud.ibm.com/v1"`},
+			notInErr:   []string{"hunter2", "//user"},
 		},
 		{
 			// The scheme is checked before the query, so this error must not print the query either.
@@ -159,18 +158,28 @@ func TestNewServiceWithAuthenticator(t *testing.T) {
 			notInErr:   []string{"apikey", "fake-query-key"},
 		},
 		{
+			// A URL without a host is not printed at all (serviceurl.Printable).
 			name:       "fragment with a secret in a URL without host is not printed",
 			serviceURL: "https:///v1#fake-fragment-token",
 			auth:       validAuth,
-			wantErr:    []string{`"https:///v1" is not an absolute https URL`},
+			wantErr:    []string{`"(URL without a host, not shown)" is not an absolute https URL`},
 			notInErr:   []string{"fake-fragment-token"},
 		},
 		{ //nolint:gosec // G101: "hunter2" and the query key are fake; the case proves neither reaches the error.
 			name:       "user information and a query with a secret are neither printed",
 			serviceURL: "https://user:hunter2@us-south.iaas.cloud.ibm.com/v1?apikey=fake-query-key",
 			auth:       validAuth,
-			wantErr:    []string{"must not contain user information", `"https://user:xxxxx@us-south.iaas.cloud.ibm.com/v1"`},
-			notInErr:   []string{"hunter2", "apikey", "fake-query-key"},
+			wantErr:    []string{"must not contain user information", `"https://xxxxx@us-south.iaas.cloud.ibm.com/v1"`},
+			notInErr:   []string{"hunter2", "//user", "apikey", "fake-query-key"},
+		},
+		{
+			// url.Parse ends the host at the "/" inside the token, so parsed.User is nil and the host is the token's first
+			// part; the "@" after the host still marks it as user information (serviceurl.HasAtAfterHost).
+			name:       "user information holding a slash is rejected and not printed",
+			serviceURL: "https://fake-token-head/fake-token-tail@us-south.iaas.cloud.ibm.com/v1",
+			auth:       validAuth,
+			wantErr:    []string{"must not contain user information", `"(URL with an @ after the host, not shown)"`},
+			notInErr:   []string{"fake-token-head", "fake-token-tail"},
 		},
 	}
 
@@ -200,50 +209,57 @@ func TestNewServiceWithAuthenticator(t *testing.T) {
 	}
 }
 
-// TestPrintableURL covers the form in which URL errors print a rejected service URL: no password, query or fragment.
-func TestPrintableURL(t *testing.T) {
+// TestServiceURLErrorsCarryNoSecret proves through both public constructors that a service URL's secrets never reach
+// an error: when the service URL holds user information, a query or a fragment, or does not parse at all, no part of
+// any of them reaches the error. The first six URLs are the plain cases; each secrets entry lists what the error must
+// not contain. The cases with plantedSecret are the ones that net/url's own error texts would print: net/url quotes a
+// password with a "/" as an invalid port, the first characters of an invalid escape, and a URL without "//" keeps a
+// user name and password as its scheme and opaque part. The last five hold user information with a "/", "?" or "#"
+// before the "@", which url.Parse splits into a host and a path, query or fragment; a check of the parsed user
+// information alone would accept the https form with a "/", and a password with leading digits leaves a valid host
+// and port.
+func TestServiceURLErrorsCarryNoSecret(t *testing.T) {
+	const plantedSecret = "planted-s3cr3t"
+	validAuth := &core.BearerTokenAuthenticator{BearerToken: "test-token"}
 	testCases := []struct {
-		name  string
-		input string
-		want  string
+		serviceURL string
+		secrets    []string
 	}{
-		{
-			name:  "URL without anything to drop is unchanged",
-			input: testVPCURL,
-			want:  testVPCURL,
+		{serviceURL: "https://u:p@h/x", secrets: []string{"u:p", "//u:", "p@"}}, //nolint:gosec // G101: a fake password.
+		{serviceURL: "https://u@h/x", secrets: []string{"//u@", "u@h"}},
+		{serviceURL: "https://h/x?apikey=S", secrets: []string{"apikey", "=S", "x?"}},
+		{serviceURL: "https://h/x#S", secrets: []string{"#S", "x#"}},
+		{serviceURL: "https://h/x?", secrets: []string{"x?"}},
+		{serviceURL: "https://u:S@h/%zz", secrets: []string{"u:S", "S@", "%zz", "zz"}}, //nolint:gosec // G101: a fake password.
+		{serviceURL: "https://u:" + plantedSecret + "/x@h/v1", secrets: []string{plantedSecret, "//u:"}},
+		{serviceURL: "https://u:%" + plantedSecret + "@h/v1", secrets: []string{"%pl", plantedSecret}},
+		{serviceURL: "u:" + plantedSecret + "@h/v1", secrets: []string{plantedSecret, "u:"}},
+		{serviceURL: "https://" + plantedSecret + "?" + plantedSecret + "@h/v1", secrets: []string{plantedSecret}},
+		{serviceURL: "https://" + plantedSecret + "#" + plantedSecret + "@h/v1", secrets: []string{plantedSecret}},
+		{serviceURL: "http://" + plantedSecret + "/" + plantedSecret + "@h/v1", secrets: []string{plantedSecret}},
+		{serviceURL: "https://" + plantedSecret + "/" + plantedSecret + "@h/v1", secrets: []string{plantedSecret}},
+		{serviceURL: "https://u:1234/" + plantedSecret + "@h/v1?", secrets: []string{plantedSecret, "u:1234", "1234"}},
+	}
+	constructors := map[string]func(serviceURL string) (Vpc, error){
+		"NewServiceWithAuthenticator": func(serviceURL string) (Vpc, error) {
+			return NewServiceWithAuthenticator(serviceURL, validAuth)
 		},
-		{
-			name:  "query and fragment are dropped",
-			input: testVPCURL + "?apikey=fake-query-key#fake-fragment",
-			want:  testVPCURL,
-		},
-		{
-			name:  "empty query and empty fragment are dropped",
-			input: testVPCURL + "?#",
-			want:  testVPCURL,
-		},
-		{ //nolint:gosec // G101: "hunter2" is a fake password; the case proves it is redacted.
-			name:  "password is redacted and the user name kept",
-			input: "https://user:hunter2@us-south.iaas.cloud.ibm.com/v1?apikey=fake-query-key",
-			want:  "https://user:xxxxx@us-south.iaas.cloud.ibm.com/v1",
-		},
-		{
-			name:  "opaque URL keeps its opaque part",
-			input: "https:us-south.iaas.cloud.ibm.com?apikey=fake-query-key",
-			want:  "https:us-south.iaas.cloud.ibm.com",
+		"NewServiceWithAuthenticatorAndTimeout": func(serviceURL string) (Vpc, error) {
+			return NewServiceWithAuthenticatorAndTimeout(serviceURL, validAuth, time.Second)
 		},
 	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			g := NewWithT(t)
-			parsed, err := url.Parse(tc.input)
-			g.Expect(err).ToNot(HaveOccurred())
-			before := *parsed
-
-			g.Expect(printableURL(parsed)).To(Equal(tc.want))
-			g.Expect(*parsed).To(Equal(before), "printableURL must not modify its argument")
-		})
+	for name, construct := range constructors {
+		for _, tc := range testCases {
+			t.Run(name+"/"+tc.serviceURL, func(t *testing.T) {
+				g := NewWithT(t)
+				svc, err := construct(tc.serviceURL)
+				g.Expect(svc).To(BeNil())
+				g.Expect(err).To(MatchError(ContainSubstring("VPC service URL")))
+				for _, secret := range tc.secrets {
+					g.Expect(err.Error()).NotTo(ContainSubstring(secret))
+				}
+			})
+		}
 	}
 }
 
