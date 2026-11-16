@@ -38,6 +38,16 @@ const (
 	// KubeconfigClusterIDAnnotation records the IBM cluster that issued the credential in the Secret. clusterctl move
 	// carries the Secret with the control plane, so this is the durable copy of status.clusterID.
 	KubeconfigClusterIDAnnotation = KubeconfigAnnotationPrefix + "cluster-id"
+
+	// CreateHoldAnnotation is written by the IBMCloudManagedControlPlane controller, on the control plane, after IBM
+	// definitively refused a create request (400, 401, 403, 422, A0656, or E0007 with no cluster found). Its value is a
+	// time in RFC 3339 (UTC) before which the controller sends no new create request: the refusal changes status, and
+	// without the hold the reconcile that change triggers would send the same request at once. The controller removes it
+	// with its next create request and once the control plane is bound to an IBM cluster. It is an annotation, like the
+	// kubeconfig annotations (KubeconfigAnnotationPrefix), because no status field is spent on it. Its effect is bounded:
+	// the controller ignores a value more than 12 minutes ahead (its create refusal hold) and ends the hold on any spec
+	// change, so an edit shifts the next create request by at most 12 minutes and can never stop creates.
+	CreateHoldAnnotation = "ibmcloudmanaged.controlplane.cluster.x-k8s.io/create-hold-until"
 )
 
 // Distribution selects the IBM Cloud offering.

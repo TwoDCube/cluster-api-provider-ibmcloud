@@ -63,6 +63,13 @@ func TestKubeconfigClusterIDAnnotation(t *testing.T) {
 	g.Expect(controlplanev1.KubeconfigClusterIDAnnotation).To(Equal("ibmcloudmanaged.controlplane.cluster.x-k8s.io/cluster-id"))
 }
 
+// TestCreateHoldAnnotation pins the create-hold key: a control plane written by an earlier controller version (or
+// carried by clusterctl move) keeps its hold only while the key stays the same.
+func TestCreateHoldAnnotation(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(controlplanev1.CreateHoldAnnotation).To(Equal("ibmcloudmanaged.controlplane.cluster.x-k8s.io/create-hold-until"))
+}
+
 // TestConditionCatalogueIsValid runs every declared condition type and reason through the API server's own condition
 // validation, so a reason the server would reject fails here instead of in a status patch.
 func TestConditionCatalogueIsValid(t *testing.T) {
