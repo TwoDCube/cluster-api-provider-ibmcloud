@@ -71,6 +71,12 @@ rules:
   - list
   - watch
 - apiGroups:
+  - controlplane.cluster.x-k8s.io
+  resources:
+  - ibmcloudmanagedcontrolplanes
+  verbs:
+  - get
+- apiGroups:
   - infrastructure.cluster.x-k8s.io
   resources:
   - ibmpowervsclusters
