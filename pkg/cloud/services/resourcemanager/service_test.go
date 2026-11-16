@@ -20,7 +20,6 @@ import (
 	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -119,11 +118,13 @@ func TestNewServiceWithAuthenticatorAndTimeout(t *testing.T) {
 			wantErr:    []string{"resource manager service URL is empty", resourcemanagerv2.DefaultServiceURL},
 		},
 		{
+			// A URL without a host is not printed at all (serviceurl.Printable): without "//" a user name and password
+			// would be part of it.
 			name:       "relative URL without scheme",
 			serviceURL: "resource-controller.cloud.ibm.com",
 			auth:       validAuth,
 			timeout:    30 * time.Second,
-			wantErr:    []string{`"resource-controller.cloud.ibm.com" is not an absolute URL`},
+			wantErr:    []string{`"(URL without a host, not shown)" is not an absolute URL`},
 		},
 		{
 			name:       "other scheme",
@@ -151,8 +152,8 @@ func TestNewServiceWithAuthenticatorAndTimeout(t *testing.T) {
 			serviceURL: "https://user:hunter2@resource-controller.cloud.ibm.com",
 			auth:       validAuth,
 			timeout:    30 * time.Second,
-			wantErr:    []string{"must not contain user information", "user:xxxxx@"},
-			notInErr:   []string{"hunter2"},
+			wantErr:    []string{"must not contain user information", `"https://xxxxx@resource-controller.cloud.ibm.com"`},
+			notInErr:   []string{"hunter2", "//user"},
 		},
 		{
 			name:       "URL ending at a trailing slash",
@@ -207,7 +208,7 @@ func TestNewServiceWithAuthenticatorAndTimeout(t *testing.T) {
 			serviceURL: "https:///#fake-fragment-token",
 			auth:       validAuth,
 			timeout:    30 * time.Second,
-			wantErr:    []string{`"https:///" is not an absolute URL`},
+			wantErr:    []string{`"(URL without a host, not shown)" is not an absolute URL`},
 			notInErr:   []string{"fake-fragment-token"},
 		},
 		{ //nolint:gosec // G101: "hunter2" and the query key are fake; the case proves neither reaches the error.
@@ -215,8 +216,19 @@ func TestNewServiceWithAuthenticatorAndTimeout(t *testing.T) {
 			serviceURL: "https://user:hunter2@resource-controller.cloud.ibm.com/?apikey=fake-query-key",
 			auth:       validAuth,
 			timeout:    30 * time.Second,
-			wantErr:    []string{"must not contain user information", `"https://user:xxxxx@resource-controller.cloud.ibm.com/"`},
-			notInErr:   []string{"hunter2", "apikey", "fake-query-key"},
+			wantErr:    []string{"must not contain user information", `"https://xxxxx@resource-controller.cloud.ibm.com/"`},
+			notInErr:   []string{"hunter2", "//user", "apikey", "fake-query-key"},
+		},
+		{
+			// url.Parse ends the host at the "/" inside the token, so parsed.User is nil and the host is the token's first
+			// part; the "@" after the host still marks it as user information (serviceurl.HasAtAfterHost). This client
+			// admits http, so the URL passed every other check.
+			name:       "user information holding a slash in a plain http URL is rejected and not printed",
+			serviceURL: "http://fake-token-head/fake-token-tail@resource-controller.cloud.ibm.com",
+			auth:       validAuth,
+			timeout:    30 * time.Second,
+			wantErr:    []string{"must not contain user information", `"(URL with an @ after the host, not shown)"`},
+			notInErr:   []string{"fake-token-head", "fake-token-tail"},
 		},
 	}
 
@@ -273,49 +285,46 @@ func TestNewServiceWithAuthenticatorAndTimeout(t *testing.T) {
 	})
 }
 
-// TestPrintableURL covers the form in which URL errors print a rejected service URL: no password, query or fragment.
-func TestPrintableURL(t *testing.T) {
+// TestServiceURLErrorsCarryNoSecret proves through the public constructor that nothing secret typed into the service
+// URL reaches an error: when the service URL holds user information, a query or a fragment, or does not parse at all,
+// no part of any of them reaches the error. The first six URLs are the plain cases; each secrets entry lists what the
+// error must not contain. The cases with plantedSecret are the ones a url.Parse error or a printed URL would leak:
+// net/url quotes a password with a "/" as an invalid port, the first characters of an invalid escape, and a URL without
+// "//" keeps a user name and password as its scheme and opaque part. The last five hold user information with a "/",
+// "?" or "#" before the "@", which url.Parse splits into a host and a path, query or fragment; both forms with a "/"
+// parse as valid URLs without user information (this client admits http), and a password with leading digits leaves a
+// valid host and port.
+func TestServiceURLErrorsCarryNoSecret(t *testing.T) {
+	const plantedSecret = "planted-s3cr3t"
+	validAuth := &core.BearerTokenAuthenticator{BearerToken: "test-token"}
 	testCases := []struct {
-		name  string
-		input string
-		want  string
+		serviceURL string
+		secrets    []string
 	}{
-		{
-			name:  "URL without anything to drop is unchanged",
-			input: resourcemanagerv2.DefaultServiceURL,
-			want:  resourcemanagerv2.DefaultServiceURL,
-		},
-		{
-			name:  "query and fragment are dropped",
-			input: "https://resource-controller.cloud.ibm.com/api?apikey=fake-query-key#fake-fragment",
-			want:  "https://resource-controller.cloud.ibm.com/api",
-		},
-		{
-			name:  "empty query and empty fragment are dropped",
-			input: "https://resource-controller.cloud.ibm.com/api?#",
-			want:  "https://resource-controller.cloud.ibm.com/api",
-		},
-		{ //nolint:gosec // G101: "hunter2" is a fake password; the case proves it is redacted.
-			name:  "password is redacted and the user name kept",
-			input: "https://user:hunter2@resource-controller.cloud.ibm.com?apikey=fake-query-key",
-			want:  "https://user:xxxxx@resource-controller.cloud.ibm.com",
-		},
-		{
-			name:  "opaque URL keeps its opaque part",
-			input: "https:resource-controller.cloud.ibm.com?apikey=fake-query-key",
-			want:  "https:resource-controller.cloud.ibm.com",
-		},
+		{serviceURL: "https://u:p@h/x", secrets: []string{"u:p", "//u:", "p@"}}, //nolint:gosec // G101: a fake password.
+		{serviceURL: "https://u@h/x", secrets: []string{"//u@", "u@h"}},
+		{serviceURL: "https://h/x?apikey=S", secrets: []string{"apikey", "=S", "x?"}},
+		{serviceURL: "https://h/x#S", secrets: []string{"#S", "x#"}},
+		{serviceURL: "https://h/x?", secrets: []string{"x?"}},
+		{serviceURL: "https://u:S@h/%zz", secrets: []string{"u:S", "S@", "%zz", "zz"}}, //nolint:gosec // G101: a fake password.
+		{serviceURL: "https://u:" + plantedSecret + "/x@h/v2", secrets: []string{plantedSecret, "//u:"}},
+		{serviceURL: "https://u:%" + plantedSecret + "@h/v2", secrets: []string{"%pl", plantedSecret}},
+		{serviceURL: "u:" + plantedSecret + "@h/v2", secrets: []string{plantedSecret, "u:"}},
+		{serviceURL: "https://" + plantedSecret + "?" + plantedSecret + "@h/v2", secrets: []string{plantedSecret}},
+		{serviceURL: "https://" + plantedSecret + "#" + plantedSecret + "@h/v2", secrets: []string{plantedSecret}},
+		{serviceURL: "http://" + plantedSecret + "/" + plantedSecret + "@h/v2", secrets: []string{plantedSecret}},
+		{serviceURL: "https://" + plantedSecret + "/" + plantedSecret + "@h/v2", secrets: []string{plantedSecret}},
+		{serviceURL: "https://u:1234/" + plantedSecret + "@h/v2?", secrets: []string{plantedSecret, "u:1234", "1234"}},
 	}
-
 	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
+		t.Run(tc.serviceURL, func(t *testing.T) {
 			g := NewWithT(t)
-			parsed, err := url.Parse(tc.input)
-			g.Expect(err).ToNot(HaveOccurred())
-			before := *parsed
-
-			g.Expect(printableURL(parsed)).To(Equal(tc.want))
-			g.Expect(*parsed).To(Equal(before), "printableURL must not modify its argument")
+			svc, err := NewServiceWithAuthenticatorAndTimeout(tc.serviceURL, validAuth, time.Second)
+			g.Expect(svc).To(BeNil())
+			g.Expect(err).To(MatchError(ContainSubstring("resource manager service URL")))
+			for _, secret := range tc.secrets {
+				g.Expect(err.Error()).NotTo(ContainSubstring(secret))
+			}
 		})
 	}
 }

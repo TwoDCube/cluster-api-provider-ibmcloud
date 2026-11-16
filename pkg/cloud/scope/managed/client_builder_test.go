@@ -23,7 +23,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -220,14 +219,27 @@ func TestNewProdClientBuilderValidation(t *testing.T) {
 				// A URL with user information on purpose: the error must print it redacted.
 				o.ServiceEndpoints = []endpoints.ServiceEndpoint{{ID: "vpc", Region: testRegion, URL: "https://user:secret@us-south.iaas.cloud.ibm.com/v1"}} //nolint:gosec // synthetic test value, never a credential
 			},
-			wantErr: []string{"us-south:vpc=https://user:xxxxx@us-south.iaas.cloud.ibm.com/v1"},
+			wantErr:  []string{"us-south:vpc=https://xxxxx@us-south.iaas.cloud.ibm.com/v1"},
+			notInErr: []string{"secret", "//user"},
 		},
 		{
+			// url.Parse ends the host at the "/" inside the token, so the URL has no parsed user information and was
+			// accepted; cachedClient would then print it as it is. The "@" after the host marks it
+			// (serviceurl.HasAtAfterHost), and serviceurl.Printable does not show it.
+			name: "vpc endpoint with user information holding a slash is named, not shown",
+			mutate: func(o *ProdClientBuilderOptions) {
+				o.ServiceEndpoints = []endpoints.ServiceEndpoint{{ID: "vpc", Region: testRegion, URL: "https://fake-token-head/fake-token-tail@us-south.private.iaas.cloud.ibm.com/v1"}}
+			},
+			wantErr:  []string{"us-south:vpc=(URL with an @ after the host, not shown) is not an absolute https URL without user information"},
+			notInErr: []string{"fake-token-head", "fake-token-tail"},
+		},
+		{
+			// A URL without a host is not printed at all (serviceurl.Printable).
 			name: "rm endpoint without host is named",
 			mutate: func(o *ProdClientBuilderOptions) {
 				o.ServiceEndpoints = []endpoints.ServiceEndpoint{{ID: "rm", Region: testRegion, URL: "https:///v2"}}
 			},
-			wantErr: []string{"us-south:rm=https:///v2 is not an absolute https URL"},
+			wantErr: []string{"us-south:rm=(URL without a host, not shown) is not an absolute https URL"},
 		},
 		{
 			// The flag parser admits it; the constructor would reject it only at the first reconcile.
@@ -266,8 +278,8 @@ func TestNewProdClientBuilderValidation(t *testing.T) {
 			mutate: func(o *ProdClientBuilderOptions) {
 				o.ServiceEndpoints = []endpoints.ServiceEndpoint{{ID: "rm", Region: testRegion, URL: "http://user:secret@private.resource-controller.cloud.ibm.com/?apikey=fake-query-key"}} //nolint:gosec // synthetic test value, never a credential
 			},
-			wantErr:  []string{"us-south:rm=http://user:xxxxx@private.resource-controller.cloud.ibm.com/ is not an absolute https URL"},
-			notInErr: []string{"secret", "apikey", "fake-query-key"},
+			wantErr:  []string{"us-south:rm=http://xxxxx@private.resource-controller.cloud.ibm.com/ is not an absolute https URL"},
+			notInErr: []string{"secret", "//user", "apikey", "fake-query-key"},
 		},
 		{
 			name: "unparsable endpoint is named without its text",
@@ -824,44 +836,140 @@ func TestNewResourceManager(t *testing.T) {
 	}
 }
 
-// TestPrintableURL covers the form in which errors print a rejected endpoint URL: no password, query or fragment.
-func TestPrintableURL(t *testing.T) {
+// TestValidateBuilderEndpointCarriesNoSecret proves for the start-up check of the --service-endpoint entries of every
+// service the builder uses that no secret in a URL reaches an error: when the URL holds user information, a query or a
+// fragment, or does not parse at all, the entry is rejected and no part of any of them reaches the error. The first six
+// URLs are the cases whose url.Parse error fragments or printed user name used to leak; each secrets entry lists what
+// the error must not contain. The cases with plantedSecret were printed before the error text was redacted: net/url
+// quotes a password with a "/" as an invalid port, the first characters of an invalid escape, and a URL without "//"
+// keeps a user name and password as its scheme and opaque part. The last five hold user information with a "/", "?" or
+// "#" before the "@", which url.Parse splits into a host and a path, query or fragment: the https form with a "/" was
+// even accepted, and a password with leading digits leaves a valid host and port.
+func TestValidateBuilderEndpointCarriesNoSecret(t *testing.T) {
+	const plantedSecret = "planted-s3cr3t"
 	testCases := []struct {
-		name  string
-		input string
-		want  string
+		rawURL  string
+		secrets []string
+	}{
+		{rawURL: "https://u:p@h/x", secrets: []string{"u:p", "//u:", "p@"}}, //nolint:gosec // G101: a fake password.
+		{rawURL: "https://u@h/x", secrets: []string{"//u@", "u@h"}},
+		{rawURL: "https://h/x?apikey=S", secrets: []string{"apikey", "=S", "x?"}},
+		{rawURL: "https://h/x#S", secrets: []string{"#S", "x#"}},
+		{rawURL: "https://h/x?", secrets: []string{"x?"}},
+		{rawURL: "https://u:S@h/%zz", secrets: []string{"u:S", "S@", "%zz", "zz"}}, //nolint:gosec // G101: a fake password.
+		{rawURL: "https://u:" + plantedSecret + "/x@h/v1", secrets: []string{plantedSecret, "//u:"}},
+		{rawURL: "https://u:%" + plantedSecret + "@h/v1", secrets: []string{"%pl", plantedSecret}},
+		{rawURL: "u:" + plantedSecret + "@h/v1", secrets: []string{plantedSecret, "=u:"}},
+		{rawURL: "https://h/v1%23" + plantedSecret, secrets: []string{plantedSecret, "%23"}},
+		{rawURL: "https://" + plantedSecret + "?" + plantedSecret + "@h/v1", secrets: []string{plantedSecret}},
+		{rawURL: "https://" + plantedSecret + "#" + plantedSecret + "@h/v1", secrets: []string{plantedSecret}},
+		{rawURL: "http://" + plantedSecret + "/" + plantedSecret + "@h/v1", secrets: []string{plantedSecret}},
+		{rawURL: "https://" + plantedSecret + "/" + plantedSecret + "@h/v1", secrets: []string{plantedSecret}},
+		{rawURL: "https://u:1234/" + plantedSecret + "@h/v1?", secrets: []string{plantedSecret, "u:1234", "1234"}},
+	}
+	for _, id := range []string{string(endpoints.Containers), string(endpoints.VPC), string(endpoints.RM)} {
+		for _, tc := range testCases {
+			t.Run(id+"="+tc.rawURL, func(t *testing.T) {
+				g := NewWithT(t)
+				err := validateBuilderEndpoint(endpoints.ServiceEndpoint{ID: id, Region: testRegion, URL: tc.rawURL})
+				g.Expect(err).To(MatchError(ContainSubstring("--service-endpoint entry " + testRegion + ":" + id)))
+				for _, secret := range tc.secrets {
+					g.Expect(err.Error()).NotTo(ContainSubstring(secret))
+				}
+			})
+		}
+	}
+}
+
+// TestValidateBuilderEndpointThroughTheFlagParser runs flag values through endpoints.ParseServiceEndpointFlag, the
+// parser cmd/main.go uses, because it rewrites the URL before the builder sees it: url.ParseRequestURI keeps a typed
+// fragment in the path, so "#<token>" arrives as "%23<token>" and only hasFragment's path check rejects it. Like
+// url.Parse, it also ends the host at a "/" or "?" inside user information, so the rest of a token typed there arrives
+// in the path or query with the "@" (serviceurl.HasAtAfterHost); a "#" there makes the parser itself fail, with a
+// message that names no URL.
+func TestValidateBuilderEndpointThroughTheFlagParser(t *testing.T) {
+	const plantedSecret = "planted-s3cr3t"
+	const atAfterHostRejected = "=(URL with an @ after the host, not shown) is not an absolute https URL"
+	testCases := []struct {
+		name         string
+		flag         string
+		wantParseErr bool     // the flag parser itself rejects the value
+		wantErr      string   // substring of the builder's error; empty means the entry is accepted
+		notInErr     []string // further substrings no error may contain, besides plantedSecret
 	}{
 		{
-			name:  "URL without anything to drop is unchanged",
-			input: resourcemanagerv2.DefaultServiceURL,
-			want:  resourcemanagerv2.DefaultServiceURL,
+			name: "a private endpoint is accepted", flag: "us-south:vpc=https://us-south.private.iaas.cloud.ibm.com/v1",
 		},
 		{
-			name:  "query and fragment are dropped",
-			input: "https://us-south.iaas.cloud.ibm.com/v1?apikey=fake-query-key#fake-fragment",
-			want:  "https://us-south.iaas.cloud.ibm.com/v1",
+			name:    "a fragment is rejected and not printed",
+			flag:    "us-south:vpc=https://us-south.private.iaas.cloud.ibm.com/v1#" + plantedSecret,
+			wantErr: "us-south:vpc=https://us-south.private.iaas.cloud.ibm.com/v1 is not an absolute https URL",
 		},
 		{
-			name:  "empty query and empty fragment are dropped",
-			input: "https://us-south.iaas.cloud.ibm.com/v1?#",
-			want:  "https://us-south.iaas.cloud.ibm.com/v1",
+			name:    "an empty fragment is rejected",
+			flag:    "eu-de:containers=https://private.eu-de.containers.cloud.ibm.com/global#",
+			wantErr: "eu-de:containers=https://private.eu-de.containers.cloud.ibm.com/global is not an absolute https URL",
 		},
-		{ //nolint:gosec // G101: "hunter2" is a fake password; the case proves it is redacted.
-			name:  "password is redacted and the user name kept",
-			input: "https://user:hunter2@us-south.iaas.cloud.ibm.com/v1?apikey=fake-query-key",
-			want:  "https://user:xxxxx@us-south.iaas.cloud.ibm.com/v1",
+		{
+			name:    "user information is rejected and not printed",
+			flag:    "us-south:rm=https://u:" + plantedSecret + "@private.resource-controller.cloud.ibm.com",
+			wantErr: "us-south:rm=https://xxxxx@private.resource-controller.cloud.ibm.com is not an absolute https URL",
+		},
+		{
+			// A query with "=" fails in the flag parser itself, with a message that names no URL.
+			name:    "a query without '=' is rejected and not printed",
+			flag:    "us-south:rm=https://private.resource-controller.cloud.ibm.com?" + plantedSecret,
+			wantErr: "us-south:rm=https://private.resource-controller.cloud.ibm.com is not an absolute https URL",
+		},
+		{
+			// It passed every check before: an https URL with a host, no parsed user information, query or fragment.
+			name:    "user information holding a slash is rejected and not shown",
+			flag:    "us-south:vpc=https://" + plantedSecret + "/" + plantedSecret + "@us-south.private.iaas.cloud.ibm.com/v1",
+			wantErr: "us-south:vpc" + atAfterHostRejected,
+		},
+		{
+			name:    "user information holding a slash in a plain http URL is not shown",
+			flag:    "us-south:vpc=http://" + plantedSecret + "/" + plantedSecret + "@us-south.private.iaas.cloud.ibm.com/v1",
+			wantErr: "us-south:vpc" + atAfterHostRejected,
+		},
+		{
+			name:    "user information holding a question mark is not shown",
+			flag:    "us-south:vpc=https://" + plantedSecret + "?" + plantedSecret + "@us-south.private.iaas.cloud.ibm.com/v1",
+			wantErr: "us-south:vpc" + atAfterHostRejected,
+		},
+		{
+			// The digits before the "/" form a valid port, so the user name and the digits were the host and port.
+			name:     "a password with leading digits and a slash is not shown",
+			flag:     "us-south:rm=https://admin:2024/" + plantedSecret + "@private.resource-controller.cloud.ibm.com?",
+			wantErr:  "us-south:rm" + atAfterHostRejected,
+			notInErr: []string{"admin", "2024"},
+		},
+		{
+			name:         "user information holding a hash fails in the flag parser",
+			flag:         "us-south:vpc=https://" + plantedSecret + "#" + plantedSecret + "@us-south.private.iaas.cloud.ibm.com/v1",
+			wantParseErr: true,
 		},
 	}
-
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
-			parsed, err := url.Parse(tc.input)
-			g.Expect(err).ToNot(HaveOccurred())
-			before := *parsed
-
-			g.Expect(printableURL(parsed)).To(Equal(tc.want))
-			g.Expect(*parsed).To(Equal(before), "printableURL must not modify its argument")
+			parsed, err := endpoints.ParseServiceEndpointFlag(tc.flag)
+			if tc.wantParseErr {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).NotTo(ContainSubstring(plantedSecret))
+				return
+			}
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(parsed).To(HaveLen(1))
+			err = validateBuilderEndpoint(parsed[0])
+			if tc.wantErr == "" {
+				g.Expect(err).NotTo(HaveOccurred())
+				return
+			}
+			g.Expect(err).To(MatchError(ContainSubstring(tc.wantErr)))
+			for _, secret := range append([]string{plantedSecret}, tc.notInErr...) {
+				g.Expect(err.Error()).NotTo(ContainSubstring(secret))
+			}
 		})
 	}
 }
