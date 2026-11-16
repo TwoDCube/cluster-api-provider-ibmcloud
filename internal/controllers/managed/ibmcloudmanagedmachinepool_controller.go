@@ -36,12 +36,14 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/controllers/clustercache"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	"sigs.k8s.io/cluster-api/util/finalizers"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/cluster-api/util/paused"
 	"sigs.k8s.io/cluster-api/util/predicates"
@@ -74,8 +76,9 @@ var machinePoolOwnedConditions = []string{
 
 // IBMCloudManagedMachinePoolReconciler reconciles IBMCloudManagedMachinePool objects, the InfraMachinePool of a managed
 // (IKS or ROKS) cluster: one IBM worker pool. It adopts or creates the pool, publishes its workers as
-// spec.providerIDList and grows it; every IBM call goes through the scope, with the credentials resolved from the
-// Cluster's IBMCloudManagedCluster.
+// spec.providerIDList and grows it, and on a stand-alone deletion drains every Node of the pool before it removes the
+// IBM pool; every IBM call goes through the scope, with the credentials resolved from the Cluster's
+// IBMCloudManagedCluster.
 type IBMCloudManagedMachinePoolReconciler struct {
 	// Client is the manager's client.
 	Client client.Client
@@ -99,14 +102,18 @@ type IBMCloudManagedMachinePoolReconciler struct {
 // The controller writes the pool's spec.providerIDList and status, reads its owners and lists the pools of a Cluster.
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=ibmcloudmanagedmachinepools,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=ibmcloudmanagedmachinepools/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=ibmcloudmanagedmachinepools/finalizers,verbs=update
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=ibmcloudmanagedclusters,verbs=get;list;watch
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=ibmcloudmanagedcontrolplanes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machinepools;clusters,verbs=get;list;watch
+// The disruption token, which allows one worker removal at a time per Cluster, is a Lease per Cluster; the drain
+// itself runs in the workload cluster with its admin credential, which needs no management-cluster RBAC.
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;create;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile reconciles one IBMCloudManagedMachinePool in Cluster API's KubeadmControlPlane order: object, owning
-// MachinePool, Cluster, pause, deletion, patch helper, scope. No IBM call happens before the owner is known or while
-// paused.
+// MachinePool, Cluster, finalizer, pause, patch helper, scope, then deletion or the normal flow. No IBM call happens
+// before the owner is known or while paused.
 func (r *IBMCloudManagedMachinePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, reterr error) {
 	log := ctrl.LoggerFrom(ctx)
 
@@ -127,14 +134,20 @@ func (r *IBMCloudManagedMachinePoolReconciler) Reconcile(ctx context.Context, re
 	log = log.WithValues("MachinePool", klog.KObj(machinePool), "Cluster", klog.KObj(cluster))
 	ctx = ctrl.LoggerInto(ctx, log)
 
+	// The finalizer comes only after the owner: a pool no MachinePool references never gets one and can always be
+	// deleted. The update event of the added finalizer brings the object back.
+	if added, err := finalizers.EnsureFinalizer(ctx, r.Client, pool, infrav1.IBMCloudManagedMachinePoolFinalizer); err != nil || added {
+		return ctrl.Result{}, err
+	}
+
 	// Pause is checked before deletion handling, so that a paused object causes no IBM and no workload-cluster call
 	// on any path: clusterctl move pauses the Cluster, and a paused object must not act while it moves.
 	if isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, pool); err != nil || isPaused || requeue {
 		return ctrl.Result{}, err
 	}
 
-	if !pool.DeletionTimestamp.IsZero() {
-		// This controller sets no finalizer yet, so nothing holds the object and nothing in IBM Cloud is removed.
+	if !pool.DeletionTimestamp.IsZero() && !controllerutil.ContainsFinalizer(pool, infrav1.IBMCloudManagedMachinePoolFinalizer) {
+		// Another finalizer holds an object this controller never finalized: nothing of it is removed in IBM Cloud.
 		return ctrl.Result{}, nil
 	}
 
@@ -159,9 +172,13 @@ func (r *IBMCloudManagedMachinePoolReconciler) Reconcile(ctx context.Context, re
 		MachinePool:         machinePool,
 		Pool:                pool,
 		ProviderIDDropAfter: dropAfter,
+		Persist:             patcher.Patch,
 	})
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("creating the scope of IBMCloudManagedMachinePool %s: %w", req.NamespacedName, err)
+	}
+	if !pool.DeletionTimestamp.IsZero() {
+		return r.reconcileDelete(ctx, scope)
 	}
 	return r.reconcileNormal(ctx, scope)
 }

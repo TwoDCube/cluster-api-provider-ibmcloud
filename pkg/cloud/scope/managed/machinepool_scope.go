@@ -55,11 +55,11 @@ const (
 	// repeats once after a clusterctl move, which empties status.poolID.
 	EventWorkerPoolAdopted = "WorkerPoolAdopted"
 
-	// MachinePoolIBMAPIErrorReason is the WorkerPoolReady reason of an IBM call or a credential resolution that
-	// failed in a way a human must look at. The pool's WorkerPoolReady condition defines no such reason of its own; the
-	// scope uses IBMAPIError, the token of the control plane and the IBMCloudManagedCluster, so that one token matches
-	// this failure on every managed kind. The message names the call and the HTTP status, never IBM's description, so
-	// that a repeated failure does not rewrite status.
+	// MachinePoolIBMAPIErrorReason is the WorkerPoolReady (while deleting: Deleting) reason of an IBM call or a
+	// credential resolution that failed in a way a human must look at. The pool's WorkerPoolReady condition defines no
+	// such reason of its own; the scope uses IBMAPIError, the token of the control plane and the IBMCloudManagedCluster,
+	// so that one token matches this failure on every managed kind. The message names the call and the HTTP status,
+	// never IBM's description, so that a repeated failure does not rewrite status.
 	MachinePoolIBMAPIErrorReason = infrav1.IBMCloudManagedClusterNetworkReadyIBMAPIErrorReason
 
 	// poolKubernetesServiceRoles are the IAM roles a 403 message asks for: the pool and worker operations need them on
@@ -89,6 +89,11 @@ type MachinePoolScopeInput struct {
 	// deletes the Node of every provider ID that leaves the list. It is an input because the requeue intervals belong
 	// to the controllers. Required, > 0.
 	ProviderIDDropAfter time.Duration
+
+	// Persist patches Pool now. A removal patches its status (phase WaitingForIBM, ibmRequestTime,
+	// lastDisruptionTime) before it sends the IBM call, so that a restart never sends the call twice within
+	// DisruptionSettleDelay. The controller passes its patch helper. Required.
+	Persist func(ctx context.Context) error
 }
 
 // MachinePoolScope is the scope of one IBMCloudManagedMachinePool reconcile. Create it with NewMachinePoolScope; it
@@ -113,6 +118,8 @@ type MachinePoolScope struct {
 	clusterPools []infrav1.IBMCloudManagedMachinePool
 	// dropAfter is MachinePoolScopeInput.ProviderIDDropAfter.
 	dropAfter time.Duration
+	// persist is MachinePoolScopeInput.Persist.
+	persist func(ctx context.Context) error
 	// notes are non-blocking WorkerPoolReady messages (an ignored spec.failureDomains, IBM pool zones that differ
 	// from spec.zones), appended to every WorkerPoolReady message of this reconcile.
 	notes []string
@@ -131,12 +138,14 @@ type poolClients struct {
 // happens in a reconcile step, after the controller's patch helper exists, and is persisted as a condition.
 //
 // Parameters:
-//   - params are the shared dependencies; the scope needs Client, Recorder, Resolver, ClientBuilder and Clock.
+//   - params are the shared dependencies; the scope needs Client, APIReader, Recorder, Resolver, ClientBuilder, Clock
+//     and ClusterCache.
 //   - in are the objects and settings of the reconcile; see MachinePoolScopeInput.
 //
 // It returns an error naming every missing dependency or input.
 func NewMachinePoolScope(params *ScopeParams, in MachinePoolScopeInput) (*MachinePoolScope, error) {
-	if err := params.validate("MachinePoolScope", depClient, depRecorder, depResolver, depClientBuilder, depClock); err != nil {
+	if err := params.validate("MachinePoolScope", depClient, depAPIReader, depRecorder, depResolver, depClientBuilder, depClock,
+		depClusterCache); err != nil {
 		return nil, err
 	}
 	var problems []string
@@ -153,6 +162,9 @@ func NewMachinePoolScope(params *ScopeParams, in MachinePoolScopeInput) (*Machin
 		problems = append(problems, fmt.Sprintf("ProviderIDDropAfter is %s; pass poolTransitionPoll, which is greater than zero",
 			in.ProviderIDDropAfter))
 	}
+	if in.Persist == nil {
+		problems = append(problems, "Persist is nil; pass the function that patches the IBMCloudManagedMachinePool")
+	}
 	if len(problems) > 0 {
 		return nil, errors.New("managed: MachinePoolScope: " + strings.Join(problems, "; "))
 	}
@@ -162,6 +174,7 @@ func NewMachinePoolScope(params *ScopeParams, in MachinePoolScopeInput) (*Machin
 		MachinePool: in.MachinePool,
 		Pool:        in.Pool,
 		dropAfter:   in.ProviderIDDropAfter,
+		persist:     in.Persist,
 	}, nil
 }
 
@@ -762,12 +775,22 @@ func (s *MachinePoolScope) ibmProblem(clients *poolClients, op kubernetesservice
 	}
 }
 
-// report sets the condition a pool step reports its waits and problems on: WorkerPoolReady=False.
+// report sets the condition a pool step reports its waits and problems on: WorkerPoolReady=False while the pool lives,
+// Deleting=True while it is being deleted (the delete flow sets Deleting=True with its specific reason).
 //
 // Parameters:
 //   - reason is the condition reason.
 //   - message explains it; deterministic and free of IBM text.
 func (s *MachinePoolScope) report(reason, message string) {
+	if !s.Pool.DeletionTimestamp.IsZero() {
+		conditions.Set(s.Pool, metav1.Condition{
+			Type:    infrav1.IBMCloudManagedMachinePoolDeletingCondition,
+			Status:  metav1.ConditionTrue,
+			Reason:  reason,
+			Message: message,
+		})
+		return
+	}
 	s.setWorkerPoolReady(metav1.ConditionFalse, reason, message)
 }
 

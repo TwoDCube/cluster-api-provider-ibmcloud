@@ -37,6 +37,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/controllers/clustercache"
 	"sigs.k8s.io/cluster-api/util/conditions"
 
 	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
@@ -118,6 +119,11 @@ type poolFixture struct {
 	params *ScopeParams
 	// mgmt is the fake management-cluster client of the last scope.
 	mgmt client.Client
+	// clusterCache gives the workload cluster; the empty fake (never connected) unless a test sets one.
+	clusterCache clustercache.ClusterCache
+	// persisted records status.disruption at every Persist call; persistErr is what Persist returns.
+	persisted  []infrav1.WorkerDisruptionStatus
+	persistErr error
 }
 
 // newPoolFixture returns the objects of a healthy IKS Cluster with two zones and a pool "workers" of 2 workers per
@@ -126,11 +132,12 @@ func newPoolFixture(t *testing.T) *poolFixture {
 	t.Helper()
 	mockCtrl := gomock.NewController(t)
 	f := &poolFixture{
-		t:        t,
-		ibm:      ksmock.NewMockKubernetesService(mockCtrl),
-		resolver: &recordingResolver{},
-		recorder: record.NewFakeRecorder(100),
-		clock:    clocktesting.NewFakeClock(poolTestNow),
+		t:            t,
+		ibm:          ksmock.NewMockKubernetesService(mockCtrl),
+		resolver:     &recordingResolver{},
+		recorder:     record.NewFakeRecorder(100),
+		clock:        clocktesting.NewFakeClock(poolTestNow),
+		clusterCache: clustercache.NewFakeEmptyClusterCache(),
 	}
 	f.builder = &poolStubBuilder{kubernetes: f.ibm}
 	labels := map[string]string{clusterv1.ClusterNameLabel: poolTestCluster}
@@ -216,21 +223,30 @@ func (f *poolFixture) managementObjects() []client.Object {
 	return append(objs, f.others...)
 }
 
-// scope builds the fake management cluster and the scope of f.pool.
+// scope returns a scope of f.pool. The first call builds the fake management cluster from the fixture objects; later
+// calls reuse it, so that what one reconcile wrote there (the disruption token) is seen by the next.
 func (f *poolFixture) scope() *MachinePoolScope {
 	f.t.Helper()
-	f.mgmt = fake.NewClientBuilder().WithScheme(poolScheme(f.t)).WithObjects(f.managementObjects()...).
-		WithStatusSubresource(&infrav1.IBMCloudManagedMachinePool{}).Build()
+	if f.mgmt == nil {
+		f.mgmt = fake.NewClientBuilder().WithScheme(poolScheme(f.t)).WithObjects(f.managementObjects()...).
+			WithStatusSubresource(&infrav1.IBMCloudManagedMachinePool{}).Build()
+	}
 	if f.params == nil {
 		f.params = &ScopeParams{Client: f.mgmt, APIReader: f.mgmt, Recorder: f.recorder, Resolver: f.resolver,
-			ClientBuilder: f.builder, Clock: f.clock}
+			ClientBuilder: f.builder, Clock: f.clock, ClusterCache: f.clusterCache}
 	}
 	scope, err := NewMachinePoolScope(f.params, MachinePoolScopeInput{Cluster: f.cluster, MachinePool: f.machinePool,
-		Pool: f.pool, ProviderIDDropAfter: 30 * time.Second})
+		Pool: f.pool, ProviderIDDropAfter: 30 * time.Second, Persist: f.persist})
 	if err != nil {
 		f.t.Fatalf("NewMachinePoolScope: %v", err)
 	}
 	return scope
+}
+
+// persist is the scope's Persist: it records status.disruption as it is when the scope persists.
+func (f *poolFixture) persist(context.Context) error {
+	f.persisted = append(f.persisted, *f.pool.Status.Disruption.DeepCopy())
+	return f.persistErr
 }
 
 // ibmPool returns an IBM pool of the test cluster with sizePerZone workers in each zone.
@@ -313,8 +329,11 @@ func (f *poolFixture) events() []string {
 func TestNewMachinePoolScope(t *testing.T) {
 	f := newPoolFixture(t)
 	valid := func() (*ScopeParams, MachinePoolScopeInput) {
-		return &ScopeParams{Client: fake.NewClientBuilder().Build(), Recorder: f.recorder, Resolver: f.resolver, ClientBuilder: f.builder, Clock: f.clock},
-			MachinePoolScopeInput{Cluster: f.cluster, MachinePool: f.machinePool, Pool: f.pool, ProviderIDDropAfter: time.Second}
+		c := fake.NewClientBuilder().Build()
+		return &ScopeParams{Client: c, APIReader: c, Recorder: f.recorder, Resolver: f.resolver, ClientBuilder: f.builder,
+				Clock: f.clock, ClusterCache: f.clusterCache},
+			MachinePoolScopeInput{Cluster: f.cluster, MachinePool: f.machinePool, Pool: f.pool, ProviderIDDropAfter: time.Second,
+				Persist: f.persist}
 	}
 	testCases := []struct {
 		name    string
@@ -347,6 +366,22 @@ func TestNewMachinePoolScope(t *testing.T) {
 			},
 			wantErr: "ProviderIDDropAfter is 0s",
 		},
+		{
+			name: "no persist function",
+			modify: func(p *ScopeParams, in *MachinePoolScopeInput) *ScopeParams {
+				in.Persist = nil
+				return p
+			},
+			wantErr: "Persist is nil",
+		},
+		{
+			name: "the drain dependencies are named",
+			modify: func(p *ScopeParams, _ *MachinePoolScopeInput) *ScopeParams {
+				p.APIReader, p.ClusterCache = nil, nil
+				return p
+			},
+			wantErr: "needs ScopeParams.APIReader, ScopeParams.ClusterCache",
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -368,10 +403,11 @@ func TestMachinePoolScopeIdentitySeams(t *testing.T) {
 	t.Run("constructor_makes_no_call", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newPoolFixture(t)
-		params := &ScopeParams{Client: fake.NewClientBuilder().Build(), Recorder: f.recorder, Resolver: failingResolver{t: t},
-			ClientBuilder: failingBuilder{t: t}, Clock: f.clock}
+		c := fake.NewClientBuilder().Build()
+		params := &ScopeParams{Client: c, APIReader: c, Recorder: f.recorder, Resolver: failingResolver{t: t},
+			ClientBuilder: failingBuilder{t: t}, Clock: f.clock, ClusterCache: f.clusterCache}
 		scope, err := NewMachinePoolScope(params, MachinePoolScopeInput{Cluster: f.cluster, MachinePool: f.machinePool,
-			Pool: f.pool, ProviderIDDropAfter: time.Second})
+			Pool: f.pool, ProviderIDDropAfter: time.Second, Persist: f.persist})
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(scope.ControlPlane).To(BeNil(), "the constructor reads no object")
 	})
@@ -910,6 +946,7 @@ func TestMachinePoolScopeClusterDeletion(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 			f := newPoolFixture(t)
+			f.clusterCache = failIfCalledClusterCache{t: t}
 			tc.modify(f)
 			// gomock fails on any IBM call: no ListWorkerPools, no CreateWorkerPool, no ResizeWorkerPool.
 			g.Expect(f.scope().ReconcileNormal(context.Background())).To(Equal(Done()))

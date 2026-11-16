@@ -159,14 +159,15 @@ func newMachinePoolFixture(t *testing.T) *machinePoolFixture {
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: mpTestNamespace, Name: "workers", Labels: labels, UID: "pool-uid",
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: clusterv1.GroupVersion.String(), Kind: "MachinePool", Name: "workers", UID: "mp-uid"}},
+			Finalizers:      []string{infrav1.IBMCloudManagedMachinePoolFinalizer},
 		},
 		Spec: infrav1.IBMCloudManagedMachinePoolSpec{
 			PoolName: "workers",
 			Flavor:   mpTestFlavor,
 			Zones:    []infrav1.WorkerPoolZone{{Name: "us-south-1"}, {Name: "us-south-2"}},
 		},
-		// An earlier reconcile recorded that the pool is not paused: the first reconcile of an object only records that
-		// and returns (CAPI's EnsurePausedCondition contract), which the skeleton tests cover separately.
+		// Earlier reconciles added the finalizer and recorded that the pool is not paused: each of them only does that and
+		// returns (CAPI's EnsureFinalizer and EnsurePausedCondition contracts), which the skeleton tests cover separately.
 		Status: infrav1.IBMCloudManagedMachinePoolStatus{Conditions: []metav1.Condition{{
 			Type: clusterv1.PausedCondition, Status: metav1.ConditionFalse, Reason: clusterv1.NotPausedReason,
 			LastTransitionTime: metav1.NewTime(mpTestNow),
@@ -299,12 +300,22 @@ func TestIBMCloudManagedMachinePoolReconcileSkeleton(t *testing.T) {
 	t.Run("a pool no MachinePool owns causes no call", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newMachinePoolFixture(t)
-		f.pool.OwnerReferences = nil
+		f.pool.OwnerReferences, f.pool.Finalizers = nil, nil
 		f.pool.Status.Conditions = nil
 		result, err := f.reconcile(f.reconciler())
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(result).To(Equal(ctrl.Result{}))
 		g.Expect(f.stored().Status.Conditions).To(BeEmpty(), "nothing is patched")
+		g.Expect(f.resolver.Holders()).To(BeEmpty())
+	})
+	t.Run("the first reconcile only adds the finalizer", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newMachinePoolFixture(t)
+		f.pool.Finalizers = nil
+		result, err := f.reconcile(f.reconciler())
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(result).To(Equal(ctrl.Result{}))
+		g.Expect(f.stored().Finalizers).To(ConsistOf(infrav1.IBMCloudManagedMachinePoolFinalizer))
 		g.Expect(f.resolver.Holders()).To(BeEmpty())
 	})
 	t.Run("the first reconcile only records that the pool is not paused", func(t *testing.T) {
@@ -390,7 +401,7 @@ func TestIBMCloudManagedMachinePoolReconcileClusterDeletion(t *testing.T) {
 			f := newMachinePoolFixture(t)
 			tc.modify(f)
 			r := f.reconciler()
-			r.Resolver, r.ClientBuilder = failIfCalledResolver{t: t}, failIfCalledBuilder{t: t}
+			r.Resolver, r.ClientBuilder, r.ClusterCache = failIfCalledResolver{t: t}, failIfCalledBuilder{t: t}, noWorkloadCallsClusterCache{t: t}
 			// gomock fails on any IBM call: no ListWorkerPools, no CreateWorkerPool, no ResizeWorkerPool.
 			result, err := f.reconcile(r)
 			g.Expect(err).NotTo(HaveOccurred())
