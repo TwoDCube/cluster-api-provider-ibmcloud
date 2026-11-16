@@ -30,7 +30,11 @@ import (
 
 	. "github.com/onsi/gomega"
 
+	"k8s.io/utils/ptr"
+
+	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/ibmversion"
 )
 
 // The tests of this file pin every value of assumptions.go to its source, so that switching a decision point after a
@@ -245,4 +249,85 @@ func TestBindingWindows(t *testing.T) {
 	layouts := CreatedDateLayouts()
 	layouts[0] = "changed"
 	g.Expect(CreatedDateLayouts()[0]).To(Equal(time.RFC3339))
+}
+
+func TestCreateVersion(t *testing.T) {
+	testCases := []struct {
+		name         string
+		distribution controlplanev1.Distribution
+		minor        ibmversion.Minor
+		want         string
+	}{
+		{name: "IKS sends the minor", distribution: controlplanev1.DistributionKubernetes, minor: ibmversion.Minor{Major: 1, Minor: 36}, want: "1.36"},
+		{name: "ROKS adds _openshift", distribution: controlplanev1.DistributionOpenShift, minor: ibmversion.Minor{Major: 4, Minor: 21}, want: "4.21_openshift"},
+		{name: "unknown distribution sends nothing", distribution: "Other", minor: ibmversion.Minor{Major: 1, Minor: 36}, want: ""},
+		{name: "empty distribution sends nothing", distribution: "", minor: ibmversion.Minor{Major: 4, Minor: 21}, want: ""},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			got := CreateVersion(tc.distribution, tc.minor)
+			g.Expect(got).To(Equal(tc.want))
+			if got != "" {
+				// The value is an IBM minor-only version, the form IBM was observed to resolve to its newest patch.
+				parsed, err := ibmversion.Parse(got)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(parsed.MinorVersion()).To(Equal(tc.minor))
+				g.Expect(parsed.HasFixPack).To(BeFalse())
+			}
+		})
+	}
+}
+
+func TestMinWorkersPerZoneAtCreate(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(MinWorkersPerZoneAtCreate(controlplanev1.DistributionKubernetes)).To(BeEquivalentTo(1))
+	g.Expect(MinWorkersPerZoneAtCreate(controlplanev1.DistributionOpenShift)).To(BeEquivalentTo(2))
+	g.Expect(MinWorkersPerZoneAtCreate("Other")).To(BeEquivalentTo(2), "an unknown distribution gets the stricter value")
+}
+
+func TestIsMasterReady(t *testing.T) {
+	deployed := loadCluster(t, "iks-getCluster-deployed.json")
+	testCases := []struct {
+		name    string
+		cluster *kubernetesservice.Cluster
+		want    bool
+	}{
+		{name: "iks_deployed_fixture_with_empty_health_is_ready", cluster: &deployed, want: true},
+		{name: "iks_deploying_fixture_is_not_ready", cluster: ptr.To(loadCluster(t, "iks-getCluster-deploying.json")), want: false},
+		{name: "roks_deployed_fixture_is_ready", cluster: ptr.To(loadCluster(t, "roks-getCluster-deployed.json")), want: true},
+		{name: "roks_deploying_fixture_is_not_ready", cluster: ptr.To(loadCluster(t, "roks-getCluster-deploying.json")), want: false},
+		{name: "normal cluster is ready", cluster: ptr.To(loadCluster(t, "iks-getCluster-normal.json")), want: true},
+		{name: "Ready with surrounding white space", cluster: withMaster(deployed, "deployed", " Ready \n", deployed.MasterURL), want: true},
+		{name: "Ready with a suffix", cluster: withMaster(deployed, "deployed", "Ready (master health checks pending)", deployed.MasterURL), want: true},
+		{name: "deployed without a master URL", cluster: withMaster(deployed, "deployed", "Ready", ""), want: false},
+		{name: "deployed but not Ready", cluster: withMaster(deployed, "deployed", "Deploy in progress.", deployed.MasterURL), want: false},
+		{name: "Ready but still deploying", cluster: withMaster(deployed, "deploying", "Ready", deployed.MasterURL), want: false},
+		{name: "lower-case ready is not IBM's value", cluster: withMaster(deployed, "deployed", "ready", deployed.MasterURL), want: false},
+		{name: "nil", cluster: nil, want: false},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(IsMasterReady(tc.cluster)).To(Equal(tc.want))
+		})
+	}
+	// The point of the case: the live deployed capture has no master health yet.
+	NewWithT(t).Expect(deployed.MasterHealth).To(BeEmpty())
+}
+
+// TestCreateDecisionPoints pins the create decision points: the workers' operating system and the answers that clear
+// a create intent.
+func TestCreateDecisionPoints(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(InitialWorkerPoolName).To(Equal("default"))
+	g.Expect(ROKSWorkerOperatingSystem).To(BeEmpty())
+	g.Expect(ClearIntentErrorCodes()).To(Equal([]string{"E0007", "A0656"}))
+	g.Expect(ClearIntentStatusCodes()).To(Equal([]int{400, 401, 403, 422}))
+}
+
+// withMaster returns a copy of c with the given master state, status and URL.
+func withMaster(c kubernetesservice.Cluster, state, status, url string) *kubernetesservice.Cluster {
+	c.MasterState, c.MasterStatus, c.MasterURL = state, status, url
+	return &c
 }

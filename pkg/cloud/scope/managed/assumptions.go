@@ -18,7 +18,12 @@ package managed
 
 import (
 	"fmt"
+	"strings"
 	"time"
+
+	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/ibmversion"
 )
 
 // This file holds every fact about IBM's API that only a live probe can settle, in one place, so that a reviewer sees
@@ -110,3 +115,94 @@ const DeleteLookupGracePeriod = 30 * time.Minute
 // because it is open whether a master URL is unique per cluster and stable over master updates (the two clusters of
 // the live probes had distinct URLs); switch to true once both are confirmed.
 const AdoptByEndpointMatch = false
+
+// Create and observe (BuildCreateClusterRequest, IsMasterReady).
+
+// InitialWorkerPoolName is the name of the worker pool CAPIBM embeds into createCluster: the IBMCloudManagedMachinePool
+// with this poolName is the cluster's initial pool, and every pool, this one included, is then adopted by name.
+// Observed on IBM Cloud: IBM honours a custom workerPool.name and names the pool "default" when none is sent, so
+// CAPIBM's convention matches IBM's default.
+const InitialWorkerPoolName = "default"
+
+// ROKSWorkerOperatingSystem is the operatingSystem CAPIBM sends for new workers of either distribution: "" means the
+// field is not sent and IBM picks its default. Observed on IBM Cloud: IBM picked UBUNTU_24_64 for IKS 1.36 and RHCOS
+// for ROKS 4.21, the supported defaults, so no compat cluster create is needed for it.
+const ROKSWorkerOperatingSystem = ""
+
+// openShiftVersionSuffix marks a ROKS version in IBM requests ("4.21_openshift"). Observed on IBM Cloud: createCluster
+// accepted "4.21_openshift".
+const openShiftVersionSuffix = "_openshift"
+
+// ibmMinorVersion returns the minor-only version string IBM accepts for a distribution: "1.36" for Kubernetes and
+// "4.21_openshift" for OpenShift, or "" for an unknown distribution. Observed on IBM Cloud: createCluster accepted
+// both forms.
+//
+// Parameters:
+//   - d: the control plane's spec.distribution.
+//   - minor: the minor to name.
+func ibmMinorVersion(d controlplanev1.Distribution, minor ibmversion.Minor) string {
+	switch d {
+	case controlplanev1.DistributionKubernetes:
+		return minor.String()
+	case controlplanev1.DistributionOpenShift:
+		return minor.String() + openShiftVersionSuffix
+	default:
+		return ""
+	}
+}
+
+// CreateVersion returns the kubeVersion CAPIBM sends to createCluster: "1.36" for Kubernetes (IKS) and
+// "4.21_openshift" for OpenShift (ROKS). Observed on IBM Cloud: IBM accepted both minor-only forms and created the
+// newest patch of the minor, 1.36.5_1537 and 4.21.35_1537_openshift. An unknown distribution returns "", which
+// kubernetesservice.CreateCluster rejects before sending anything.
+//
+// Parameters:
+//   - d: the control plane's spec.distribution.
+//   - minor: spec.distributionVersion, parsed with ibmversion.ParseMinor.
+func CreateVersion(d controlplanev1.Distribution, minor ibmversion.Minor) string {
+	return ibmMinorVersion(d, minor)
+}
+
+// MinWorkersPerZoneAtCreate returns the smallest number of workers per zone CAPIBM accepts for the initial worker pool
+// of createCluster: 1 for Kubernetes and 2 for OpenShift. An unknown distribution gets the stricter 2.
+// Not yet verified against IBM Cloud: IBM refused to take a ROKS cluster below 2 workers (E1437), but whether
+// createCluster wants 2 per zone or 2 in total is open; default 2 per zone; fallback: a total of 2 across the zones.
+//
+// Parameters:
+//   - d: the control plane's spec.distribution.
+func MinWorkersPerZoneAtCreate(d controlplanev1.Distribution) int64 {
+	if d == controlplanev1.DistributionKubernetes {
+		return 1
+	}
+	return 2
+}
+
+// IsMasterReady reports whether the IBM master can be used: masterState "deployed", masterStatus starting with
+// "Ready" and masterURL set. masterHealth is not part of it. Observed on IBM Cloud: the master was usable from state
+// deployed, 16-25 minutes after the create; masterHealth stayed "" for 3-4 minutes after "Ready" on both flavors
+// before it became normal. nil is not ready.
+//
+// Parameters:
+//   - c: the cluster as GetCluster returned it.
+func IsMasterReady(c *kubernetesservice.Cluster) bool {
+	return c != nil &&
+		c.MasterState == "deployed" &&
+		strings.HasPrefix(strings.TrimSpace(c.MasterStatus), "Ready") &&
+		c.MasterURL != ""
+}
+
+// ClearIntentErrorCodes returns the IBM error codes that prove a createCluster attempt created nothing, whatever the
+// HTTP status: E0007 (the cluster name exists) and A0656 (IBM could not create the infrastructure API key). Such an
+// answer clears the attempt from status.createIntent. Observed on IBM Cloud: IBM checks A0656 before it validates the
+// request, and a refused create left nothing behind.
+func ClearIntentErrorCodes() []string {
+	return []string{"E0007", "A0656"}
+}
+
+// ClearIntentStatusCodes returns the HTTP statuses of a createCluster answer that prove nothing was created, so the
+// attempt leaves status.createIntent. Not yet verified against IBM Cloud: a 400 with P4102 (unknown subnet) and one
+// with E7278 (ROKS without a COS instance) left nothing behind, but whether every 4xx does is open; default
+// {400, 401, 403, 422}; fallback: keep the intent for a code that turns out to leave a cluster behind.
+func ClearIntentStatusCodes() []int {
+	return []int{400, 401, 403, 422}
+}
