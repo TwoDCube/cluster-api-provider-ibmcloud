@@ -1,0 +1,6 @@
+{
+  "incidentID": "00000000-0000-4000-8000-0000000000e4",
+  "code": "E1437",
+  "description": "The action cannot be completed because it would reduce the worker pool's size below the cluster's minimum requirement of 1 workers. If there are any worker operations pending, you might need wait for them to complete.",
+  "type": "BadRequest"
+}

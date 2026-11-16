@@ -63,6 +63,10 @@ type KubernetesService interface {
 	// retried by the client. A compat function (POST /v2/vpc/createWorkerPool); its fallback behind CreatePoolWithZones
 	// is a zone-less SDK create plus one SDK zone add per zone.
 	CreateWorkerPool(ctx context.Context, req CreateWorkerPoolRequest) (string, error)
+	// ResizeWorkerPool sets the workers per zone of a pool; IBM picks the workers it removes when shrinking.
+	// allowSingleOpenShiftWorker is never sent. IBM refuses a size below the cluster minimum with E1437 (observed on IBM
+	// Cloud). SDK V2ResizeWorkerPoolWithContext (POST /v2/resizeWorkerPool).
+	ResizeWorkerPool(ctx context.Context, clusterID, poolID string, sizePerZone int64) error
 
 	// ListWorkers returns every worker of the cluster, including deleted ones (showDeleted=true), so that a worker
 	// leaves providerIDList on IBM's "deleted" record rather than on its absence from one listing: dropping a live

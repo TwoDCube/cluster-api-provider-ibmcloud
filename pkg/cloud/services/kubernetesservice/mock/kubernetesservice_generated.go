@@ -203,3 +203,17 @@ func (mr *MockKubernetesServiceMockRecorder) ReplaceWorker(ctx, clusterID, worke
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ReplaceWorker", reflect.TypeOf((*MockKubernetesService)(nil).ReplaceWorker), ctx, clusterID, workerID, update)
 }
+
+// ResizeWorkerPool mocks base method.
+func (m *MockKubernetesService) ResizeWorkerPool(ctx context.Context, clusterID, poolID string, sizePerZone int64) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ResizeWorkerPool", ctx, clusterID, poolID, sizePerZone)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// ResizeWorkerPool indicates an expected call of ResizeWorkerPool.
+func (mr *MockKubernetesServiceMockRecorder) ResizeWorkerPool(ctx, clusterID, poolID, sizePerZone any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ResizeWorkerPool", reflect.TypeOf((*MockKubernetesService)(nil).ResizeWorkerPool), ctx, clusterID, poolID, sizePerZone)
+}

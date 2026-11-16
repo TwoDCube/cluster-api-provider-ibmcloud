@@ -78,6 +78,23 @@ func TestClassify(t *testing.T) {
 		{name: "E0d39 on CreateCluster has no pool meaning", op: OpCreateCluster, err: apiError(OpCreateCluster, http.StatusConflict, "E0d39"), expected: ClassUnknown},
 		{name: "404 on ListWorkers", op: OpListWorkers, err: apiError(OpListWorkers, http.StatusNotFound, ""), expected: ClassNotFound},
 		{name: "409 on ReplaceWorker has no specific meaning", op: OpReplaceWorker, err: apiError(OpReplaceWorker, http.StatusConflict, ""), expected: ClassUnknown},
+
+		{
+			name:     "the autoscaled text on another operation is PermissionDenied",
+			op:       OpCreateWorkerPool,
+			err:      &APIError{Operation: OpCreateWorkerPool, StatusCode: http.StatusForbidden, Description: "Forbidden. The request will not be permitted."},
+			expected: ClassPermissionDenied,
+		},
+		{name: "E1437 on CreateCluster is only its status", op: OpCreateCluster, err: apiError(OpCreateCluster, http.StatusBadRequest, "E1437"), expected: ClassBadRequest},
+
+		{name: "400 E1437 on ResizeWorkerPool", op: OpResizeWorkerPool, err: apiError(OpResizeWorkerPool, http.StatusBadRequest, "E1437"), expected: ClassClusterMinimum},
+		{
+			name:     "documented autoscaled 403 on ResizeWorkerPool",
+			op:       OpResizeWorkerPool,
+			err:      &APIError{Operation: OpResizeWorkerPool, StatusCode: http.StatusForbidden, Description: "Forbidden. The request will not be permitted."},
+			expected: ClassAutoscaled,
+		},
+		{name: "429 on ResizeWorkerPool", op: OpResizeWorkerPool, err: apiError(OpResizeWorkerPool, http.StatusTooManyRequests, ""), expected: ClassRateLimited},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {

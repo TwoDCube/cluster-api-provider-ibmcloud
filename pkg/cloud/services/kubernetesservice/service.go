@@ -275,6 +275,30 @@ func (s *Service) listWorkerPoolsFromVPCPath(ctx context.Context, clusterID stri
 	return workerPoolsFromSDK(pools), nil
 }
 
+// ResizeWorkerPool implements KubernetesService. sizePerZone may be 0 (IBM decides whether the cluster minimum
+// allows it, and answers E1437 when it does not); it must not be negative.
+func (s *Service) ResizeWorkerPool(ctx context.Context, clusterID, poolID string, sizePerZone int64) error {
+	switch {
+	case clusterID == "":
+		return invalidRequest(OpResizeWorkerPool, "the cluster ID is empty; pass status.clusterID of the IBMCloudManagedControlPlane")
+	case poolID == "":
+		return invalidRequest(OpResizeWorkerPool, "the pool ID is empty; pass the ID of a pool that ListWorkerPools returned")
+	case sizePerZone < 0:
+		return invalidRequest(OpResizeWorkerPool, fmt.Sprintf("the size per zone is %d; pass 0 or more workers per zone", sizePerZone))
+	}
+	ctx, tracker := trackCall(ctx)
+	response, err := s.sdk.V2ResizeWorkerPoolWithContext(ctx, &kubernetesserviceapiv1.V2ResizeWorkerPoolOptions{
+		Cluster:    core.StringPtr(clusterID),
+		Workerpool: core.StringPtr(poolID),
+		Size:       core.Int64Ptr(sizePerZone),
+		// AllowSingleOpenShiftWorker stays nil: CAPIBM never asks IBM to go below the ROKS minimum.
+	})
+	if err != nil {
+		return callError(OpResizeWorkerPool, tracker, response, err)
+	}
+	return nil
+}
+
 // ListWorkers implements KubernetesService.
 func (s *Service) ListWorkers(ctx context.Context, clusterID string) ([]Worker, error) {
 	if clusterID == "" {

@@ -53,6 +53,8 @@ const (
 	OpListWorkers Operation = "ListWorkers"
 	// OpReplaceWorker is KubernetesService.ReplaceWorker.
 	OpReplaceWorker Operation = "ReplaceWorker"
+	// OpResizeWorkerPool is KubernetesService.ResizeWorkerPool.
+	OpResizeWorkerPool Operation = "ResizeWorkerPool"
 )
 
 // ErrorClass is what an error from KubernetesService means for a controller. Each controller decides what to do for
@@ -99,6 +101,14 @@ const (
 	// ClassOperationInProgress is any other 409 on CreateWorkerPool ("worker pool create may already be in
 	// progress"; its code is not yet verified against IBM Cloud). The caller retries after a minute and adopts by name.
 	ClassOperationInProgress ErrorClass = "OperationInProgress"
+	// ClassClusterMinimum is code E1437 on a pool removal or resize: the change would take the cluster below IBM's
+	// minimum (IKS 1, ROKS 2 workers). Synchronous and side-effect free (observed on IBM Cloud); the caller waits, never
+	// fails.
+	ClassClusterMinimum ErrorClass = "ClusterMinimum"
+	// ClassAutoscaled is a 403 "Forbidden. The request will not be permitted." on a pool removal or resize, which IBM
+	// documents for autoscaled pools (for v1 operations only; not yet verified against IBM Cloud for v2). The caller
+	// reports ExternallyAutoscaled when the pool shows autoscaleEnabled, else PermissionDenied.
+	ClassAutoscaled ErrorClass = "Autoscaled"
 )
 
 // IBM error codes Classify matches. The error bodies of most operations are not yet verified against IBM Cloud; the
@@ -116,7 +126,15 @@ const (
 	codeInternalError = "E0004"
 	// codePoolNameExists is IBM's "worker pool name already exists" code on createWorkerPool (409).
 	codePoolNameExists = "E0d39"
+	// codeClusterMinimum is IBM's "below the cluster's minimum workers" code (400, observed on IBM Cloud).
+	codeClusterMinimum = "E1437"
 )
+
+// autoscaledPoolForbidden is the description IBM documents for a 403 on a resize or removal of an autoscaled pool. It
+// is the one row of Classify that matches description text, because a 403 on these operations has no code that tells
+// it apart from a missing permission. IBM documents it for v1 operations only; not yet verified against IBM Cloud for
+// the v2 operations CAPIBM calls.
+const autoscaledPoolForbidden = "The request will not be permitted"
 
 // ErrInvalidRequest marks a request that KubernetesService refused to send because an argument is missing or
 // malformed. Nothing reached IBM; Classify maps it to ClassBadRequest. The wrapping error names the operation, the
@@ -205,6 +223,21 @@ func classifyOperation(op Operation, apiErr *APIError) ErrorClass {
 		return classifyCreateCluster(apiErr)
 	case OpCreateWorkerPool:
 		return classifyCreateWorkerPool(apiErr)
+	case OpResizeWorkerPool:
+		return classifyPoolSizeChange(apiErr)
+	default:
+		return ClassUnknown
+	}
+}
+
+// classifyPoolSizeChange applies the rows for operations that take workers away from a pool (removal and resize) to
+// apiErr.
+func classifyPoolSizeChange(apiErr *APIError) ErrorClass {
+	switch {
+	case apiErr.Code == codeClusterMinimum:
+		return ClassClusterMinimum
+	case apiErr.StatusCode == http.StatusForbidden && strings.Contains(apiErr.Description, autoscaledPoolForbidden):
+		return ClassAutoscaled
 	default:
 		return ClassUnknown
 	}

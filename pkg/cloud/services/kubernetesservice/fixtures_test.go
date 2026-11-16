@@ -44,6 +44,8 @@ package kubernetesservice
 //     verified against IBM Cloud; until it is captured, the tests serve these /v2/vpc bodies on it.
 //   - {iks,roks}-getWorkers-{deploying,deployed,pending,normal}.json: GET /v2/vpc/getWorkers in each create state,
 //     with kubeVersion{desired, actual, target}; roks-getWorkers-deploying.json is IBM's empty list.
+//   - error-E1437-{iks,roks}-resize.json: the 400 E1437 of a resize below the cluster minimum (IKS 1, ROKS 2 workers);
+//     removing the only pool answers the same code and text, synchronously and without side effects.
 //   - golden/createWorkerPool.json: not a capture; the body CreateWorkerPool must send for
 //     iksCreateWorkerPoolRequest (zones with subnetID, no operatingSystem).
 

@@ -941,3 +941,76 @@ func TestReplaceWorker(t *testing.T) {
 		})
 	}
 }
+
+const (
+	// testPoolID is the scrubbed IKS pool ID of the fixtures.
+	testPoolID = testIKSClusterID + "-00000a1"
+	// autoscaledForbiddenBody is the 403 IBM documents for autoscaled pools (for v1 operations; not yet verified
+	// against IBM Cloud).
+	autoscaledForbiddenBody = `{"code":"","description":"Forbidden. The request will not be permitted."}`
+)
+
+func TestResizeWorkerPool(t *testing.T) {
+	noContent := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }
+
+	for _, size := range []int64{0, 1, 3} {
+		t.Run(fmt.Sprintf("posts {cluster, size: %d, workerpool} and never allowSingleOpenShiftWorker", size), func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeIKS(t, servePath("/global/v2/resizeWorkerPool", http.StatusNoContent, nil))
+			service, _ := newTestService(t, fake)
+			g.Expect(service.ResizeWorkerPool(context.Background(), testIKSClusterID, testPoolID, size)).To(Succeed())
+			request := fake.last(t)
+			g.Expect(request.Method).To(Equal(http.MethodPost))
+			g.Expect(request.Header.Get("Authorization")).To(Equal("Bearer " + testToken))
+			g.Expect(string(request.Body)).To(MatchJSON(fmt.Sprintf(`{"cluster": %q, "size": %d, "workerpool": %q}`, testIKSClusterID, size, testPoolID)))
+		})
+	}
+
+	errorCases := []struct {
+		name     string
+		status   int
+		body     []byte
+		expected ErrorClass
+	}{
+		{name: "live IKS E1437 (size 0 on a 1-worker cluster) is ClusterMinimum", status: http.StatusBadRequest, body: fixture(t, "error-E1437-iks-resize.json"), expected: ClassClusterMinimum},
+		{name: "live ROKS E1437 (size 1 on a 2-worker cluster) is ClusterMinimum", status: http.StatusBadRequest, body: fixture(t, "error-E1437-roks-resize.json"), expected: ClassClusterMinimum},
+		{name: "documented autoscaled 403 is Autoscaled", status: http.StatusForbidden, body: []byte(autoscaledForbiddenBody), expected: ClassAutoscaled},
+		{name: "other 403 is PermissionDenied", status: http.StatusForbidden, body: nil, expected: ClassPermissionDenied},
+		{name: "other 400 is BadRequest", status: http.StatusBadRequest, body: []byte(`{"code":"E0001"}`), expected: ClassBadRequest},
+		{name: "500 is Transient and sent once", status: http.StatusInternalServerError, body: nil, expected: ClassTransient},
+	}
+	for _, tc := range errorCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeIKS(t, reply(tc.status, tc.body))
+			service, _ := newTestService(t, fake)
+			err := service.ResizeWorkerPool(context.Background(), testIKSClusterID, testPoolID, 0)
+			g.Expect(Classify(OpResizeWorkerPool, err)).To(Equal(tc.expected))
+			g.Expect(fake.received()).To(HaveLen(1))
+		})
+	}
+
+	refused := []struct {
+		name      string
+		clusterID string
+		poolID    string
+		size      int64
+		message   string
+	}{
+		{name: "empty cluster ID", clusterID: "", poolID: testPoolID, size: 1, message: "ResizeWorkerPool: the cluster ID is empty"},
+		{name: "empty pool ID", clusterID: testIKSClusterID, poolID: "", size: 1, message: "ResizeWorkerPool: the pool ID is empty"},
+		{name: "negative size", clusterID: testIKSClusterID, poolID: testPoolID, size: -1, message: "ResizeWorkerPool: the size per zone is -1; pass 0 or more"},
+	}
+	for _, tc := range refused {
+		t.Run("refused before sending: "+tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeIKS(t, noContent)
+			service, limiter := newTestService(t, fake)
+			err := service.ResizeWorkerPool(context.Background(), tc.clusterID, tc.poolID, tc.size)
+			g.Expect(err).To(MatchError(ErrInvalidRequest))
+			g.Expect(err.Error()).To(ContainSubstring(tc.message))
+			g.Expect(fake.received()).To(BeEmpty())
+			g.Expect(limiter.count()).To(BeZero())
+		})
+	}
+}
