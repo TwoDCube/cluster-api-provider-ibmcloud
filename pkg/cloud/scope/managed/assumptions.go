@@ -489,3 +489,102 @@ const CreatePoolWithZones = kubernetesservice.CreatePoolWithZones
 // VPC clusters, while the live probes measured GET /v2/vpc/getWorkerPools; fallback: a compat decoder for
 // /v2/vpc/getWorkerPools. As for CreatePoolWithZones, the switch is kubernetesservice.ListWorkerPoolsViaSDK.
 const ListWorkerPoolsViaSDK = kubernetesservice.ListWorkerPoolsViaSDK
+
+// Disruption guards and the drain (CheckDisruption, DecideDisruptionStep).
+
+// ClusterMinimumWorkers returns IBM's minimum number of workers of a cluster: 1 for Kubernetes and 2 for OpenShift.
+// CheckDisruption keeps the ready workers at or above it. An unknown distribution gets the higher value, 2.
+// Observed on IBM Cloud: IBM refused a resize or a pool removal below these counts with E1437 on IKS and on ROKS.
+//
+// Parameters:
+//   - d: the control plane's spec.distribution.
+func ClusterMinimumWorkers(d controlplanev1.Distribution) int {
+	if d == controlplanev1.DistributionKubernetes {
+		return 1
+	}
+	return 2
+}
+
+// ClusterMinimumErrorCode is the IBM error code of a resize or pool removal below ClusterMinimumWorkers;
+// kubernetesservice.Classify maps it to ClassClusterMinimum. Observed on IBM Cloud: HTTP 400, synchronous and
+// side-effect free, also for removing the only pool.
+const ClusterMinimumErrorCode = "E1437"
+
+// WorkerStateDeployed is the lifecycle.actualState of a running worker. Observed on IBM Cloud.
+const WorkerStateDeployed = "deployed"
+
+// WorkerStateDeleting is the lifecycle.actualState of a worker IBM is removing. Observed on IBM Cloud: the replaced
+// worker was deleting while IBM deleted its Node, before the replacement provisioned.
+const WorkerStateDeleting = "deleting"
+
+// WorkerStateDeleted is the lifecycle.actualState of a worker IBM has removed; ListWorkers returns such records because
+// it sends showDeleted=true. Not yet verified against IBM Cloud: whether and for how long IBM lists deleted records;
+// fallback: drop a worker from providerIDList only once two listings poolTransitionPoll apart both omit it.
+const WorkerStateDeleted = "deleted"
+
+// ReadyWorkerHealthStates returns the health.state values of a ready worker. Not yet verified against IBM Cloud:
+// every deployed worker of the live probes was "normal", but the full value set is open; fallback: extend the list.
+func ReadyWorkerHealthStates() []string {
+	return []string{"normal"}
+}
+
+// TransitionalWorkerStates returns the lifecycle.actualState values of a worker IBM is still changing; such a worker
+// keeps the cluster unsettled (CheckDisruption rule 1). The failed states provision_failed and deploy_failed are not
+// in it, so a broken worker cannot block every disruption. Not yet verified against IBM Cloud: the live probes saw
+// provisioning, deploying and deleting, the others come from IBM's documentation
+// (https://cloud.ibm.com/docs/containers?topic=containers-worker-node-state-reference); fallback: extend the list.
+func TransitionalWorkerStates() []string {
+	return []string{"provision_pending", "provisioning", "provisioned", "deploying", WorkerStateDeleting,
+		"reload_pending", "reloading"}
+}
+
+// PendingOperationBlocks makes a worker with a non-empty lifecycle.pendingOperation count as transitional.
+// Not yet verified against IBM Cloud: pendingOperation was "" on every steady worker of the live probes; whether IBM
+// sets it during a replace is open; fallback: false, if IBM turns out to keep it set on steady workers.
+const PendingOperationBlocks = true
+
+// IsWorkerReady reports whether a worker counts as ready capacity: deployed, with a health in ReadyWorkerHealthStates.
+// Not yet verified against IBM Cloud (see ReadyWorkerHealthStates; the live probes saw deployed and normal).
+//
+// Parameters:
+//   - w: the worker as ListWorkers returned it.
+func IsWorkerReady(w kubernetesservice.Worker) bool {
+	return w.ActualState == WorkerStateDeployed && slices.Contains(ReadyWorkerHealthStates(), w.HealthState)
+}
+
+// IsWorkerTransitional reports whether IBM is still changing a worker: its actualState is in TransitionalWorkerStates,
+// or, while PendingOperationBlocks is true, it has a pending operation. A deleted worker is never transitional.
+// Not yet verified against IBM Cloud (see TransitionalWorkerStates and PendingOperationBlocks).
+//
+// Parameters:
+//   - w: the worker as ListWorkers returned it.
+func IsWorkerTransitional(w kubernetesservice.Worker) bool {
+	if w.ActualState == WorkerStateDeleted {
+		return false
+	}
+	return slices.Contains(TransitionalWorkerStates(), w.ActualState) || (PendingOperationBlocks && w.PendingOperation != "")
+}
+
+// DisruptionSettleDelay is how long after the newest lastDisruptionTime of the Cluster's pools no pool starts another
+// worker removal (CheckDisruption rule 2): IBM's worker list shows a replacement or a resize only after a lag.
+// Not yet verified against IBM Cloud: IBM listed the replacement of one IKS worker about 1.7 minutes after
+// replaceWorker, but timings at scale are open; default 3 minutes; fallback: longer.
+const DisruptionSettleDelay = 3 * time.Minute
+
+// WorkerStuckAfter is how long a worker may stay transitional before CheckDisruption treats it like a failed worker (it
+// stops blocking and the message names it), and how long after the IBM call a removal may take before
+// DecideDisruptionStep reports WorkerOperationStuck. Not yet verified against IBM Cloud: one IKS replace took about
+// 5.7 minutes; default 60 minutes; fallback: longer.
+const WorkerStuckAfter = 60 * time.Minute
+
+// ReplacementNotCreatedAfter is how long after the IBM call a replaced worker's zone may stay below its size before
+// DecideDisruptionStep reports ReplacementNotCreated (auto-rebalance off, or no capacity in the zone).
+// Not yet verified against IBM Cloud: IBM listed the replacement about 1.7 minutes after the call, for a Node IBM
+// drained itself; the timing for a Node CAPIBM drained first is open; default 30 minutes; fallback: longer.
+const ReplacementNotCreatedAfter = 30 * time.Minute
+
+// ExcludeFromLoadBalancersDuringDrain makes the drain add node.kubernetes.io/exclude-from-external-load-balancers to
+// every Node it cordons (drain.CordonOptions.ExcludeFromLoadBalancers), because a cordon alone does not take a Node out
+// of cloud load balancer pools. Not yet verified against IBM Cloud: whether the IBM VPC load balancer honours the
+// label, and how fast; fallback: false.
+const ExcludeFromLoadBalancersDuringDrain = true

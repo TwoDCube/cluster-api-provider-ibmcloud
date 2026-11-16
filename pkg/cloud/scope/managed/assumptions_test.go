@@ -593,3 +593,122 @@ func TestPoolServiceDecisionPoints(t *testing.T) {
 	g.Expect(CreatePoolWithZones).To(BeTrue())
 	g.Expect(ListWorkerPoolsViaSDK).To(BeTrue())
 }
+
+func TestClusterMinimum(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(ClusterMinimumWorkers(controlplanev1.DistributionKubernetes)).To(Equal(1))
+	g.Expect(ClusterMinimumWorkers(controlplanev1.DistributionOpenShift)).To(Equal(2))
+	g.Expect(ClusterMinimumWorkers("Other")).To(Equal(2), "an unknown distribution gets the higher minimum")
+	// IBM's code for a change below the minimum, observed on both flavors. The live captures that show it arrive with
+	// the pool removal, where TestDisruptionCallOutcome reads them.
+	g.Expect(ClusterMinimumErrorCode).To(Equal("E1437"))
+}
+
+// workersFixture holds the fields of a getWorkers capture that the assumptions read.
+type workersFixture []struct {
+	ID        string `json:"id"`
+	PoolID    string `json:"poolID"`
+	Location  string `json:"location"`
+	Lifecycle struct {
+		ActualState      string `json:"actualState"`
+		PendingOperation string `json:"pendingOperation"`
+	} `json:"lifecycle"`
+	Health struct {
+		State string `json:"state"`
+	} `json:"health"`
+	KubeVersion struct {
+		Desired string `json:"desired"`
+		Actual  string `json:"actual"`
+		Target  string `json:"target"`
+	} `json:"kubeVersion"`
+}
+
+// loadWorkers decodes a getWorkers capture into the domain type, the way kubernetesservice.ListWorkers fills it.
+func loadWorkers(t *testing.T, name string) []kubernetesservice.Worker {
+	t.Helper()
+	data, err := os.ReadFile(fixturePath(name))
+	if err != nil {
+		t.Fatalf("reading fixture %s: %v", name, err)
+	}
+	var f workersFixture
+	if err := json.Unmarshal(data, &f); err != nil {
+		t.Fatalf("decoding fixture %s: %v", name, err)
+	}
+	workers := make([]kubernetesservice.Worker, 0, len(f))
+	for _, w := range f {
+		workers = append(workers, kubernetesservice.Worker{
+			ID:                 w.ID,
+			PoolID:             w.PoolID,
+			Zone:               w.Location,
+			ActualState:        w.Lifecycle.ActualState,
+			PendingOperation:   w.Lifecycle.PendingOperation,
+			HealthState:        w.Health.State,
+			KubeVersionActual:  w.KubeVersion.Actual,
+			KubeVersionTarget:  w.KubeVersion.Target,
+			KubeVersionDesired: w.KubeVersion.Desired,
+		})
+	}
+	return workers
+}
+
+func TestWorkerStates(t *testing.T) {
+	steady := loadWorkers(t, "iks-getWorkers-normal.json")[0]
+	provisioning := loadWorkers(t, "iks-getWorkers-deploying.json")[0]
+	with := func(w kubernetesservice.Worker, state, pending, health string) kubernetesservice.Worker {
+		w.ActualState, w.PendingOperation, w.HealthState = state, pending, health
+		return w
+	}
+	testCases := []struct {
+		name             string
+		worker           kubernetesservice.Worker
+		wantReady        bool
+		wantTransitional bool
+	}{
+		{name: "steady live worker", worker: steady, wantReady: true, wantTransitional: false},
+		{name: "provisioning live worker", worker: provisioning, wantReady: false, wantTransitional: true},
+		{name: "deleting", worker: with(steady, "deleting", "", "normal"), wantReady: false, wantTransitional: true},
+		{name: "deleted is neither", worker: with(steady, "deleted", "", ""), wantReady: false, wantTransitional: false},
+		{name: "deleted with a pending operation is not transitional", worker: with(steady, "deleted", "replace", ""), wantReady: false, wantTransitional: false},
+		{name: "deployed with a pending operation", worker: with(steady, "deployed", "replace", "normal"), wantReady: true, wantTransitional: true},
+		{name: "deployed with health warning is not ready", worker: with(steady, "deployed", "", "warning"), wantReady: false, wantTransitional: false},
+		{name: "deployed with no health yet is not ready", worker: with(steady, "deployed", "", ""), wantReady: false, wantTransitional: false},
+		{name: "provision_failed is not transitional", worker: with(steady, "provision_failed", "", "critical"), wantReady: false, wantTransitional: false},
+		{name: "deploy_failed is not transitional", worker: with(steady, "deploy_failed", "", "critical"), wantReady: false, wantTransitional: false},
+		{name: "unknown state is not transitional", worker: with(steady, "something_new", "", ""), wantReady: false, wantTransitional: false},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(IsWorkerReady(tc.worker)).To(Equal(tc.wantReady))
+			g.Expect(IsWorkerTransitional(tc.worker)).To(Equal(tc.wantTransitional))
+		})
+	}
+	for _, state := range TransitionalWorkerStates() {
+		t.Run("transitional state "+state, func(t *testing.T) {
+			g := NewWithT(t)
+			w := with(steady, state, "", "")
+			g.Expect(IsWorkerReady(w)).To(BeFalse())
+			g.Expect(IsWorkerTransitional(w)).To(BeTrue())
+		})
+	}
+}
+
+// TestDisruptionDecisionPoints pins the disruption decision points: the worker states, the settle and stuck timings,
+// the replacement wait and the load balancer exclusion.
+func TestDisruptionDecisionPoints(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(WorkerStateDeployed).To(Equal("deployed"))
+	g.Expect(WorkerStateDeleting).To(Equal("deleting"))
+	g.Expect(WorkerStateDeleted).To(Equal("deleted"))
+	g.Expect(ReadyWorkerHealthStates()).To(Equal([]string{"normal"}))
+	g.Expect(TransitionalWorkerStates()).To(Equal([]string{"provision_pending", "provisioning", "provisioned",
+		"deploying", "deleting", "reload_pending", "reloading"}))
+	g.Expect(PendingOperationBlocks).To(BeTrue())
+	g.Expect(DisruptionSettleDelay).To(Equal(3 * time.Minute))
+	g.Expect(WorkerStuckAfter).To(Equal(60 * time.Minute))
+	g.Expect(ReplacementNotCreatedAfter).To(Equal(30 * time.Minute))
+	g.Expect(ExcludeFromLoadBalancersDuringDrain).To(BeTrue())
+	// On IBM Cloud one replace took about 5.7 minutes and the replacement was listed after about 1.7 minutes.
+	g.Expect(WorkerStuckAfter).To(BeNumerically(">", 6*time.Minute))
+	g.Expect(DisruptionSettleDelay).To(BeNumerically(">", 2*time.Minute))
+}

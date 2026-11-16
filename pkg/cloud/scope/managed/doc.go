@@ -47,4 +47,10 @@ limitations under the License.
 //     condition reason, Transient for errors that controller-runtime should retry with backoff, or Terminal for
 //     conditions that need a human. Condition messages never carry IBM free text, and status is written only when it
 //     changes, so that an unchanged answer from IBM causes no status write and no further reconcile.
+//   - Worker removals are serialized per Cluster. A replace, a scale-down and a pool deletion each hold the Cluster's
+//     disruption token, a Lease, from the first cordon until the removal settled (DisruptionToken), and advance one
+//     step per reconcile as DecideDisruptionStep decides it from what the pool controller observed; CheckDisruption
+//     holds the cluster-wide gates. Their tests check over generated inputs that two disruptions never overlap, that
+//     no removal takes the cluster below IBM's minimum, and that IBM is never asked to remove a worker whose Node
+//     still runs evictable pods, unless the drain time limit expired or the drain is excluded.
 package managed
