@@ -2176,6 +2176,9 @@ func TestControlPlaneEnvtestCreate(t *testing.T) {
 	g := NewWithT(t)
 	namespace := newTestNamespace(t, "cp-create")
 	cluster, infra := createEnvtestCreateInputs(t, namespace)
+	// The test ends with a bound control plane and an owned initial pool: paused, a later manager that watches every
+	// namespace (the pool controller's envtests) leaves them alone instead of calling IBM for this cluster ID.
+	t.Cleanup(func() { pauseTestCluster(t, cluster) })
 	cp := createEnvtestControlPlane(t, namespace, "dev", cluster)
 	key := client.ObjectKeyFromObject(cp)
 
