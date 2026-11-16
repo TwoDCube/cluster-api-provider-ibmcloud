@@ -838,6 +838,27 @@ func TestMachinePoolScopeClusterStateGate(t *testing.T) {
 	})
 }
 
+func TestClusterStateMessage(t *testing.T) {
+	testCases := []struct {
+		name  string
+		state string
+		want  string
+	}{
+		{name: "unavailable accepts no pool change", state: "unavailable",
+			want: "IBM cluster c1 is unavailable; IBM accepts no worker pool change in that state"},
+		{name: "scaled_down accepts no pool change", state: "scaled_down",
+			want: "IBM cluster c1 is scaled_down; IBM accepts no worker pool change in that state"},
+		{name: "unsupported names the master upgrade", state: "unsupported",
+			want: "IBM cluster c1 runs an unsupported version: IBM does not add or reload workers on an unsupported version; " +
+				"upgrade the master first"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			NewWithT(t).Expect(clusterStateMessage("c1", tc.state)).To(Equal(tc.want))
+		})
+	}
+}
+
 func TestMachinePoolScopeObserves(t *testing.T) {
 	pools := []kubernetesservice.WorkerPool{ibmPool("workers", 2, "us-south-2", "us-south-1")}
 	t.Run("no_worker_publishes_zero_replicas", func(t *testing.T) {
@@ -1234,6 +1255,56 @@ func TestMachinePoolScopeIBMErrors(t *testing.T) {
 				g.Expect(ready.Reason).To(Equal(MachinePoolIBMAPIErrorReason))
 				g.Expect(ready.Message).To(ContainSubstring(tc.wantCondition))
 			}
+			if tc.invalidated {
+				g.Expect(f.builder.invalidated).To(ConsistOf(credentials.ControllerKey()))
+			} else {
+				g.Expect(f.builder.invalidated).To(BeEmpty())
+			}
+		})
+	}
+}
+
+// TestMachinePoolScopeIBMProblemOn checks that ibmProblemOn classifies like ibmProblem but reports through the function
+// it is given, once, and leaves the pool's own conditions alone; a 429 and a transient failure report nothing.
+func TestMachinePoolScopeIBMProblemOn(t *testing.T) {
+	action := "replacing worker w0 of IBM cluster " + poolTestClusterID
+	testCases := []struct {
+		name        string
+		err         error
+		wantKind    OutcomeKind
+		wantMessage string
+		invalidated bool
+	}{
+		{name: "401 rebuilds the identity's authenticator", err: apiError(kubernetesservice.OpReplaceWorker, http.StatusUnauthorized, ""),
+			wantKind: OutcomeNotDone, invalidated: true,
+			wantMessage: "IBM Cloud rejected the credentials of the test identity while " + action + "; CAPIBM rebuilds them and retries"},
+		{name: "403 names the roles and the code only", err: apiError(kubernetesservice.OpReplaceWorker, http.StatusForbidden, "E3e8a"),
+			wantKind: OutcomeTerminal,
+			wantMessage: "IBM Cloud refused the test identity (HTTP 403, code E3e8a) while " + action + "; grant it the Administrator " +
+				"platform role and the Manager service role on Kubernetes Service (the IAM roles of the managed Kubernetes book)"},
+		{name: "400 asks for a human", err: apiError(kubernetesservice.OpReplaceWorker, http.StatusBadRequest, "E9999"),
+			wantKind: OutcomeTerminal,
+			wantMessage: "IBM Cloud refused the request (HTTP 400, code E9999) while " + action + "; check spec.flavor and " +
+				"spec.zones of IBMCloudManagedMachinePool/workers; the controller log has IBM's description"},
+		{name: "429 reports nothing", err: apiError(kubernetesservice.OpReplaceWorker, http.StatusTooManyRequests, ""), wantKind: OutcomeRateLimited},
+		{name: "5xx reports nothing", err: apiError(kubernetesservice.OpReplaceWorker, http.StatusInternalServerError, ""), wantKind: OutcomeTransient},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			f := newPoolFixture(t)
+			scope := f.scope()
+			clients := &poolClients{identity: credentials.Identity{Key: credentials.ControllerKey(), Description: "the test identity"}, kubernetes: f.ibm}
+			var reported []string
+			outcome := scope.ibmProblemOn(func(reason, message string) { reported = append(reported, reason+": "+message) },
+				clients, kubernetesservice.OpReplaceWorker, action, tc.err)
+			g.Expect(outcome.Kind).To(Equal(tc.wantKind))
+			if tc.wantMessage == "" {
+				g.Expect(reported).To(BeEmpty())
+			} else {
+				g.Expect(reported).To(Equal([]string{MachinePoolIBMAPIErrorReason + ": " + tc.wantMessage}))
+			}
+			g.Expect(f.pool.Status.Conditions).To(BeEmpty(), "only the given report function writes")
 			if tc.invalidated {
 				g.Expect(f.builder.invalidated).To(ConsistOf(credentials.ControllerKey()))
 			} else {

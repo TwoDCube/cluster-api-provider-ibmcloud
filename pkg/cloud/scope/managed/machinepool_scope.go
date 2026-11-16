@@ -567,14 +567,26 @@ func (s *MachinePoolScope) clusterStateGate(op PoolOperation) (Outcome, bool) {
 	if PoolMutationAllowed(state, op) {
 		return Outcome{}, false
 	}
-	message := fmt.Sprintf("IBM cluster %s is %s; IBM accepts no worker pool change in that state", s.ControlPlane.Status.ClusterID, state)
-	if state == clusterStateUnsupported {
-		message = fmt.Sprintf("IBM cluster %s runs an unsupported version: IBM does not add or reload workers on an "+
-			"unsupported version; upgrade the master first", s.ControlPlane.Status.ClusterID)
-	}
 	reason := infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForClusterStateReason
-	s.report(reason, message)
+	s.report(reason, clusterStateMessage(s.ControlPlane.Status.ClusterID, state))
 	return NotDone(IntervalGuarded, reason), true
+}
+
+// clusterStateMessage is the WaitingForClusterState message of a pool operation that PoolMutationAllowed denies in
+// state: unavailable and scaled_down accept no pool change at all, while unsupported refuses only the operations
+// that add or reload workers (create, grow, replace), so its message says that and names the fix. Every
+// cluster-state gate of the pool, before a mutation and in the pre-call gate of a removal, uses it, so that one state
+// always reads the same.
+//
+// Parameters:
+//   - clusterID is the IBM cluster ID.
+//   - state is the IBM cluster state that denied the operation.
+func clusterStateMessage(clusterID, state string) string {
+	if state == clusterStateUnsupported {
+		return fmt.Sprintf("IBM cluster %s runs an unsupported version: IBM does not add or reload workers on an "+
+			"unsupported version; upgrade the master first", clusterID)
+	}
+	return fmt.Sprintf("IBM cluster %s is %s; IBM accepts no worker pool change in that state", clusterID, state)
 }
 
 // observe lists the workers of the cluster and publishes what the pool listing and the worker listing say:
@@ -816,6 +828,22 @@ func (s *MachinePoolScope) reportReadiness(pool *kubernetesservice.WorkerPool, w
 //   - action says what the call did, for example "listing the workers of IBM cluster c1".
 //   - err is the call's error.
 func (s *MachinePoolScope) ibmProblem(clients *poolClients, op kubernetesservice.Operation, action string, err error) Outcome {
+	return s.ibmProblemOn(s.report, clients, op, action, err)
+}
+
+// ibmProblemOn is ibmProblem with the report of the problem left to report instead of MachinePoolScope.report: a
+// worker removal reports IBM's answer to its call on the condition it reports its steps on, which for a worker replace
+// is WorkersUpToDate (removalRunnerInput.reportCallError). Classification, outcome and the 401 handling are the same.
+//
+// Parameters:
+//   - report sets the condition the problem is reported on, from the reason and the message; it is called at most
+//     once, and not for a failure that leaves the conditions as they are (429, transient).
+//   - clients are this reconcile's IBM clients; their identity made the call.
+//   - op is the failed operation; Classify reads the error per operation.
+//   - action says what the call did, for example "listing the workers of IBM cluster c1".
+//   - err is the call's error.
+func (s *MachinePoolScope) ibmProblemOn(report func(reason, message string), clients *poolClients, op kubernetesservice.Operation,
+	action string, err error) Outcome {
 	reason := MachinePoolIBMAPIErrorReason
 	statusCode, code := 0, ""
 	var apiErr *kubernetesservice.APIError
@@ -830,7 +858,7 @@ func (s *MachinePoolScope) ibmProblem(clients *poolClients, op kubernetesservice
 	case kubernetesservice.ClassUnauthorized:
 		// Only this identity's authenticator is rebuilt, on its next use; other identities keep theirs.
 		s.params.ClientBuilder.InvalidateAuthenticator(clients.identity.Key)
-		s.report(reason, fmt.Sprintf("IBM Cloud rejected the credentials of %s while %s; CAPIBM rebuilds them and retries",
+		report(reason, fmt.Sprintf("IBM Cloud rejected the credentials of %s while %s; CAPIBM rebuilds them and retries",
 			clients.identity.Description, action))
 		return NotDone(IntervalSteadyState, reason)
 	case kubernetesservice.ClassPermissionDenied, kubernetesservice.ClassAutoscaled:
@@ -841,15 +869,15 @@ func (s *MachinePoolScope) ibmProblem(clients *poolClients, op kubernetesservice
 		// transient failure with the fast backoff.
 		message := fmt.Sprintf("IBM Cloud refused %s (%s) while %s; grant it %s (the IAM roles of the managed Kubernetes book)",
 			clients.identity.Description, answer, action, poolKubernetesServiceRoles)
-		s.report(reason, message)
+		report(reason, message)
 		return Terminal(reason, message)
 	case kubernetesservice.ClassBadRequest:
 		message := fmt.Sprintf("IBM Cloud refused the request (%s) while %s; check spec.flavor and spec.zones of %s; the "+
 			"controller log has IBM's description", answer, action, s.objectName())
-		s.report(reason, message)
+		report(reason, message)
 		return Terminal(reason, message)
 	case kubernetesservice.ClassNotFound:
-		s.report(reason, fmt.Sprintf("IBM Cloud answered %s while %s: the IBM cluster or pool is gone; CAPIBM looks again", answer, action))
+		report(reason, fmt.Sprintf("IBM Cloud answered %s while %s: the IBM cluster or pool is gone; CAPIBM looks again", answer, action))
 		return NotDone(IntervalSteadyState, reason)
 	case kubernetesservice.ClassRateLimited:
 		return RateLimited(kubernetesservice.RateLimitBackoff(err))
