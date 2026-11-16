@@ -33,6 +33,7 @@ import (
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 
+	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
 	infrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/v1alpha1"
 
 	. "github.com/onsi/gomega"
@@ -62,6 +63,15 @@ func newTestNamespace(t *testing.T, generateName string) string {
 		g.Expect(testEnv.Cleanup(ctx, &corev1.Namespace{ObjectMeta: ns.ObjectMeta})).To(Succeed())
 	})
 	return ns.Name
+}
+
+// managedControlPlaneRef is a Cluster's spec.controlPlaneRef to an IBMCloudManagedControlPlane named name.
+func managedControlPlaneRef(name string) clusterv1.ContractVersionedObjectReference {
+	return clusterv1.ContractVersionedObjectReference{
+		APIGroup: controlplanev1.GroupVersion.Group,
+		Kind:     ibmCloudManagedControlPlaneKind,
+		Name:     name,
+	}
 }
 
 // createTestCluster creates a CAPI Cluster whose infrastructureRef names the IBMCloudManagedCluster of the same name
