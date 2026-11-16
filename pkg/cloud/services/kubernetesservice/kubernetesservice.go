@@ -42,8 +42,10 @@ type KubernetesService interface {
 	DeleteCluster(ctx context.Context, clusterID, resourceGroupID string) error
 	// UpdateMaster requests a master minor update to version ("1.37", "4.22_openshift"; that IBM accepts a minor without
 	// a patch here is not yet verified against IBM Cloud); force is never set, so IBM's own checks stay in force. IBM
-	// answers 409 when the version is already requested and 403 for a skip of more than two versions. SDK
-	// V2UpdateMasterWithContext (POST /v2/updateMaster).
+	// answers 409 when the version is already requested (ClassMasterUpdateAlreadyRequested). Classify makes a 403
+	// ClassPermissionDenied, most likely a missing Kubernetes Service IAM role, because CAPIBM requests only the observed
+	// minor + 1 and so never provokes IBM's version-skip refusal; only an IBM code recorded as identifying that refusal
+	// (none observed yet) makes a 403 ClassVersionSkipNotAllowed. SDK V2UpdateMasterWithContext (POST /v2/updateMaster).
 	UpdateMaster(ctx context.Context, clusterID, version string) error
 	// ListVersions returns the offered Kubernetes and OpenShift versions. SDK GetVersionsWithContext
 	// (GET /v1/versions; the SDK's V2GetVersions decodes the wrong shape).

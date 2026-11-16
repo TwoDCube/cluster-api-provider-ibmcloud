@@ -1114,7 +1114,8 @@ func TestUpdateMaster(t *testing.T) {
 		expected ErrorClass
 	}{
 		{name: "updateMaster 409 is MasterUpdateAlreadyRequested", status: http.StatusConflict, body: []byte(`{"description":"The specified value is already set on the cluster."}`), expected: ClassMasterUpdateAlreadyRequested},
-		{name: "updateMaster 403 is VersionSkipNotAllowed", status: http.StatusForbidden, body: []byte(`{"description":"The master is more than two versions behind the targeted version."}`), expected: ClassVersionSkipNotAllowed},
+		// Description text never makes a 403 VersionSkipNotAllowed; only a recorded version-skip code would.
+		{name: "updateMaster 403 naming a version skip is PermissionDenied", status: http.StatusForbidden, body: []byte(`{"description":"The master is more than two versions behind the targeted version."}`), expected: ClassPermissionDenied},
 		{name: "404 is NotFound", status: http.StatusNotFound, body: nil, expected: ClassNotFound},
 		{name: "401 is Unauthorized", status: http.StatusUnauthorized, body: nil, expected: ClassUnauthorized},
 		{name: "500 is Transient and sent once", status: http.StatusInternalServerError, body: nil, expected: ClassTransient},

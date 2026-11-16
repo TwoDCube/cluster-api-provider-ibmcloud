@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -88,7 +89,8 @@ const (
 	// ClassUnauthorized is a 401 from IBM Cloud Kubernetes Service, or IAM rejecting the credentials before the
 	// request was sent (ErrCredentialsRejected). The caller invalidates that identity's authenticator.
 	ClassUnauthorized ErrorClass = "Unauthorized"
-	// ClassPermissionDenied is a 403 without a more specific row.
+	// ClassPermissionDenied is a 403 without a more specific row. That includes every 403 on UpdateMaster whose IBM
+	// code is not a recorded version-skip code (see ClassVersionSkipNotAllowed).
 	ClassPermissionDenied ErrorClass = "PermissionDenied"
 	// ClassRateLimited is a 429; wait RateLimitBackoff before the next request.
 	ClassRateLimited ErrorClass = "RateLimited"
@@ -116,12 +118,13 @@ const (
 	// ClassMasterUpdateAlreadyRequested is a 409 on UpdateMaster ("The specified value is already set on the
 	// cluster"): a re-POST before IBM shows the update as pending. Never an error; the caller keeps polling.
 	ClassMasterUpdateAlreadyRequested ErrorClass = "MasterUpdateAlreadyRequested"
-	// ClassVersionSkipNotAllowed is a 403 on UpdateMaster ("The master is more than two versions behind the targeted
-	// version"). No retry until the spec changes. Caveat for callers: the control plane controller refuses a skip before
-	// calling and only ever requests the observed minor + 1, so CAPIBM's own requests should not provoke IBM's skip
-	// refusal, while a caller without the Kubernetes Service IAM role also gets a 403 here. Every UpdateMaster 403 is
-	// still this class until an IBM code that tells the two apart is observed on IBM Cloud; a message for it should name
-	// both causes.
+	// ClassVersionSkipNotAllowed is a 403 on UpdateMaster whose IBM error code specifically identifies IBM's refusal
+	// to skip versions ("The master is more than two versions behind the targeted version"). No retry until the spec
+	// changes. Such a code is listed in versionSkipRefusalCodes; none has been observed on IBM Cloud yet, so Classify
+	// does not return this class today. Every other UpdateMaster 403, including one whose description text names a
+	// version skip, is ClassPermissionDenied: the control plane controller refuses a skip before calling and only ever
+	// requests the observed minor + 1, so a 403 is almost certainly a missing Kubernetes Service IAM role, and
+	// VersionSkipNotAllowed would send the operator after the wrong cause.
 	ClassVersionSkipNotAllowed ErrorClass = "VersionSkipNotAllowed"
 )
 
@@ -143,6 +146,12 @@ const (
 	// codeClusterMinimum is IBM's "below the cluster's minimum workers" code (400, observed on IBM Cloud).
 	codeClusterMinimum = "E1437"
 )
+
+// versionSkipRefusalCodes are the IBM error codes that specifically identify UpdateMaster's refusal to skip versions
+// (ClassVersionSkipNotAllowed). It is the one place to add such a code, as a named constant in the block above, once
+// one is observed on IBM Cloud. Until then it is empty and every UpdateMaster 403 is ClassPermissionDenied. IBM's
+// description text is never a substitute for a code here. Read only: nothing assigns to it at run time.
+var versionSkipRefusalCodes []string
 
 // autoscaledPoolForbidden is the description IBM documents for a 403 on a resize or removal of an autoscaled pool. It
 // is the one row of Classify that matches description text, because a 403 on these operations has no code that tells
@@ -240,21 +249,31 @@ func classifyOperation(op Operation, apiErr *APIError) ErrorClass {
 	case OpRemoveWorkerPool, OpResizeWorkerPool:
 		return classifyPoolSizeChange(apiErr)
 	case OpUpdateMaster:
-		return classifyUpdateMaster(apiErr)
+		return classifyUpdateMaster(apiErr, versionSkipRefusalCodes)
 	default:
 		return ClassUnknown
 	}
 }
 
-// classifyUpdateMaster applies the UpdateMaster rows to apiErr. The live swagger documents both statuses for
-// updateMaster only, so they are matched by operation and status.
-func classifyUpdateMaster(apiErr *APIError) ErrorClass {
-	switch apiErr.StatusCode {
-	case http.StatusConflict:
+// classifyUpdateMaster applies the UpdateMaster rows to apiErr. The live swagger documents a 409 and a 403 for
+// updateMaster only; the 409 is matched by operation and status, the 403 only together with a version-skip code.
+//
+// Parameters:
+//   - apiErr is UpdateMaster's answer.
+//   - skipCodes are the IBM codes that identify a version-skip refusal. Classify passes versionSkipRefusalCodes; it is
+//     a parameter so that the tests can show where such a code will map once one is observed, before any is known.
+func classifyUpdateMaster(apiErr *APIError, skipCodes []string) ErrorClass {
+	switch {
+	case apiErr.StatusCode == http.StatusConflict:
 		return ClassMasterUpdateAlreadyRequested
-	case http.StatusForbidden:
+	case apiErr.StatusCode == http.StatusForbidden && apiErr.Code != "" && slices.Contains(skipCodes, apiErr.Code):
+		// Only a code tells IBM's skip refusal apart from a missing role. The empty-code guard keeps a 403
+		// without a code out of this row even if "" were ever listed.
 		return ClassVersionSkipNotAllowed
 	default:
+		// Every other 403 is left to classifyStatus, which makes it ClassPermissionDenied like a 403 on any other
+		// operation. CAPIBM requests only the observed minor + 1, so IBM's documented skip refusal cannot be the cause, and
+		// a 403 is almost certainly a missing Kubernetes Service IAM role.
 		return ClassUnknown
 	}
 }

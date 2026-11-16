@@ -111,7 +111,16 @@ func TestClassify(t *testing.T) {
 		{name: "429 on ResizeWorkerPool", op: OpResizeWorkerPool, err: apiError(OpResizeWorkerPool, http.StatusTooManyRequests, ""), expected: ClassRateLimited},
 
 		{name: "UpdateMaster 409 is MasterUpdateAlreadyRequested", op: OpUpdateMaster, err: apiError(OpUpdateMaster, http.StatusConflict, ""), expected: ClassMasterUpdateAlreadyRequested},
-		{name: "UpdateMaster 403 is VersionSkipNotAllowed", op: OpUpdateMaster, err: apiError(OpUpdateMaster, http.StatusForbidden, ""), expected: ClassVersionSkipNotAllowed},
+		// An UpdateMaster 403 is PermissionDenied unless its code is a recorded version-skip code (none observed yet);
+		// TestClassifyUpdateMaster shows where such a code maps.
+		{name: "UpdateMaster 403 without code is PermissionDenied", op: OpUpdateMaster, err: apiError(OpUpdateMaster, http.StatusForbidden, ""), expected: ClassPermissionDenied},
+		{
+			name:     "UpdateMaster 403 naming a version skip only in its description is PermissionDenied",
+			op:       OpUpdateMaster,
+			err:      &APIError{Operation: OpUpdateMaster, StatusCode: http.StatusForbidden, Description: "The master is more than two versions behind the targeted version."},
+			expected: ClassPermissionDenied,
+		},
+		{name: "UpdateMaster 403 with a code that is not recorded is PermissionDenied", op: OpUpdateMaster, err: apiError(OpUpdateMaster, http.StatusForbidden, "E9999"), expected: ClassPermissionDenied},
 		{name: "UpdateMaster 404 is NotFound", op: OpUpdateMaster, err: apiError(OpUpdateMaster, http.StatusNotFound, ""), expected: ClassNotFound},
 		{name: "409 on CreateCluster is not MasterUpdateAlreadyRequested", op: OpCreateCluster, err: apiError(OpCreateCluster, http.StatusConflict, ""), expected: ClassUnknown},
 	}
@@ -121,6 +130,82 @@ func TestClassify(t *testing.T) {
 			g.Expect(Classify(tc.op, tc.err)).To(Equal(tc.expected))
 		})
 	}
+}
+
+// TestClassifyUpdateMaster shows the UpdateMaster rows with a version-skip code list passed in, because IBM's code has
+// not been observed yet. The rows that return ClassUnknown are left to the status rows, which make a 403
+// ClassPermissionDenied (TestClassify).
+func TestClassifyUpdateMaster(t *testing.T) {
+	// recordedSkipCode stands for a version-skip code once one is observed; it is not an IBM code.
+	const recordedSkipCode = "Exxxx"
+	testCases := []struct {
+		name      string
+		apiErr    *APIError
+		skipCodes []string
+		expected  ErrorClass
+	}{
+		{
+			name:      "403 with a recorded version-skip code is VersionSkipNotAllowed",
+			apiErr:    &APIError{Operation: OpUpdateMaster, StatusCode: http.StatusForbidden, Code: recordedSkipCode},
+			skipCodes: []string{recordedSkipCode},
+			expected:  ClassVersionSkipNotAllowed,
+		},
+		{
+			name:      "403 with the same code but no recorded codes is left to the status rows",
+			apiErr:    &APIError{Operation: OpUpdateMaster, StatusCode: http.StatusForbidden, Code: recordedSkipCode},
+			skipCodes: nil,
+			expected:  ClassUnknown,
+		},
+		{
+			name:      "403 with another code is left to the status rows",
+			apiErr:    &APIError{Operation: OpUpdateMaster, StatusCode: http.StatusForbidden, Code: "E9999"},
+			skipCodes: []string{recordedSkipCode},
+			expected:  ClassUnknown,
+		},
+		{
+			name: "403 naming a version skip only in its description is left to the status rows",
+			apiErr: &APIError{
+				Operation:   OpUpdateMaster,
+				StatusCode:  http.StatusForbidden,
+				Description: "The master is more than two versions behind the targeted version.",
+			},
+			skipCodes: []string{recordedSkipCode},
+			expected:  ClassUnknown,
+		},
+		{
+			name:      "403 without code is left to the status rows even if an empty code is listed",
+			apiErr:    &APIError{Operation: OpUpdateMaster, StatusCode: http.StatusForbidden},
+			skipCodes: []string{""},
+			expected:  ClassUnknown,
+		},
+		{
+			name:      "the recorded code with another status is left to the status rows",
+			apiErr:    &APIError{Operation: OpUpdateMaster, StatusCode: http.StatusBadRequest, Code: recordedSkipCode},
+			skipCodes: []string{recordedSkipCode},
+			expected:  ClassUnknown,
+		},
+		{
+			name:      "409 is MasterUpdateAlreadyRequested whatever the code",
+			apiErr:    &APIError{Operation: OpUpdateMaster, StatusCode: http.StatusConflict, Code: recordedSkipCode},
+			skipCodes: []string{recordedSkipCode},
+			expected:  ClassMasterUpdateAlreadyRequested,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(classifyUpdateMaster(tc.apiErr, tc.skipCodes)).To(Equal(tc.expected))
+		})
+	}
+
+	// Classify must pass the package's list: every code recorded there maps to VersionSkipNotAllowed end to end. The
+	// loop is empty until a code is recorded.
+	t.Run("every recorded version-skip code reaches Classify", func(t *testing.T) {
+		g := NewWithT(t)
+		for _, code := range versionSkipRefusalCodes {
+			g.Expect(Classify(OpUpdateMaster, apiError(OpUpdateMaster, http.StatusForbidden, code))).To(Equal(ClassVersionSkipNotAllowed), "code %s", code)
+		}
+	})
 }
 
 func TestAPIErrorError(t *testing.T) {
