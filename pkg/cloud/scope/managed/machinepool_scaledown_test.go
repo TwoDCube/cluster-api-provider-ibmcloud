@@ -720,6 +720,26 @@ func TestMachinePoolScopeScaleDownCallFailures(t *testing.T) {
 		g.Expect(f.ready().Message).To(ContainSubstring("while shrinking worker pool workers of IBM cluster " + poolTestClusterID +
 			" to 1 workers per zone; grant it " + poolKubernetesServiceRoles))
 	})
+	t.Run("a refused resize keeps its report while it waits out DisruptionSettleDelay", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newScaleDownFixture(t, nil)
+		f.inPhase(infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach)
+		f.cordonVictims(true)
+		f.expect()
+		f.ibm.EXPECT().ResizeWorkerPool(gomock.Any(), poolTestClusterID, poolTestPoolID, int64(1)).
+			Return(apiError(kubernetesservice.OpResizeWorkerPool, http.StatusForbidden, "E3e8a"))
+		g.Expect(f.reconcile().Kind).To(Equal(OutcomeTerminal))
+		refused := f.ready().DeepCopy()
+		g.Expect(refused.Message).To(ContainSubstring("(HTTP 403, code E3e8a) while shrinking worker pool workers"))
+
+		// The reconcile that the status patch triggers a second later sends no call and keeps the cause in view.
+		f.clock.Step(time.Second)
+		f.expect()
+		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalGuarded, MachinePoolIBMAPIErrorReason)))
+		g.Expect(f.ready()).To(Equal(refused), "no churn: nothing new is written")
+		g.Expect(f.pool.Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseWaitingForIBM))
+		g.Expect(f.cordoned()).To(Equal([]string{"10.0.0.1", "10.0.0.2"}))
+	})
 	t.Run("the workload cluster down before the call holds", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newScaleDownFixture(t, nil)
@@ -982,6 +1002,23 @@ func TestMachinePoolScopeScaleDownWithoutVictims(t *testing.T) {
 		f.expect()
 		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalGuarded, string(ReasonWaitingForClusterMinimum))))
 		g.Expect(f.ready().Message).To(Equal(message))
+	})
+	t.Run("a 403 keeps its report, unwrapped, while the resize waits out DisruptionSettleDelay", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newScaleDownFixture(t, nil)
+		f.workers = f.workers[4:]
+		f.expect()
+		f.ibm.EXPECT().ResizeWorkerPool(gomock.Any(), poolTestClusterID, poolTestPoolID, int64(1)).
+			Return(apiError(kubernetesservice.OpResizeWorkerPool, http.StatusForbidden, "E3e8a"))
+		g.Expect(f.reconcile().Kind).To(Equal(OutcomeTerminal))
+		refused := f.ready().DeepCopy()
+		g.Expect(refused.Reason).To(Equal(MachinePoolIBMAPIErrorReason))
+		for _, step := range []time.Duration{time.Second, time.Minute} {
+			f.clock.Step(step)
+			f.expect()
+			g.Expect(f.reconcile()).To(Equal(NotDone(IntervalGuarded, MachinePoolIBMAPIErrorReason)), "no second call")
+			g.Expect(f.ready()).To(Equal(refused), "the gate's prefix never wraps the report")
+		}
 	})
 	for _, tc := range []struct {
 		name       string

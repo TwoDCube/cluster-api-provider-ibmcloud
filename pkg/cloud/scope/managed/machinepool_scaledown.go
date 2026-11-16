@@ -34,7 +34,6 @@ import (
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/v1alpha1"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
-	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/drain"
 )
 
 // This file is the scale-down of an IBMCloudManagedMachinePool. IBM's resizeWorkerPool cannot name the workers it
@@ -492,21 +491,12 @@ func (s *MachinePoolScope) markedWorkers(view workloadNodes, poolID string, work
 	var marked []string
 	for i := range view.nodes {
 		node := &view.nodes[i]
-		if id, found := byProviderID[node.Spec.ProviderID]; found && ownsDrainMarker(node, s.Pool) {
+		if id, found := byProviderID[node.Spec.ProviderID]; found && hasDrainOwner(node, s.Pool) {
 			marked = append(marked, id)
 		}
 	}
 	slices.Sort(marked)
 	return slices.Compact(marked), nil
-}
-
-// ownsDrainMarker reports whether node carries pool's drain-owner marker, which CAPIBM writes with every cordon.
-//
-// Parameters:
-//   - node is the Node.
-//   - pool is the IBMCloudManagedMachinePool.
-func ownsDrainMarker(node *corev1.Node, pool *infrav1.IBMCloudManagedMachinePool) bool {
-	return node.Annotations[infrav1.NodeAnnotationPrefix+drain.MarkerDrainOwner] == DrainOwner(pool)
 }
 
 // scaleDown is one reconcile of the ScaleDown removal: what was observed, the plan, and the handles that carry out the
@@ -764,7 +754,7 @@ func (sd *scaleDown) run(ctx context.Context) Outcome {
 			return Transient(err)
 		}
 		o.Token = status.State
-		if o.Drain, err = sd.drainProgress(ctx, o); err != nil {
+		if o.Drain, err = sd.runner.checkDrain(ctx, o); err != nil {
 			return Transient(err)
 		}
 	}
@@ -811,7 +801,7 @@ func (sd *scaleDown) observation(ctx context.Context) (DisruptionObservation, er
 		PreCallGate: preCall,
 		IBM:         sd.verified.Progress,
 	}
-	o.Drain, err = sd.drainProgress(ctx, o)
+	o.Drain, err = sd.runner.checkDrain(ctx, o)
 	return o, err
 }
 
@@ -860,51 +850,6 @@ func (sd *scaleDown) lastCallRefused() bool {
 		sd.runner.recordedRefusal() != ""
 }
 
-// drainProgress observes the drain for the effective phase of o: in every phase before the IBM call it checks the
-// victims without evicting (DrainStep.Check), and the gates read only the exclusions. Unlike the pool deletion, which
-// never aborts, it does not evict while it observes: a scale-down whose MachinePool went back up is aborted, and
-// evicting first would only move pods for nothing. The eviction runs once the decision is StepDrain (drainVictims).
-// Nothing is cordoned or evicted before this pool holds the disruption token. ResizeOnly drains nothing, so its
-// drain counts as excluded.
-//
-// Parameters:
-//   - ctx is the reconcile context.
-//   - o is the observation so far.
-func (sd *scaleDown) drainProgress(ctx context.Context, o DisruptionObservation) (DrainProgress, error) {
-	runner := sd.runner
-	knobsOnly := DrainProgress{Excluded: runner.knobs.ExcludeDraining || sd.resizeOnly,
-		DetachExcluded: runner.knobs.ExcludeVolumeDetachWait || sd.resizeOnly}
-	phase := o.Phase
-	if phase == "" && o.ResumeFromNodeMarkers {
-		phase = infrav1.WorkerDisruptionPhaseDraining
-	}
-	if sd.resizeOnly || o.Token != TokenHeld || !isPreCallPhase(phase) {
-		return knobsOnly, nil
-	}
-	if runner.drain == nil {
-		return runner.disconnectedProgress(), nil
-	}
-	if runner.drainResult == nil {
-		if err := runner.runDrain(ctx, false); err != nil {
-			return DrainProgress{}, err
-		}
-	}
-	return runner.drainResult.Progress, nil
-}
-
-// announceTimeout emits DrainTimeoutExceeded when the drain leaves phase Draining because its time limit ran out: the
-// observation only checked the Nodes, and Evict is what names the pods left on a timed-out Node (it sends no eviction
-// there). It runs once, on the step out of Draining. ctx is the reconcile context.
-func (sd *scaleDown) announceTimeout(ctx context.Context) error {
-	runner := sd.runner
-	from := sd.s.Pool.Status.Disruption.Phase
-	leavesDraining := from == infrav1.WorkerDisruptionPhaseDraining || (from == "" && runner.resumed)
-	if !leavesDraining || runner.drain == nil || runner.evicted || runner.drainResult == nil || !runner.drainResult.Progress.TimedOut {
-		return nil
-	}
-	return runner.runDrain(ctx, true)
-}
-
 // apply carries out the decision of this reconcile: one step of the removal state machine DecideDisruptionStep drives.
 //
 // Parameters:
@@ -921,9 +866,9 @@ func (sd *scaleDown) apply(ctx context.Context, d DisruptionDecision) Outcome {
 		}
 		return runner.wait(d, IntervalGuarded)
 	case StepDrain:
-		return sd.drainVictims(ctx, d)
+		return runner.drainVictims(ctx, d)
 	case StepWaitForVolumeDetach:
-		if err := sd.announceTimeout(ctx); err != nil {
+		if err := runner.announceTimeout(ctx); err != nil {
 			return Transient(err)
 		}
 		runner.record(d.Phase)
@@ -959,25 +904,6 @@ func (sd *scaleDown) apply(ctx context.Context, d DisruptionDecision) Outcome {
 	}
 }
 
-// drainVictims carries out StepDrain: cordon every victim Node first, so that evicted pods never land on another
-// victim, then evict, and record phase Draining. ResizeOnly drains nothing and only moves the removal on. ctx is the
-// reconcile context; d is the decision.
-func (sd *scaleDown) drainVictims(ctx context.Context, d DisruptionDecision) Outcome {
-	runner := sd.runner
-	if !runner.evicted && !sd.resizeOnly {
-		if err := runner.runDrain(ctx, true); err != nil {
-			return Transient(err)
-		}
-	}
-	if runner.drainResult != nil && runner.drainResult.Progress.Blocked {
-		// The first drain runs after the decision; its refusals are reported at once, so that the next reconcile sees
-		// DrainBlocked as the previous reason and does not announce it again (as in the pool deletion).
-		d.DrainingReason = ReasonDrainBlocked
-	}
-	runner.record(d.Phase)
-	return runner.wait(d, IntervalDrainRetry)
-}
-
 // refusalMessage is the WorkerPoolReady message while IBM's refusal of the resize holds, and the scale-down's refusal
 // record (refusalRecord.message). It is fixed per reason, so that the hold writes the same condition on every
 // reconcile, and it carries no IBM text.
@@ -1003,7 +929,7 @@ func (sd *scaleDown) correctVictims(ctx context.Context, d DisruptionDecision) O
 	spared := sd.verified.Spared
 	predicted := sd.runner.victims
 	if !sd.resizeOnly {
-		if _, outcome, held := sd.uncordon(ctx, spared, d.Phase); held {
+		if _, outcome, held := sd.runner.uncordon(ctx, sd.account, spared, d.Phase, sd.needsNoWorkloadCluster()); held {
 			return outcome
 		}
 		message := fmt.Sprintf("IBM's resize of pool %s removes %s, not the predicted %s; CAPIBM waits for the workers IBM removes",
@@ -1027,7 +953,8 @@ func (sd *scaleDown) correctVictims(ctx context.Context, d DisruptionDecision) O
 // up), or the victims came from Node markers that a resize would not cover. It uncordons what CAPIBM cordoned, emits
 // NodeUncordoned and releases the token. ctx is the reconcile context; d is the decision.
 func (sd *scaleDown) abort(ctx context.Context, d DisruptionDecision) Outcome {
-	reverted, outcome, held := sd.uncordon(ctx, sd.runner.victims, sd.s.Pool.Status.Disruption.Phase)
+	reverted, outcome, held := sd.runner.uncordon(ctx, sd.account, sd.runner.victims, sd.s.Pool.Status.Disruption.Phase,
+		sd.needsNoWorkloadCluster())
 	if held {
 		return outcome
 	}
@@ -1036,46 +963,6 @@ func (sd *scaleDown) abort(ctx context.Context, d DisruptionDecision) Outcome {
 			"reverted CAPIBM's cordon of %d Nodes of pool %s: %s", reverted, sd.s.Pool.Spec.PoolName, d.Message)
 	}
 	return sd.finish(ctx, d.Message)
-}
-
-// uncordon reverts CAPIBM's cordon of the Nodes of the workers (drain.Helper.Uncordon reverts only CAPIBM's own
-// changes, so a Node a human cordoned stays cordoned). It returns how many of the Nodes carried this pool's drain
-// markers. It returns a hold, and true, while the workload cluster is not connected and the scale-down needs it: the
-// Nodes cannot be uncordoned yet, so nothing is given up.
-//
-// Parameters:
-//   - ctx is the reconcile context.
-//   - workerIDs are the workers whose Nodes to uncordon.
-//   - phase is the phase to keep while holding.
-func (sd *scaleDown) uncordon(ctx context.Context, workerIDs []string, phase infrav1.WorkerDisruptionPhase) (int, Outcome, bool) {
-	if sd.resizeOnly || len(workerIDs) == 0 {
-		return 0, Outcome{}, false
-	}
-	if sd.workload.client == nil {
-		if sd.needsNoWorkloadCluster() {
-			return 0, Outcome{}, false
-		}
-		hold := DisruptionDecision{Step: StepHold, Phase: phase, Reason: ReasonWaitingForWorkloadCluster,
-			Message: "the workload cluster is not connected; CAPIBM uncordons the Nodes it cordoned once it is"}
-		if phase != "" {
-			sd.runner.record(phase)
-		}
-		return 0, sd.runner.wait(hold, IntervalGuarded), true
-	}
-	helper := &drain.Helper{Client: sd.workload.client, Clock: sd.s.params.Clock, EvictionBudget: EvictionBudgetPerReconcile,
-		AnnotationPrefix: infrav1.NodeAnnotationPrefix}
-	// The victims' Nodes as this reconcile last wrote them: Uncordon patches with the Node's resourceVersion.
-	nodes := VictimNodes(sd.runner.victimNodes, sd.account, sd.s.ControlPlane.Status.ClusterID, workerIDs)
-	reverted := 0
-	for i := range nodes {
-		if ownsDrainMarker(&nodes[i], sd.s.Pool) {
-			reverted++
-		}
-		if err := helper.Uncordon(ctx, &nodes[i]); err != nil {
-			return 0, Transient(err), true
-		}
-	}
-	return reverted, Outcome{}, false
 }
 
 // finish ends the scale-down: it releases the token, clears status.disruption, sets Draining False and reports the
@@ -1142,7 +1029,11 @@ func (sd *scaleDown) resizeWithoutVictims(ctx context.Context) Outcome {
 		if err != nil {
 			return Transient(err)
 		}
-		sd.s.report(string(d.Reason), fmt.Sprintf("pool %s: %s", sd.pool.Name, d.Message))
+		// WorkerPoolReady already names IBM's answer to the last resize while the gate keeps it (keepsCallError); the
+		// prefix would wrap it once more on every reconcile.
+		if !keepsCallError(d) {
+			sd.s.report(string(d.Reason), fmt.Sprintf("pool %s: %s", sd.pool.Name, d.Message))
+		}
 		return NotDone(IntervalGuarded, string(d.Reason))
 	}
 	sd.s.Pool.Status.LastDisruptionTime = metav1.NewTime(sd.s.params.Clock.Now())
