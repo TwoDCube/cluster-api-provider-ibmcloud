@@ -27,6 +27,8 @@ import (
 
 	"github.com/IBM-Cloud/container-services-go-sdk/kubernetesserviceapiv1"
 	"github.com/IBM/go-sdk-core/v5/core"
+
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/serviceurl"
 )
 
 // DefaultUserAgent is the User-Agent sent when ServiceOptions.UserAgent is empty, so that IBM never sees the SDK's
@@ -133,9 +135,10 @@ func (o ServiceOptions) validate() error {
 // validateServiceURL returns an error unless rawURL is an absolute https URL with a host and without user information,
 // query or fragment: the rule of the VPC and Resource Manager clients, so that every --service-endpoint of the
 // managed client builder is held to the same form at start-up. Each message prints the URL only in the form
-// printableURL returns, and a URL that does not parse only as parseFailureReason describes it, so no user information,
-// query or fragment typed into it (any of them may carry a token) reaches a log, an event or a condition. rawURL is
-// ServiceOptions.URL.
+// serviceurl.Printable returns, and a URL that does not parse only as serviceurl.ParseFailureReason describes it, so no
+// user information, query or fragment typed into it (any of them may carry a token) reaches a log, an event or a
+// condition; the VPC and Resource Manager clients and the client builder print through the same helpers. A URL that
+// passes holds no user information in any form, so newService may print it as it is. rawURL is ServiceOptions.URL.
 func validateServiceURL(rawURL string) error {
 	const accepted = "pass the absolute https URL of the IBM Cloud Kubernetes Service API, for example https://containers.cloud.ibm.com/global"
 	if rawURL == "" {
@@ -143,15 +146,19 @@ func validateServiceURL(rawURL string) error {
 	}
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		return fmt.Errorf("kubernetesservice: ServiceOptions.URL is not a valid URL (%s); %s", parseFailureReason(err), accepted)
+		return fmt.Errorf("kubernetesservice: ServiceOptions.URL is not a valid URL (%s); %s", serviceurl.ParseFailureReason(err), accepted)
 	}
-	if parsed.User != nil {
+	// User information that holds a "/", "?" or "#" leaves parsed.User nil: url.Parse ends the host there and leaves the
+	// "@" after it (serviceurl.HasAtAfterHost). It is rejected here too, and Printable does not show it; otherwise
+	// "https://<token>/<rest>@host/global" would pass and reach the logs as it is, through newService's error that
+	// names the URL and through go-sdk-core's transport errors.
+	if parsed.User != nil || serviceurl.HasAtAfterHost(parsed) {
 		return fmt.Errorf("kubernetesservice: ServiceOptions.URL %q must not contain user information (credentials come "+
-			"only from ServiceOptions.Authenticator); %s", printableURL(parsed), accepted)
+			"only from ServiceOptions.Authenticator); %s", serviceurl.Printable(parsed), accepted)
 	}
 	// url.Parse lower-cases the scheme, so "HTTPS://" is accepted; an opaque URL such as "https:host" has no Host.
 	if parsed.Scheme != "https" || parsed.Host == "" {
-		return fmt.Errorf("kubernetesservice: ServiceOptions.URL %q is not an absolute https URL; %s", printableURL(parsed), accepted)
+		return fmt.Errorf("kubernetesservice: ServiceOptions.URL %q is not an absolute https URL; %s", serviceurl.Printable(parsed), accepted)
 	}
 	// The SDK and the compat calls build each request URL by appending the operation path to the service URL string
 	// (go-sdk-core v5.25.3, RequestBuilder.ResolveRequestURL), so with "https://host/global?x" a GetCluster call would
@@ -162,62 +169,9 @@ func validateServiceURL(rawURL string) error {
 	if parsed.RawQuery != "" || parsed.ForceQuery || strings.Contains(rawURL, "#") {
 		return fmt.Errorf("kubernetesservice: ServiceOptions.URL must end at the API path: remove the query (?...) or "+
 			"fragment (#...) after %q, because the client appends each operation path (for example /v2/vpc/getCluster) "+
-			"to the URL; %s", printableURL(parsed), accepted)
+			"to the URL; %s", serviceurl.Printable(parsed), accepted)
 	}
 	return nil
-}
-
-// printableURL returns the form of a rejected service URL that errors print: the whole user information replaced by
-// "xxxxx", and the query and fragment dropped, because all of them are arbitrary text that may carry a token. The user
-// name goes too, not only the password (url.URL.Redacted keeps it), because a token is often typed into the user slot
-// ("https://<api key>@host"). The scheme, host and path stay, so the operator still recognizes the value that was
-// rejected. It is stricter than the printableURL of the VPC and Resource Manager clients, which redact only the
-// password; each service package keeps its own unexported copy, so that no service package imports another for a
-// helper.
-//
-// Parameters:
-//   - parsed is the URL as url.Parse returned it; it is not modified.
-func printableURL(parsed *url.URL) string {
-	shown := *parsed
-	if shown.User != nil {
-		shown.User = url.User("xxxxx")
-	}
-	shown.RawQuery = ""
-	shown.ForceQuery = false
-	shown.Fragment = ""
-	shown.RawFragment = ""
-	return shown.String()
-}
-
-// parseFailureReason describes why url.Parse rejected a service URL without quoting any part of it. url.Parse's own
-// error quotes the whole input, and several of the reasons it wraps quote a part of it: an invalid escape up to three
-// characters ("%zz", from a password, path or fragment), an invalid host character one, an invalid port everything
-// after the host's colon (which is part of the password when the password holds a "/" or a "?"). So only the kind of
-// problem is printed, and a reason this function does not know becomes "malformed URL". err is url.Parse's error.
-func parseFailureReason(err error) string {
-	var escapeErr url.EscapeError
-	var hostErr url.InvalidHostError
-	switch {
-	case errors.As(err, &escapeErr):
-		return "invalid percent-encoding: every % must start an escape of two hexadecimal digits"
-	case errors.As(err, &hostErr):
-		return "invalid character in the host name"
-	}
-	reason := err
-	if unwrapped := errors.Unwrap(err); unwrapped != nil {
-		reason = unwrapped
-	}
-	switch text := reason.Error(); {
-	case strings.HasPrefix(text, "invalid port "):
-		return "invalid port after the host"
-	case text == "missing protocol scheme", text == "first path segment in URL cannot contain colon",
-		text == "net/url: invalid control character in URL", text == "net/url: invalid userinfo",
-		text == "invalid IP-literal", text == "missing ']' in host":
-		// net/url's fixed texts, which quote nothing.
-		return text
-	default:
-		return "malformed URL"
-	}
 }
 
 // GetCluster implements KubernetesService.

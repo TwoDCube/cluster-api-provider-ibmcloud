@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"testing"
 	"time"
 
@@ -142,9 +141,9 @@ func TestNewService(t *testing.T) {
 }
 
 // TestValidateServiceURL covers the VPC and Resource Manager rule for ServiceOptions.URL: an absolute https URL with a
-// host and without user information, query or fragment. Every rejection prints the URL only through printableURL, so
-// a password, a query or a fragment (any of which may carry a token) never reaches the error, which the client
-// builder returns at start-up and the controller may log.
+// host and without user information, query or fragment. Every rejection prints the URL only through
+// serviceurl.Printable, so a password, a query or a fragment (any of which may carry a token) never reaches the error,
+// which the client builder returns at start-up and the controller may log.
 func TestValidateServiceURL(t *testing.T) {
 	const global = "https://containers.cloud.ibm.com/global"
 	testCases := []struct {
@@ -204,8 +203,9 @@ func TestValidateServiceURL(t *testing.T) {
 			notInErr: []string{"apikey", "fake-query-key"},
 		},
 		{
+			// A URL without a host is not printed at all (serviceurl.Printable).
 			name: "a URL without host and with a secret fragment prints no fragment", rawURL: "https:///global#fake-fragment-token",
-			wantErr:  []string{`"https:///global" is not an absolute https URL`},
+			wantErr:  []string{`"(URL without a host, not shown)" is not an absolute https URL`},
 			notInErr: []string{"fake-fragment-token"},
 		},
 		{ //nolint:gosec // G101: "hunter2" and the query key are fake; the case proves neither reaches the error.
@@ -213,12 +213,40 @@ func TestValidateServiceURL(t *testing.T) {
 			wantErr:  []string{"must not contain user information", `"https://xxxxx@h/x"`},
 			notInErr: []string{"hunter2", "apikey", "fake-query-key"},
 		},
+		// User information that holds a "/", "?" or "#" is split by url.Parse into a host and a path, query or fragment,
+		// with parsed.User nil; the "@" after the host still marks it (serviceurl.HasAtAfterHost). The https form with a
+		// "/" was accepted before, and a password with leading digits leaves a valid host and port.
+		{
+			name: "user information holding a slash is rejected and not printed", rawURL: "https://fake-token-head/fake-token-tail@containers.cloud.ibm.com/global",
+			wantErr:  []string{"must not contain user information", `"(URL with an @ after the host, not shown)"`},
+			notInErr: []string{"fake-token-head", "fake-token-tail"},
+		},
+		{
+			name: "user information holding a slash in a plain http URL is not printed", rawURL: "http://fake-token-head/fake-token-tail@h/x",
+			wantErr:  []string{"must not contain user information", `"(URL with an @ after the host, not shown)"`},
+			notInErr: []string{"fake-token-head", "fake-token-tail"},
+		},
+		{
+			name: "user information holding a question mark is not printed", rawURL: "https://fake-token-head?fake-token-tail@h/x",
+			wantErr:  []string{"must not contain user information", `"(URL with an @ after the host, not shown)"`},
+			notInErr: []string{"fake-token-head", "fake-token-tail"},
+		},
+		{
+			name: "user information holding a hash is not printed", rawURL: "https://fake-token-head#fake-token-tail@h/x",
+			wantErr:  []string{"must not contain user information", `"(URL with an @ after the host, not shown)"`},
+			notInErr: []string{"fake-token-head", "fake-token-tail"},
+		},
+		{
+			name: "a password with leading digits and a slash is not printed", rawURL: "https://admin:2024/fake-token-tail@h/x?",
+			wantErr:  []string{"must not contain user information", `"(URL with an @ after the host, not shown)"`},
+			notInErr: []string{"admin", "2024", "fake-token-tail"},
+		},
 		{
 			name: "an opaque URL has no host", rawURL: "https:containers.cloud.ibm.com",
 			wantErr: []string{"is not an absolute https URL"},
 		},
 		// url.Parse's own error quotes the whole input, and some of the reasons it wraps quote a part of it, so a URL
-		// that does not parse is described by the kind of problem only (parseFailureReason).
+		// that does not parse is described by the kind of problem only (serviceurl.ParseFailureReason).
 		{
 			name: "an unparsable URL with a password prints only the reason", rawURL: "https://u:hunter2@h:port/x",
 			wantErr:  []string{"is not a valid URL (invalid port after the host)"},
@@ -284,6 +312,18 @@ func TestNewServiceRejectsSecretURLsWithoutPrintingThem(t *testing.T) {
 		{rawURL: "https://h/x?apikey=S", secret: "apikey=S"},
 		{rawURL: "https://h/x#S", secret: "#S"},
 		{rawURL: "https://h/x?", secret: "h/x?"},
+		// Also a user name alone, a bad escape after a password, and a URL without "//", whose user name and
+		// password url.Parse keeps as the scheme and the opaque part.
+		{rawURL: "https://u@h/x", secret: "u@"},
+		{rawURL: "https://u:S@h/%zz", secret: "u:S"},                       //nolint:gosec // G101: a fake password; the case proves it is not printed.
+		{rawURL: "u:fake-opaque-secret@h/x", secret: "fake-opaque-secret"}, //nolint:gosec // G101: a fake password; the case proves it is not printed.
+		// User information with a "/", "?" or "#" before the "@", which url.Parse splits into a host and a path, query
+		// or fragment (serviceurl.HasAtAfterHost).
+		{rawURL: "https://fake-token-head?fake-token-tail@h/x", secret: "fake-token-head"},
+		{rawURL: "https://fake-token-head#fake-token-tail@h/x", secret: "fake-token-head"},
+		{rawURL: "http://fake-token-head/fake-token-tail@h/x", secret: "fake-token-head"},
+		{rawURL: "https://fake-token-head/fake-token-tail@h/x", secret: "fake-token-head"},
+		{rawURL: "https://u:1234/fake-token-tail@h/x?", secret: "1234"},
 	} {
 		t.Run(tc.rawURL, func(t *testing.T) {
 			g := NewWithT(t)
@@ -294,70 +334,6 @@ func TestNewServiceRejectsSecretURLsWithoutPrintingThem(t *testing.T) {
 			g.Expect(err.Error()).NotTo(ContainSubstring(tc.secret))
 		})
 	}
-}
-
-// TestPrintableURL covers the form in which URL errors print a rejected service URL: no user information, query or
-// fragment.
-func TestPrintableURL(t *testing.T) {
-	testCases := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{name: "a URL without anything to drop is unchanged", input: "https://containers.cloud.ibm.com/global",
-			want: "https://containers.cloud.ibm.com/global"},
-		{name: "query and fragment are dropped", input: "https://h/x?apikey=S#S", want: "https://h/x"},
-		{name: "an empty query and an empty fragment are dropped", input: "https://h/x?#", want: "https://h/x"},
-		{name: "user name and password are both redacted", input: "https://u:p@h/x", want: "https://xxxxx@h/x"}, //nolint:gosec // G101: a fake password.
-		{name: "a user name without password is redacted", input: "https://apikey-FAKE0123@h/x", want: "https://xxxxx@h/x"},
-		{name: "an empty user name is redacted", input: "https://@h/x", want: "https://xxxxx@h/x"},
-		{name: "an opaque URL keeps its opaque part", input: "https:h?apikey=S", want: "https:h"},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			g := NewWithT(t)
-			parsed, err := url.Parse(tc.input)
-			g.Expect(err).NotTo(HaveOccurred())
-			before := *parsed
-			g.Expect(printableURL(parsed)).To(Equal(tc.want))
-			g.Expect(*parsed).To(Equal(before), "printableURL must not modify its argument")
-		})
-	}
-}
-
-// TestParseFailureReason covers how a URL that url.Parse rejects is described: by the kind of problem only, never by a
-// part of the input, because net/url quotes the input in its own error and in several of the reasons it wraps.
-func TestParseFailureReason(t *testing.T) {
-	testCases := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{name: "a bad escape in the password", input: "https://u:s3%zzcret@h/x", //nolint:gosec // G101: a fake password.
-			want: "invalid percent-encoding: every % must start an escape of two hexadecimal digits"},
-		{name: "a bad escape at the end", input: "https://h/x%2", want: "invalid percent-encoding: every % must start an escape of two hexadecimal digits"},
-		{name: "a bad host character", input: "https://h{st/x", want: "invalid character in the host name"},
-		{name: "a bad port", input: "https://h:port/x", want: "invalid port after the host"},
-		{name: "a password holding a slash becomes a bad port", input: "https://u:pa/ss@h/x", want: "invalid port after the host"},
-		{name: "a fixed net/url text is kept", input: "://h/x", want: "missing protocol scheme"},
-		{name: "a control character", input: "https://h/\x00", want: "net/url: invalid control character in URL"},
-		{name: "an IPv4 address in brackets", input: "https://[10.0.0.1]/x", want: "invalid IP-literal"},
-		{name: "a missing bracket", input: "https://[::1/x", want: "missing ']' in host"},
-		{name: "a reason that may quote the input is replaced", input: "https://[fe80::zz]/x", want: "malformed URL"},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			g := NewWithT(t)
-			_, err := url.Parse(tc.input)
-			g.Expect(err).To(HaveOccurred())
-			g.Expect(parseFailureReason(err)).To(Equal(tc.want))
-		})
-	}
-	t.Run("an error that wraps nothing is still described", func(t *testing.T) {
-		g := NewWithT(t)
-		g.Expect(parseFailureReason(errors.New("missing protocol scheme"))).To(Equal("missing protocol scheme"))
-		g.Expect(parseFailureReason(errors.New("parse \"https://u:secret@h\": something new"))).To(Equal("malformed URL"))
-	})
 }
 
 // TestNewServiceIgnoresEnvironment proves that neither NewService nor a request reads go-sdk-core's external
