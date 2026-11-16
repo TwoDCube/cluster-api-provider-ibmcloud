@@ -154,13 +154,14 @@ func (r *IBMCloudManagedControlPlaneReconciler) Reconcile(ctx context.Context, r
 	return r.reconcileNormal(ctx, scope)
 }
 
-// reconcileNormal binds the control plane to its IBM cluster, reports the cluster and keeps its kubeconfig verified,
-// then requeues at the interval the scope chose, or at steadyStatePoll when nothing is in progress, and no later than
-// the kubeconfig deadline (requeueAtKubeconfigDeadline). scope is this reconcile's scope.
+// reconcileNormal binds the control plane to its IBM cluster, reports the cluster, keeps its kubeconfig verified and
+// its master on spec.distributionVersion, then requeues at the interval the scope chose, or at steadyStatePoll when
+// nothing is in progress, merged with the master version step's (resultWithMasterVersion) and no later than the
+// kubeconfig deadline (requeueAtKubeconfigDeadline). scope is this reconcile's scope.
 func (r *IBMCloudManagedControlPlaneReconciler) reconcileNormal(ctx context.Context, scope *managedscope.ControlPlaneScope) (ctrl.Result, error) {
 	outcome := scope.ReconcileNormal(ctx)
 	logControlPlaneTerminal(ctx, outcome)
-	result, err := resultFor(outcome, managedscope.IntervalSteadyState)
+	result, err := resultWithMasterVersion(ctx, outcome, scope.MasterVersionOutcome(), scope.MasterVersionRequeueAfter())
 	return requeueAtKubeconfigDeadline(result, err, scope.KubeconfigRequeueAfter())
 }
 

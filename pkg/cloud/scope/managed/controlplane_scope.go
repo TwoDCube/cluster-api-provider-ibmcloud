@@ -99,6 +99,10 @@ type ControlPlaneScope struct {
 
 	// kubeconfigRequeue is managedkubeconfig.Decide's RequeueAfter of this reconcile (KubeconfigRequeueAfter).
 	kubeconfigRequeue time.Duration
+
+	// masterStep is what the master version step (reconcileMasterVersion) of this reconcile left for the controller's
+	// requeue (MasterVersionOutcome, MasterVersionRequeueAfter); the zero value when it did not run.
+	masterStep masterVersionStep
 }
 
 // PersistFunc writes the control plane's in-memory changes to the API server at once. The scope calls it before an IBM
@@ -268,6 +272,9 @@ func (s *ControlPlaneScope) actOnBinding(ctx context.Context, decision BindingDe
 // Status receives IBM's stable tokens through ObserveCluster, which strips the " (pending)" marker from every version
 // and omits a value it cannot record rather than writing "", which the API's MinLength=1 rejects.
 //
+// For a cluster that exists it then runs the access steps (reconcileAccess) and the master version step
+// (reconcileMasterVersion), unless IBM rate limited the access steps.
+//
 // Parameters:
 //   - ctx carries the reconcile's logger.
 //   - decision is a BindingKnown decision; its Cluster is the cluster GetCluster returned.
@@ -313,7 +320,15 @@ func (s *ControlPlaneScope) observe(ctx context.Context, decision BindingDecisio
 			notes = append(notes, cpNonCriticalSentence(codes))
 		}
 		s.setProvisioned(metav1.ConditionTrue, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedReason, strings.Join(notes, "; "))
-		return s.reconcileAccess(ctx, c)
+		access := s.reconcileAccess(ctx, c)
+		// The master version step, after the steps that may initialize the control plane; it does nothing before
+		// initialization. It runs whatever else the kubeconfig steps returned, also while IBM reports the master as not
+		// ready, which it may well do while it updates the master (IBM's states during a master update are not yet
+		// verified against IBM Cloud): RollingOut must say so then (DecideMasterAction row 1). After a 429 of those
+		// steps it waits for IBM's Retry-After (reconcileMasterVersion). Its outcome goes to the controller separately
+		// (MasterVersionOutcome).
+		s.reconcileMasterVersion(ctx, c, access)
+		return access
 	}
 }
 
