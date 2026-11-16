@@ -18,6 +18,7 @@ package managed
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -189,6 +190,21 @@ func IsMasterReady(c *kubernetesservice.Cluster) bool {
 		c.MasterState == "deployed" &&
 		strings.HasPrefix(strings.TrimSpace(c.MasterStatus), "Ready") &&
 		c.MasterURL != ""
+}
+
+// UnhealthyMasterHealth returns the masterHealth values that make the control plane unavailable (Available=False)
+// and block master updates. Not yet verified against IBM Cloud: IBM documents masterHealth as error, normal,
+// unavailable or unsupported; "" right after the master became Ready (observed on IBM Cloud) is not unhealthy, and
+// unsupported means end of support, which MasterVersionUpToDate reports; fallback: adjust the list once a master
+// update has been observed.
+func UnhealthyMasterHealth() []string {
+	return []string{"error", "unavailable"}
+}
+
+// IsMasterUnhealthy reports whether a cluster's masterHealth is in UnhealthyMasterHealth; nil is not unhealthy: the
+// caller has no cluster to judge. Not yet verified against IBM Cloud (see UnhealthyMasterHealth).
+func IsMasterUnhealthy(c *kubernetesservice.Cluster) bool {
+	return c != nil && slices.Contains(UnhealthyMasterHealth(), c.MasterHealth)
 }
 
 // ClearIntentErrorCodes returns the IBM error codes that prove a createCluster attempt created nothing, whatever the

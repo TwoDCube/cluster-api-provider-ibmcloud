@@ -316,6 +316,34 @@ func TestIsMasterReady(t *testing.T) {
 	NewWithT(t).Expect(deployed.MasterHealth).To(BeEmpty())
 }
 
+func TestMasterHealth(t *testing.T) {
+	deployed := loadCluster(t, "iks-getCluster-deployed.json")
+	with := func(health string) *kubernetesservice.Cluster {
+		c := deployed
+		c.MasterHealth = health
+		return &c
+	}
+	testCases := []struct {
+		name    string
+		cluster *kubernetesservice.Cluster
+		want    bool
+	}{
+		{name: "empty health right after Ready is not unhealthy", cluster: &deployed, want: false},
+		{name: "normal", cluster: with("normal"), want: false},
+		{name: "unsupported is end of support, not unhealthy", cluster: with("unsupported"), want: false},
+		{name: "error", cluster: with("error"), want: true},
+		{name: "unavailable", cluster: with("unavailable"), want: true},
+		{name: "nil", cluster: nil, want: false},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(IsMasterUnhealthy(tc.cluster)).To(Equal(tc.want))
+		})
+	}
+	NewWithT(t).Expect(UnhealthyMasterHealth()).To(Equal([]string{"error", "unavailable"}))
+}
+
 // TestCreateDecisionPoints pins the create decision points: the workers' operating system and the answers that clear
 // a create intent.
 func TestCreateDecisionPoints(t *testing.T) {
