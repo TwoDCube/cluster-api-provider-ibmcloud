@@ -17,7 +17,10 @@ limitations under the License.
 package vpc
 
 import (
+	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 
 	"github.com/IBM/go-sdk-core/v5/core"
 	"github.com/IBM/vpc-go-sdk/vpcv1"
@@ -651,4 +654,84 @@ func NewService(svcEndpoint string) (Vpc, error) {
 	})
 
 	return service, err
+}
+
+// serviceURLForm names the URL form NewServiceWithAuthenticator accepts; every URL error repeats it so that the
+// operator sees the expected value next to the rejected one.
+const serviceURLForm = "an absolute https URL of the regional VPC API, for example https://us-south.iaas.cloud.ibm.com/v1 " +
+	"(the default for the region, or the vpc entry of --service-endpoint)"
+
+// NewServiceWithAuthenticator returns a VPC Service that sends every request to serviceURL, authenticated by auth.
+//
+// Unlike NewService it reads nothing from the environment or from a credentials file (IBM_CREDENTIALS_FILE,
+// IBMCLOUD_*): the caller owns the credentials and passes them in. That is what lets the managed Kubernetes controllers
+// build every IBM Cloud client from one explicitly resolved credential source, and lets their tests run without
+// IBMCLOUD_* variables. NewService keeps its environment-based behaviour for the existing VPC and PowerVS callers.
+//
+// Parameters:
+//   - serviceURL is the VPC API endpoint including the API version path, for example
+//     https://us-south.iaas.cloud.ibm.com/v1 (endpoints.FetchVPCEndpoint returns it for a region and honours
+//     --service-endpoint). It must be an absolute https URL without user information, because auth adds a bearer
+//     token to every request and that token must never travel in plain text. It must also end at the path, without a
+//     query or fragment, because go-sdk-core appends each operation path (for example /vpcs) to it.
+//   - auth authenticates every request. It must not be nil, including a typed nil such as (*core.IamAuthenticator)(nil):
+//     there is deliberately no fallback to the environment.
+//
+// It makes no network call; go-sdk-core validates auth (for example that an IAM authenticator has an API key) but
+// fetches the first token only on the first request.
+func NewServiceWithAuthenticator(serviceURL string, auth core.Authenticator) (Vpc, error) {
+	// core.IsNil also catches a typed nil inside the interface, which a plain auth == nil check would let through.
+	// go-sdk-core would reject both later, but with a message that does not say what the caller must pass.
+	if core.IsNil(auth) {
+		return nil, errors.New("VPC client authenticator is nil: pass the authenticator of the IBM Cloud credentials " +
+			"the client acts as (NewServiceWithAuthenticator never reads credentials from the environment)")
+	}
+	if err := validateServiceURL(serviceURL); err != nil {
+		return nil, err
+	}
+
+	vpcService, err := vpcv1.NewVpcV1(&vpcv1.VpcV1Options{
+		Authenticator: auth,
+		URL:           serviceURL,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creating the VPC client for %s: %w", serviceURL, err)
+	}
+	return &Service{vpcService: vpcService}, nil
+}
+
+// validateServiceURL returns an error unless serviceURL is an absolute https URL with a host, no user information and
+// no query or fragment. The messages print the URL redacted, so a password typed into it never reaches a log or a
+// condition.
+func validateServiceURL(serviceURL string) error {
+	if serviceURL == "" {
+		return fmt.Errorf("VPC service URL is empty: pass %s", serviceURLForm)
+	}
+	parsed, err := url.Parse(serviceURL)
+	if err != nil {
+		// url.Parse returns a *url.Error whose text quotes the raw input, which may hold a password; only the reason it
+		// wraps is printed.
+		return fmt.Errorf("VPC service URL is not a valid URL (%v): pass %s", errors.Unwrap(err), serviceURLForm)
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("VPC service URL %q must not contain user information (credentials come only from the authenticator): pass %s",
+			parsed.Redacted(), serviceURLForm)
+	}
+	// url.Parse lower-cases the scheme, so "HTTPS://" is accepted; an opaque URL such as "https:host" has no Host.
+	if parsed.Scheme != "https" || parsed.Host == "" {
+		return fmt.Errorf("VPC service URL %q is not %s", parsed.Redacted(), serviceURLForm)
+	}
+	// go-sdk-core builds each request URL by appending the operation path to the service URL string (go-sdk-core
+	// v5.25.3, core/request_builder.go), so with "https://host/v1?debug" a ListVpcs call would send GET /v1 with the
+	// query "debug/vpcs", and a fragment would swallow the path the same way. Such a URL fails only later, as a
+	// confusing API error, so it is rejected here. A bare trailing "#" leaves no trace in the parsed URL, which is why
+	// the raw string is checked; url.Parse cuts the fragment at the first "#", so any "#" in it starts a fragment.
+	if parsed.RawQuery != "" || parsed.ForceQuery || strings.Contains(serviceURL, "#") {
+		// The query and fragment are not printed: they are arbitrary text that may carry a token.
+		withoutQuery := url.URL{Scheme: parsed.Scheme, Host: parsed.Host, Path: parsed.Path, RawPath: parsed.RawPath}
+		return fmt.Errorf("VPC service URL must end at the API version path: remove the query (?...) or fragment (#...) "+
+			"after %q, because the client appends each operation path (for example /vpcs) to the URL; pass %s",
+			withoutQuery.String(), serviceURLForm)
+	}
+	return nil
 }
