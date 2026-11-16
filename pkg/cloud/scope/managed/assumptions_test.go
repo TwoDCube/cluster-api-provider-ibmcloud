@@ -833,3 +833,11 @@ func TestMasterUpdateDecisionPoints(t *testing.T) {
 	// IBM says the master must be updated in these states, so they never block.
 	g.Expect(blocked).NotTo(ContainElements("unsupported", "update_canceled", "normal", "warning", "pending", "deployed"))
 }
+
+// TestRolloutDecisionPoints pins the rollout decision points: how long IBM's own replace drain honours budgets, and
+// SurgeSupported.
+func TestRolloutDecisionPoints(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(IBMReplaceDrainForcesAfter).To(Equal(60 * time.Second))
+	g.Expect(SurgeSupported).To(BeFalse())
+}

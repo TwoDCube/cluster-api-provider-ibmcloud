@@ -752,3 +752,16 @@ func MasterUpdateBlockedStates() []string {
 		clusterStateUnavailable, "critical", "deleting", "deleted", "aborted", "delete_failed", "deploy_failed",
 		"create_failed"}
 }
+
+// Worker rollouts.
+
+// IBMReplaceDrainForcesAfter is how long IBM's own drain on replaceWorker honours PodDisruptionBudgets before it stops
+// the remaining pods. Observed on IBM Cloud: on IKS 1.36 IBM evicted what the budgets allowed, then killed the
+// protected pods about 62 seconds after the call. Informational only, for messages and documentation: CAPIBM drains
+// before every replace and never relies on IBM's drain.
+const IBMReplaceDrainForcesAfter = 60 * time.Second
+
+// SurgeSupported gates a later spec.rollout.maxSurgePerZone. Not yet verified against IBM Cloud: whether IBM removes
+// the surge worker when the pool shrinks back, and whether its "older version" order compares fix packs; default
+// false; fallback: keep surge off.
+const SurgeSupported = false
