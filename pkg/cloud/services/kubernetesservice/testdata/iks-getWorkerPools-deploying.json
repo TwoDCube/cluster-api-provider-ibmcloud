@@ -1,0 +1,37 @@
+[
+  {
+    "id": "iksclusterid00000001-00000a1",
+    "poolName": "example-test-cluster-pool",
+    "flavor": "cx2.2x4",
+    "labels": {
+      "ibm-cloud.kubernetes.io/worker-pool-id": "iksclusterid00000001-00000a1"
+    },
+    "taints": null,
+    "workerCount": 1,
+    "isolation": "public",
+    "provider": "vpc-gen2",
+    "isBalanced": true,
+    "autoscaleEnabled": false,
+    "openshiftLicense": "",
+    "lifecycle": {
+      "desiredState": "active",
+      "actualState": ""
+    },
+    "operatingSystem": "UBUNTU_24_64",
+    "zones": [
+      {
+        "id": "eu-de-1",
+        "workerCount": 1,
+        "autobalanceEnabled": true,
+        "messages": null,
+        "subnets": [
+          {
+            "id": "02b7-00000000-0000-4000-8000-000000000002",
+            "primary": true
+          }
+        ]
+      }
+    ],
+    "vpcID": "r010-00000000-0000-4000-8000-000000000011"
+  }
+]

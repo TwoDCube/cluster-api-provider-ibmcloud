@@ -30,7 +30,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
+	"github.com/IBM-Cloud/container-services-go-sdk/kubernetesserviceapiv1"
 	"github.com/IBM/go-sdk-core/v5/core"
 
 	"k8s.io/client-go/tools/clientcmd"
@@ -225,6 +227,163 @@ func decodeCACert(encoded string) ([]byte, error) {
 		return nil, fmt.Errorf("IBM's caCert does not hold a PEM certificate")
 	}
 	return decoded, nil
+}
+
+// createWorkerPoolBody is the body of POST /v2/vpc/createWorkerPool as CAPIBM sends it. It has no operatingSystem:
+// IBM's defaults are right for both flavors (observed on IBM Cloud: UBUNTU_24_64 on IKS, RHCOS on ROKS).
+type createWorkerPoolBody struct {
+	Cluster     string                 `json:"cluster"`
+	Name        string                 `json:"name"`
+	Flavor      string                 `json:"flavor"`
+	VPCID       string                 `json:"vpcID"`
+	WorkerCount int64                  `json:"workerCount"`
+	Zones       []createWorkerPoolZone `json:"zones"`
+	Entitlement string                 `json:"entitlement,omitempty"`
+}
+
+// createWorkerPoolZone is one zone of createWorkerPoolBody, with the subnet the SDK's Zone model lacks.
+type createWorkerPoolZone struct {
+	ID       string `json:"id"`
+	SubnetID string `json:"subnetID"`
+}
+
+// createWorkerPoolResponse is the 201 body of createWorkerPool (swagger CreateWorkerpoolResponse).
+type createWorkerPoolResponse struct {
+	WorkerPoolID string `json:"workerPoolID"`
+}
+
+// CreatePoolWithZones selects how CreateWorkerPool creates a pool. Not yet verified against IBM Cloud: true sends one
+// POST /v2/vpc/createWorkerPool with zones[].subnetID, the call Terraform relies on, which never leaves a pool without
+// its zones behind. Fallback if this call turns out not to provision the workers: set it to false, and
+// CreateWorkerPool creates the pool without zones through the SDK's VpcCreateWorkerPool and then adds each zone with
+// its subnet through the SDK's VpcCreateWorkerPoolZone (createWorkerPoolZoneByZone). Exported so that the managed
+// scope's assumptions can list it with the other decision points that are not yet verified against IBM Cloud.
+const CreatePoolWithZones = true
+
+// CreateWorkerPool implements KubernetesService. It validates req and sends nothing when req is invalid.
+//
+// COMPAT(container-services-go-sdk@61af133): the Zone of VpcCreateWorkerPool has no subnetID, so the SDK cannot
+// create a pool with its zones and subnets in one call. Delete when VpcCreateWorkerPool zones carry subnetID,
+// together with the zone-by-zone fallback, which then has no reason left; callers do not change.
+//
+// CreatePoolWithZones selects the call: the single call is the default and the zone-less create plus one zone add per
+// zone is the inactive fallback; switching is the one-line change of that constant. What the switch cannot give is the
+// repair of a pool the fallback left half created (the create succeeded, then a zone add failed): the pool flow adopts
+// the pool by name on its next reconcile and has no way to add the missing zones, because adding a zone to an
+// existing pool is neither a KubernetesService method nor a controller step. That repair needs AddWorkerPoolZone in
+// the interface and in the controller, which arrive with the support for adding and removing zones.
+func (s *Service) CreateWorkerPool(ctx context.Context, req CreateWorkerPoolRequest) (string, error) {
+	if err := req.validate(); err != nil {
+		return "", err
+	}
+	if !CreatePoolWithZones {
+		return s.createWorkerPoolZoneByZone(ctx, req)
+	}
+	ctx, tracker := trackCall(ctx)
+	builder := core.NewRequestBuilder(core.POST).WithContext(ctx)
+	if _, err := builder.ResolveRequestURL(s.sdk.Service.GetServiceURL(), "/v2/vpc/createWorkerPool", nil); err != nil {
+		return "", fmt.Errorf("kubernetesservice: %s: building the request: %w", OpCreateWorkerPool, err)
+	}
+	builder.AddHeader("Accept", "application/json")
+	builder.AddHeader("Content-Type", "application/json")
+	if _, err := builder.SetBodyContentJSON(createWorkerPoolBodyFrom(req)); err != nil {
+		return "", fmt.Errorf("kubernetesservice: %s: encoding the body: %w", OpCreateWorkerPool, err)
+	}
+	request, err := builder.Build()
+	if err != nil {
+		return "", fmt.Errorf("kubernetesservice: %s: building the request: %w", OpCreateWorkerPool, err)
+	}
+	var answer createWorkerPoolResponse
+	response, err := s.sdk.Service.Request(request, &answer)
+	if err != nil {
+		return "", callError(OpCreateWorkerPool, tracker, response, err)
+	}
+	if answer.WorkerPoolID == "" {
+		// Like CreateCluster: without an ID the attempt's outcome is unknown; the pool flow adopts by name.
+		return "", fmt.Errorf("kubernetesservice: %s: IBM answered HTTP %d without a workerPoolID; the outcome of this create attempt is unknown", OpCreateWorkerPool, statusCode(response))
+	}
+	return answer.WorkerPoolID, nil
+}
+
+// createWorkerPoolBodyFrom maps a validated CreateWorkerPoolRequest to the wire body.
+func createWorkerPoolBodyFrom(req CreateWorkerPoolRequest) createWorkerPoolBody {
+	zones := make([]createWorkerPoolZone, 0, len(req.Zones))
+	for _, zone := range req.Zones {
+		zones = append(zones, createWorkerPoolZone{ID: zone.Zone, SubnetID: zone.SubnetID})
+	}
+	return createWorkerPoolBody{
+		Cluster:     req.ClusterID,
+		Name:        req.Name,
+		Flavor:      req.Flavor,
+		VPCID:       req.VPCID,
+		WorkerCount: req.WorkerCountPerZone,
+		Zones:       zones,
+		Entitlement: req.Entitlement,
+	}
+}
+
+// createWorkerPoolZoneByZone is the fallback of CreateWorkerPool, inactive while CreatePoolWithZones is true. It
+// creates the pool without zones through the SDK's VpcCreateWorkerPool (POST /v2/vpc/createWorkerPool) and then adds
+// each zone with its subnet through the SDK's VpcCreateWorkerPoolZone (POST /v2/vpc/createWorkerPoolZone {cluster,
+// id, subnetID, workerpool}), in the order of req.Zones. Like the single call it sends each request once and never
+// retries.
+//
+// When a zone add fails, the pool exists with only the zones added before it. The error then names the pool, its ID
+// and the zones it lacks, and wraps the zone add's own error, so Classify applies its CreateWorkerPool and status rows
+// to it. IBM's 409 "zone already exists in the worker pool" cannot answer a zone add here, because every zone is added
+// to the pool this call has just created.
+//
+// Parameters:
+//   - ctx bounds every request.
+//   - req is the pool to create; CreateWorkerPool has validated it.
+func (s *Service) createWorkerPoolZoneByZone(ctx context.Context, req CreateWorkerPoolRequest) (string, error) {
+	createCtx, tracker := trackCall(ctx)
+	options := &kubernetesserviceapiv1.VpcCreateWorkerPoolOptions{
+		Cluster:     core.StringPtr(req.ClusterID),
+		Name:        core.StringPtr(req.Name),
+		Flavor:      core.StringPtr(req.Flavor),
+		VpcID:       core.StringPtr(req.VPCID),
+		WorkerCount: core.Int64Ptr(req.WorkerCountPerZone),
+		// Zones stay nil: the SDK's Zone has no subnetID, so every zone is added below with its subnet. The SDK has no
+		// operatingSystem option, which matches the single call (IBM's defaults are right for both flavors).
+	}
+	if req.Entitlement != "" {
+		options.Entitlement = core.StringPtr(req.Entitlement)
+	}
+	result, response, err := s.sdk.VpcCreateWorkerPoolWithContext(createCtx, options)
+	if err != nil {
+		return "", callError(OpCreateWorkerPool, tracker, response, err)
+	}
+	if result == nil || core.StringNilMapper(result.WorkerPoolID) == "" {
+		// Like the single call: without an ID the attempt's outcome is unknown; the pool flow adopts by name.
+		return "", fmt.Errorf("kubernetesservice: %s: IBM answered HTTP %d without a workerPoolID; the outcome of this create attempt is unknown", OpCreateWorkerPool, statusCode(response))
+	}
+	poolID := *result.WorkerPoolID
+	for i, zone := range req.Zones {
+		zoneCtx, zoneTracker := trackCall(ctx)
+		response, err := s.sdk.VpcCreateWorkerPoolZoneWithContext(zoneCtx, &kubernetesserviceapiv1.VpcCreateWorkerPoolZoneOptions{
+			Cluster:    core.StringPtr(req.ClusterID),
+			Workerpool: core.StringPtr(poolID),
+			ID:         core.StringPtr(zone.Zone),
+			SubnetID:   core.StringPtr(zone.SubnetID),
+		})
+		if err != nil {
+			// The message tells the operator what exists and how to recover, because CAPIBM cannot add the zones
+			// itself until it supports adding zones to a pool (see CreateWorkerPool).
+			return "", fmt.Errorf("kubernetesservice: %s: IBM created pool %q with ID %s, but adding zone %s with subnet %s failed, so the pool lacks the zones %s; add them to the pool in IBM Cloud, or delete the pool there so that it is created again: %w",
+				OpCreateWorkerPool, req.Name, poolID, zone.Zone, zone.SubnetID, zoneNames(req.Zones[i:]), callError(OpCreateWorkerPool, zoneTracker, response, err))
+		}
+	}
+	return poolID, nil
+}
+
+// zoneNames returns the zone names of zones as a comma-separated list, for messages. zones are zone-subnet pairs.
+func zoneNames(zones []ZoneSubnet) string {
+	names := make([]string, 0, len(zones))
+	for _, zone := range zones {
+		names = append(names, zone.Zone)
+	}
+	return strings.Join(names, ", ")
 }
 
 // rawText returns a JSON value as text: a string without quotes, null or nothing as "", anything else as its JSON

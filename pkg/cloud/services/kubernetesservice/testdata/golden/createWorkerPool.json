@@ -1,0 +1,17 @@
+{
+  "cluster": "iksclusterid00000001",
+  "name": "example-test-cluster-pool",
+  "flavor": "bx2.4x16",
+  "vpcID": "r010-00000000-0000-4000-8000-000000000011",
+  "workerCount": 2,
+  "zones": [
+    {
+      "id": "eu-de-1",
+      "subnetID": "02b7-00000000-0000-4000-8000-000000000002"
+    },
+    {
+      "id": "eu-de-2",
+      "subnetID": "02b7-00000000-0000-4000-8000-000000000003"
+    }
+  ]
+}

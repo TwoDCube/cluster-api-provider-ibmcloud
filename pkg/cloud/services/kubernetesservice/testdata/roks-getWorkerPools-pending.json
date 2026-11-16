@@ -1,0 +1,37 @@
+[
+  {
+    "id": "roksclusterid0000002-00000b2",
+    "poolName": "default",
+    "flavor": "bx2.4x16",
+    "labels": {
+      "ibm-cloud.kubernetes.io/worker-pool-id": "roksclusterid0000002-00000b2"
+    },
+    "taints": null,
+    "workerCount": 2,
+    "isolation": "public",
+    "provider": "vpc-gen2",
+    "isBalanced": true,
+    "autoscaleEnabled": false,
+    "openshiftLicense": "worker_plan_ocp",
+    "lifecycle": {
+      "desiredState": "active",
+      "actualState": ""
+    },
+    "operatingSystem": "RHCOS",
+    "zones": [
+      {
+        "id": "eu-de-1",
+        "workerCount": 2,
+        "autobalanceEnabled": true,
+        "messages": null,
+        "subnets": [
+          {
+            "id": "02b7-00000000-0000-4000-8000-000000000002",
+            "primary": true
+          }
+        ]
+      }
+    ],
+    "vpcID": "r010-00000000-0000-4000-8000-000000000011"
+  }
+]

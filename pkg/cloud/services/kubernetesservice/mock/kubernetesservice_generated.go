@@ -71,6 +71,21 @@ func (mr *MockKubernetesServiceMockRecorder) CreateCluster(ctx, req any) *gomock
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateCluster", reflect.TypeOf((*MockKubernetesService)(nil).CreateCluster), ctx, req)
 }
 
+// CreateWorkerPool mocks base method.
+func (m *MockKubernetesService) CreateWorkerPool(ctx context.Context, req kubernetesservice.CreateWorkerPoolRequest) (string, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CreateWorkerPool", ctx, req)
+	ret0, _ := ret[0].(string)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// CreateWorkerPool indicates an expected call of CreateWorkerPool.
+func (mr *MockKubernetesServiceMockRecorder) CreateWorkerPool(ctx, req any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateWorkerPool", reflect.TypeOf((*MockKubernetesService)(nil).CreateWorkerPool), ctx, req)
+}
+
 // DeleteCluster mocks base method.
 func (m *MockKubernetesService) DeleteCluster(ctx context.Context, clusterID, resourceGroupID string) error {
 	m.ctrl.T.Helper()
@@ -143,4 +158,48 @@ func (m *MockKubernetesService) ListVersions(ctx context.Context) (*kubernetesse
 func (mr *MockKubernetesServiceMockRecorder) ListVersions(ctx any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListVersions", reflect.TypeOf((*MockKubernetesService)(nil).ListVersions), ctx)
+}
+
+// ListWorkerPools mocks base method.
+func (m *MockKubernetesService) ListWorkerPools(ctx context.Context, clusterID string) ([]kubernetesservice.WorkerPool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListWorkerPools", ctx, clusterID)
+	ret0, _ := ret[0].([]kubernetesservice.WorkerPool)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListWorkerPools indicates an expected call of ListWorkerPools.
+func (mr *MockKubernetesServiceMockRecorder) ListWorkerPools(ctx, clusterID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListWorkerPools", reflect.TypeOf((*MockKubernetesService)(nil).ListWorkerPools), ctx, clusterID)
+}
+
+// ListWorkers mocks base method.
+func (m *MockKubernetesService) ListWorkers(ctx context.Context, clusterID string) ([]kubernetesservice.Worker, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListWorkers", ctx, clusterID)
+	ret0, _ := ret[0].([]kubernetesservice.Worker)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListWorkers indicates an expected call of ListWorkers.
+func (mr *MockKubernetesServiceMockRecorder) ListWorkers(ctx, clusterID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListWorkers", reflect.TypeOf((*MockKubernetesService)(nil).ListWorkers), ctx, clusterID)
+}
+
+// ReplaceWorker mocks base method.
+func (m *MockKubernetesService) ReplaceWorker(ctx context.Context, clusterID, workerID string, update bool) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ReplaceWorker", ctx, clusterID, workerID, update)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// ReplaceWorker indicates an expected call of ReplaceWorker.
+func (mr *MockKubernetesServiceMockRecorder) ReplaceWorker(ctx, clusterID, workerID, update any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ReplaceWorker", reflect.TypeOf((*MockKubernetesService)(nil).ReplaceWorker), ctx, clusterID, workerID, update)
 }

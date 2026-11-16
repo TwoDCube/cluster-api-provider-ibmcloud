@@ -1,0 +1,41 @@
+[
+  {
+    "id": "kube-iksclusterid00000001-exampletest-example-0000015f",
+    "lifecycle": {
+      "desiredState": "deployed",
+      "actualState": "provisioning",
+      "message": "Pending endpoint gateway creation",
+      "messageDate": "2026-11-16T03:24:03+0000",
+      "pendingOperation": "",
+      "reasonForDelete": "",
+      "messageDetails": "",
+      "messageDetailsDate": "",
+      "desiredOperatingSystem": "UBUNTU_24_64",
+      "actualOperatingSystem": "UBUNTU_24_64"
+    },
+    "health": {
+      "state": "",
+      "message": ""
+    },
+    "kubeVersion": {
+      "desired": "1.36.5_1540",
+      "actual": "",
+      "target": "1.36.5_1540",
+      "eos": "",
+      "masterEOS": ""
+    },
+    "flavor": "cx2.2x4",
+    "location": "eu-de-1",
+    "poolID": "iksclusterid00000001-00000a1",
+    "poolName": "example-test-cluster-pool",
+    "provider": "vpc-gen2",
+    "networkInterfaces": [
+      {
+        "subnetID": "02b7-00000000-0000-4000-8000-000000000002",
+        "ipAddress": "10.243.0.4",
+        "cidr": "10.243.0.0/24",
+        "primary": true
+      }
+    ]
+  }
+]

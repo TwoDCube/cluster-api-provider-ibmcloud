@@ -18,7 +18,9 @@ package kubernetesservice
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -633,4 +635,309 @@ func TestDeleteCluster(t *testing.T) {
 		g.Expect(fake.received()).To(BeEmpty())
 		g.Expect(limiter.count()).To(BeZero())
 	})
+}
+
+// servePath returns a handler that answers status and body on path and 404 on any other path, so that a test also
+// proves which path a method calls.
+func servePath(path string, status int, body []byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != path {
+			reply(http.StatusNotFound, []byte(`{"code":"test","description":"unexpected path"}`))(w, r)
+			return
+		}
+		reply(status, body)(w, r)
+	}
+}
+
+// The getWorkerPools fixtures were captured on GET /v2/vpc/getWorkerPools, while ListWorkerPools calls the SDK's
+// GET /v2/getWorkerPools. Until that path is captured on IBM Cloud, the fake serves the /v2/vpc bodies on the SDK's
+// path; a capture of it then replaces them.
+func TestListWorkerPools(t *testing.T) {
+	iksPool := WorkerPool{
+		ID:              testIKSClusterID + "-00000a1",
+		Name:            "example-test-cluster-pool",
+		Flavor:          "cx2.2x4",
+		SizePerZone:     1,
+		Zones:           []WorkerPoolZone{{ID: "eu-de-1", WorkerCount: 1, AutobalanceEnabled: true}},
+		IsBalanced:      true,
+		OperatingSystem: "UBUNTU_24_64",
+	}
+	roksDeploying := WorkerPool{
+		ID:              testROKSClusterID + "-00000b2",
+		Name:            "default",
+		Flavor:          "bx2.4x16",
+		SizePerZone:     2,
+		Zones:           []WorkerPoolZone{{ID: "eu-de-1", WorkerCount: 0, AutobalanceEnabled: true}},
+		IsBalanced:      true,
+		OperatingSystem: "RHCOS",
+	}
+	decodeCases := []struct {
+		fixture  string
+		expected WorkerPool
+	}{
+		{fixture: "iks-getWorkerPools-normal.json", expected: iksPool},
+		{fixture: "iks-getWorkerPools-deploying.json", expected: iksPool},
+		{fixture: "iks-getWorkerPools-deployed.json", expected: iksPool},
+		{fixture: "iks-getWorkerPools-pending.json", expected: iksPool},
+		// Right after create the zone count lags the pool's per-zone size (observed on IBM Cloud).
+		{fixture: "roks-getWorkerPools-deploying.json", expected: roksDeploying},
+	}
+	for _, tc := range decodeCases {
+		t.Run("decodes "+tc.fixture+" as an array", func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeIKS(t, servePath("/global/v2/getWorkerPools", http.StatusOK, fixture(t, tc.fixture)))
+			service, _ := newTestService(t, fake)
+			pools, err := service.ListWorkerPools(context.Background(), "some-cluster")
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(pools).To(Equal([]WorkerPool{tc.expected}))
+		})
+	}
+
+	t.Run("request shape", func(t *testing.T) {
+		g := NewWithT(t)
+		fake := newFakeIKS(t, servePath("/global/v2/getWorkerPools", http.StatusOK, fixture(t, "roks-getWorkerPools-normal.json")))
+		service, _ := newTestService(t, fake)
+		pools, err := service.ListWorkerPools(context.Background(), testROKSClusterID)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(pools).To(HaveLen(1))
+		g.Expect(pools[0].Zones).To(Equal([]WorkerPoolZone{{ID: "eu-de-1", WorkerCount: 2, AutobalanceEnabled: true}}))
+		request := fake.last(t)
+		g.Expect(request.Method).To(Equal(http.MethodGet))
+		g.Expect(request.RawQuery).To(Equal("cluster=" + testROKSClusterID))
+		g.Expect(request.Header.Get("Authorization")).To(Equal("Bearer " + testToken))
+		g.Expect(request.Header.Values("X-Region")).To(BeEmpty())
+	})
+
+	t.Run("pool lifecycle and autoscale flags", func(t *testing.T) {
+		g := NewWithT(t)
+		body := []byte(`[{"id":"p1","poolName":"gone","lifecycle":{"actualState":"deleting"},"autoscaleEnabled":true,"isBalanced":false,"workerCount":3}]`)
+		fake := newFakeIKS(t, servePath("/global/v2/getWorkerPools", http.StatusOK, body))
+		service, _ := newTestService(t, fake)
+		pools, err := service.ListWorkerPools(context.Background(), testIKSClusterID)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(pools).To(Equal([]WorkerPool{{ID: "p1", Name: "gone", ActualState: "deleting", SizePerZone: 3, AutoscaleEnabled: true}}))
+	})
+
+	t.Run("no pools", func(t *testing.T) {
+		g := NewWithT(t)
+		fake := newFakeIKS(t, servePath("/global/v2/getWorkerPools", http.StatusOK, []byte(`[]`)))
+		service, _ := newTestService(t, fake)
+		pools, err := service.ListWorkerPools(context.Background(), testIKSClusterID)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(pools).To(BeEmpty())
+	})
+
+	t.Run("404 is NotFound", func(t *testing.T) {
+		g := NewWithT(t)
+		fake := newFakeIKS(t, reply(http.StatusNotFound, []byte(`{"code":"G0004","description":"The specified cluster could not be found."}`)))
+		service, _ := newTestService(t, fake)
+		_, err := service.ListWorkerPools(context.Background(), testIKSClusterID)
+		g.Expect(Classify(OpListWorkerPools, err)).To(Equal(ClassNotFound))
+	})
+
+	t.Run("an empty cluster ID is refused before sending", func(t *testing.T) {
+		g := NewWithT(t)
+		fake := newFakeIKS(t, reply(http.StatusOK, []byte(`[]`)))
+		service, limiter := newTestService(t, fake)
+		_, err := service.ListWorkerPools(context.Background(), "")
+		g.Expect(err).To(MatchError(ErrInvalidRequest))
+		g.Expect(fake.received()).To(BeEmpty())
+		g.Expect(limiter.count()).To(BeZero())
+	})
+
+	// The /v2/vpc/getWorkerPools fallback decodes the path observed on IBM Cloud; it is inactive while
+	// ListWorkerPoolsViaSDK is true, and tested directly so that switching is the one-line change it is meant to be.
+	t.Run("fallback decodes /v2/vpc/getWorkerPools as an array", func(t *testing.T) {
+		g := NewWithT(t)
+		fake := newFakeIKS(t, servePath("/global/v2/vpc/getWorkerPools", http.StatusOK, fixture(t, "iks-getWorkerPools-normal.json")))
+		service, limiter := newTestService(t, fake)
+		pools, err := service.listWorkerPoolsFromVPCPath(context.Background(), testIKSClusterID)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(pools).To(Equal([]WorkerPool{iksPool}))
+		request := fake.last(t)
+		g.Expect(request.RawQuery).To(Equal("cluster=" + testIKSClusterID))
+		g.Expect(request.Header.Get("Authorization")).To(Equal("Bearer " + testToken))
+		g.Expect(request.Header.Get("User-Agent")).To(Equal(testUserAgent))
+		g.Expect(limiter.count()).To(Equal(1))
+	})
+
+	t.Run("fallback for /v2/vpc/getWorkerPools maps errors", func(t *testing.T) {
+		g := NewWithT(t)
+		fake := newFakeIKS(t, reply(http.StatusInternalServerError, nil))
+		service, _ := newTestService(t, fake)
+		_, err := service.listWorkerPoolsFromVPCPath(context.Background(), testIKSClusterID)
+		g.Expect(Classify(OpListWorkerPools, err)).To(Equal(ClassTransient))
+	})
+}
+
+func TestListWorkers(t *testing.T) {
+	iksNormal := Worker{
+		ID:                 "kube-" + testIKSClusterID + "-exampletest-example-0000015f",
+		PoolID:             testIKSClusterID + "-00000a1",
+		Zone:               "eu-de-1",
+		ActualState:        "deployed",
+		HealthState:        "normal",
+		KubeVersionActual:  "1.36.5_1540",
+		KubeVersionTarget:  "1.36.5_1540",
+		KubeVersionDesired: "1.36.5_1540",
+	}
+	roksPending := func(suffix string) Worker {
+		return Worker{
+			ID:                 "kube-" + testROKSClusterID + "-exampletest-default-" + suffix,
+			PoolID:             testROKSClusterID + "-00000b2",
+			Zone:               "eu-de-1",
+			ActualState:        "provision_pending",
+			KubeVersionTarget:  "4.21.40_1540_openshift",
+			KubeVersionDesired: "4.21.40_1540_openshift",
+		}
+	}
+	decodeCases := []struct {
+		fixture  string
+		expected []Worker
+	}{
+		{fixture: "iks-getWorkers-normal.json", expected: []Worker{iksNormal}},
+		{fixture: "roks-getWorkers-deployed.json", expected: []Worker{roksPending("000001ec"), roksPending("0000029f")}},
+		{fixture: "roks-getWorkers-deploying.json", expected: []Worker{}},
+	}
+	for _, tc := range decodeCases {
+		t.Run("decodes "+tc.fixture, func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeIKS(t, servePath("/global/v2/vpc/getWorkers", http.StatusOK, fixture(t, tc.fixture)))
+			service, _ := newTestService(t, fake)
+			workers, err := service.ListWorkers(context.Background(), "some-cluster")
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(workers).To(Equal(tc.expected))
+		})
+	}
+
+	stateCases := []struct {
+		fixture string
+		states  []string
+	}{
+		{fixture: "iks-getWorkers-deploying.json", states: []string{"provisioning"}},
+		{fixture: "iks-getWorkers-deployed.json", states: []string{"provisioning"}},
+		{fixture: "iks-getWorkers-pending.json", states: []string{"provisioning"}},
+		{fixture: "roks-getWorkers-pending.json", states: []string{"provisioning", "provisioning"}},
+		{fixture: "roks-getWorkers-normal.json", states: []string{"deployed", "deployed"}},
+	}
+	for _, tc := range stateCases {
+		t.Run("states of "+tc.fixture, func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeIKS(t, servePath("/global/v2/vpc/getWorkers", http.StatusOK, fixture(t, tc.fixture)))
+			service, _ := newTestService(t, fake)
+			workers, err := service.ListWorkers(context.Background(), "some-cluster")
+			g.Expect(err).ToNot(HaveOccurred())
+			states := make([]string, 0, len(workers))
+			for _, worker := range workers {
+				states = append(states, worker.ActualState)
+				g.Expect(worker.PendingOperation).To(BeEmpty(), "pendingOperation is empty on every probed worker")
+			}
+			g.Expect(states).To(Equal(tc.states))
+		})
+	}
+
+	t.Run("request asks for deleted workers", func(t *testing.T) {
+		g := NewWithT(t)
+		fake := newFakeIKS(t, servePath("/global/v2/vpc/getWorkers", http.StatusOK, fixture(t, "iks-getWorkers-normal.json")))
+		service, _ := newTestService(t, fake)
+		_, err := service.ListWorkers(context.Background(), testIKSClusterID)
+		g.Expect(err).ToNot(HaveOccurred())
+		request := fake.last(t)
+		g.Expect(request.Method).To(Equal(http.MethodGet))
+		g.Expect(request.RawQuery).To(Equal("cluster=" + testIKSClusterID + "&showDeleted=true"))
+		g.Expect(request.Header.Get("Authorization")).To(Equal("Bearer " + testToken))
+	})
+
+	t.Run("a deleted record decodes with its state", func(t *testing.T) {
+		g := NewWithT(t)
+		var records []map[string]any
+		g.Expect(json.Unmarshal(fixture(t, "iks-getWorkers-normal.json"), &records)).To(Succeed())
+		records[0]["lifecycle"].(map[string]any)["actualState"] = "deleted"
+		records[0]["lifecycle"].(map[string]any)["pendingOperation"] = "deleting"
+		body, err := json.Marshal(records)
+		g.Expect(err).ToNot(HaveOccurred())
+		fake := newFakeIKS(t, reply(http.StatusOK, body))
+		service, _ := newTestService(t, fake)
+		workers, err := service.ListWorkers(context.Background(), testIKSClusterID)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(workers).To(HaveLen(1))
+		g.Expect(workers[0].ActualState).To(Equal("deleted"))
+		g.Expect(workers[0].PendingOperation).To(Equal("deleting"))
+	})
+
+	t.Run("5xx is Transient", func(t *testing.T) {
+		g := NewWithT(t)
+		fake := newFakeIKS(t, reply(http.StatusBadGateway, nil))
+		service, _ := newTestService(t, fake)
+		_, err := service.ListWorkers(context.Background(), testIKSClusterID)
+		g.Expect(Classify(OpListWorkers, err)).To(Equal(ClassTransient))
+	})
+
+	t.Run("an empty cluster ID is refused before sending", func(t *testing.T) {
+		g := NewWithT(t)
+		fake := newFakeIKS(t, reply(http.StatusOK, []byte(`[]`)))
+		service, limiter := newTestService(t, fake)
+		_, err := service.ListWorkers(context.Background(), "")
+		g.Expect(err).To(MatchError(ErrInvalidRequest))
+		g.Expect(fake.received()).To(BeEmpty())
+		g.Expect(limiter.count()).To(BeZero())
+	})
+}
+
+func TestReplaceWorker(t *testing.T) {
+	workerID := "kube-" + testIKSClusterID + "-exampletest-example-0000015f"
+	noContent := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }
+
+	for _, update := range []bool{true, false} {
+		t.Run(fmt.Sprintf("posts {cluster, update: %t, workerID} and accepts 204", update), func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeIKS(t, noContent)
+			service, _ := newTestService(t, fake)
+			g.Expect(service.ReplaceWorker(context.Background(), testIKSClusterID, workerID, update)).To(Succeed())
+			request := fake.last(t)
+			g.Expect(request.Method).To(Equal(http.MethodPost))
+			g.Expect(request.Path).To(Equal("/global/v2/vpc/replaceWorker"))
+			g.Expect(request.Header.Get("Authorization")).To(Equal("Bearer " + testToken))
+			g.Expect(string(request.Body)).To(MatchJSON(fmt.Sprintf(`{"cluster": %q, "update": %t, "workerID": %q}`, testIKSClusterID, update, workerID)))
+		})
+	}
+
+	t.Run("404 is NotFound", func(t *testing.T) {
+		g := NewWithT(t)
+		fake := newFakeIKS(t, reply(http.StatusNotFound, []byte(`{"code":"G0005","description":"synthesized: worker not found"}`)))
+		service, _ := newTestService(t, fake)
+		err := service.ReplaceWorker(context.Background(), testIKSClusterID, workerID, true)
+		g.Expect(Classify(OpReplaceWorker, err)).To(Equal(ClassNotFound))
+	})
+
+	t.Run("a POST answered 500 is sent exactly once", func(t *testing.T) {
+		g := NewWithT(t)
+		fake := newFakeIKS(t, reply(http.StatusInternalServerError, nil))
+		service, _ := newTestService(t, fake)
+		err := service.ReplaceWorker(context.Background(), testIKSClusterID, workerID, true)
+		g.Expect(Classify(OpReplaceWorker, err)).To(Equal(ClassTransient))
+		g.Expect(fake.received()).To(HaveLen(1))
+	})
+
+	refused := []struct {
+		name      string
+		clusterID string
+		workerID  string
+		message   string
+	}{
+		{name: "empty cluster ID", clusterID: "", workerID: workerID, message: "ReplaceWorker: the cluster ID is empty"},
+		{name: "empty worker ID", clusterID: testIKSClusterID, workerID: "", message: "ReplaceWorker: the worker ID is empty"},
+	}
+	for _, tc := range refused {
+		t.Run("refused before sending: "+tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeIKS(t, noContent)
+			service, limiter := newTestService(t, fake)
+			err := service.ReplaceWorker(context.Background(), tc.clusterID, tc.workerID, true)
+			g.Expect(err).To(MatchError(ErrInvalidRequest))
+			g.Expect(err.Error()).To(ContainSubstring(tc.message))
+			g.Expect(fake.received()).To(BeEmpty())
+			g.Expect(limiter.count()).To(BeZero())
+		})
+	}
 }

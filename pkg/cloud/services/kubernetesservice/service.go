@@ -219,6 +219,99 @@ func (s *Service) ListVersions(ctx context.Context) (*Versions, error) {
 	}, nil
 }
 
+// ListWorkerPoolsViaSDK selects the source of ListWorkerPools. Not yet verified against IBM Cloud: the SDK's
+// GetWorkerPools1 calls GET /v2/getWorkerPools, whose array shape on VPC clusters only the swagger documents
+// (GetCombinedWorkerPoolResponse, with the same zone schema as the VPC answer); GET /v2/vpc/getWorkerPools was
+// observed to answer an array. Fallback if /v2/getWorkerPools answers another shape: set it to false, and
+// ListWorkerPools decodes /v2/vpc/getWorkerPools as an array (the SDK's VpcGetWorkerPools decodes a single object, so
+// it cannot be used); the fallback then becomes a compat function with its own COMPAT header. Exported so that the
+// managed scope's assumptions can list it with the other decision points that are not yet verified against IBM Cloud.
+const ListWorkerPoolsViaSDK = true
+
+// ListWorkerPools implements KubernetesService.
+func (s *Service) ListWorkerPools(ctx context.Context, clusterID string) ([]WorkerPool, error) {
+	if clusterID == "" {
+		return nil, invalidRequest(OpListWorkerPools, "the cluster ID is empty; pass status.clusterID of the IBMCloudManagedControlPlane")
+	}
+	if ListWorkerPoolsViaSDK {
+		return s.listWorkerPoolsFromSDK(ctx, clusterID)
+	}
+	return s.listWorkerPoolsFromVPCPath(ctx, clusterID)
+}
+
+// listWorkerPoolsFromSDK lists the pools of clusterID with the SDK's GetWorkerPools1 (GET /v2/getWorkerPools).
+// ctx bounds the request.
+func (s *Service) listWorkerPoolsFromSDK(ctx context.Context, clusterID string) ([]WorkerPool, error) {
+	ctx, tracker := trackCall(ctx)
+	result, response, err := s.sdk.GetWorkerPools1WithContext(ctx, &kubernetesserviceapiv1.GetWorkerPools1Options{
+		Cluster: core.StringPtr(clusterID),
+	})
+	if err != nil {
+		return nil, callError(OpListWorkerPools, tracker, response, err)
+	}
+	return workerPoolsFromSDK(result), nil
+}
+
+// listWorkerPoolsFromVPCPath is the fallback of ListWorkerPools: it decodes GET /v2/vpc/getWorkerPools as an array,
+// the shape observed on IBM Cloud. Inactive while ListWorkerPoolsViaSDK is true. ctx bounds the request; clusterID is
+// the IBM cluster ID.
+func (s *Service) listWorkerPoolsFromVPCPath(ctx context.Context, clusterID string) ([]WorkerPool, error) {
+	ctx, tracker := trackCall(ctx)
+	builder := core.NewRequestBuilder(core.GET).WithContext(ctx)
+	if _, err := builder.ResolveRequestURL(s.sdk.Service.GetServiceURL(), "/v2/vpc/getWorkerPools", nil); err != nil {
+		return nil, fmt.Errorf("kubernetesservice: %s: building the request: %w", OpListWorkerPools, err)
+	}
+	builder.AddQuery("cluster", clusterID)
+	builder.AddHeader("Accept", "application/json")
+	request, err := builder.Build()
+	if err != nil {
+		return nil, fmt.Errorf("kubernetesservice: %s: building the request: %w", OpListWorkerPools, err)
+	}
+	var pools []kubernetesserviceapiv1.GetWorkerPoolResponse
+	response, err := s.sdk.Service.Request(request, &pools)
+	if err != nil {
+		return nil, callError(OpListWorkerPools, tracker, response, err)
+	}
+	return workerPoolsFromSDK(pools), nil
+}
+
+// ListWorkers implements KubernetesService.
+func (s *Service) ListWorkers(ctx context.Context, clusterID string) ([]Worker, error) {
+	if clusterID == "" {
+		return nil, invalidRequest(OpListWorkers, "the cluster ID is empty; pass status.clusterID of the IBMCloudManagedControlPlane")
+	}
+	ctx, tracker := trackCall(ctx)
+	result, response, err := s.sdk.VpcGetWorkersWithContext(ctx, &kubernetesserviceapiv1.VpcGetWorkersOptions{
+		Cluster: core.StringPtr(clusterID),
+		// Deleted workers are listed so that a worker leaves providerIDList on IBM's "deleted" record (BuildProviderIDList).
+		ShowDeleted: core.StringPtr("true"),
+	})
+	if err != nil {
+		return nil, callError(OpListWorkers, tracker, response, err)
+	}
+	return workersFromSDK(result), nil
+}
+
+// ReplaceWorker implements KubernetesService.
+func (s *Service) ReplaceWorker(ctx context.Context, clusterID, workerID string, update bool) error {
+	switch {
+	case clusterID == "":
+		return invalidRequest(OpReplaceWorker, "the cluster ID is empty; pass status.clusterID of the IBMCloudManagedControlPlane")
+	case workerID == "":
+		return invalidRequest(OpReplaceWorker, "the worker ID is empty; pass the ID of a worker that ListWorkers returned")
+	}
+	ctx, tracker := trackCall(ctx)
+	response, err := s.sdk.VpcReplaceWorkerWithContext(ctx, &kubernetesserviceapiv1.VpcReplaceWorkerOptions{
+		Cluster:  core.StringPtr(clusterID),
+		WorkerID: core.StringPtr(workerID),
+		Update:   core.BoolPtr(update),
+	})
+	if err != nil {
+		return callError(OpReplaceWorker, tracker, response, err)
+	}
+	return nil
+}
+
 // emptyAnswer is the error of a 2xx answer without the body the operation needs.
 //
 // Parameters:
@@ -343,6 +436,60 @@ func releaseVersions(versions []kubernetesserviceapiv1.KubeVersion) []ReleaseVer
 			Default:      boolValue(version.Default),
 			EndOfService: core.StringNilMapper(version.EndOfService),
 		})
+	}
+	return mapped
+}
+
+// workerPoolsFromSDK maps the SDK's pool models; both list paths decode into them. pools may be empty.
+func workerPoolsFromSDK(pools []kubernetesserviceapiv1.GetWorkerPoolResponse) []WorkerPool {
+	mapped := make([]WorkerPool, 0, len(pools))
+	for _, pool := range pools {
+		workerPool := WorkerPool{
+			ID:               core.StringNilMapper(pool.ID),
+			Name:             core.StringNilMapper(pool.PoolName),
+			Flavor:           core.StringNilMapper(pool.Flavor),
+			SizePerZone:      int64Value(pool.WorkerCount),
+			AutoscaleEnabled: boolValue(pool.AutoscaleEnabled),
+			IsBalanced:       boolValue(pool.IsBalanced),
+			OperatingSystem:  core.StringNilMapper(pool.OperatingSystem),
+		}
+		if pool.Lifecycle != nil {
+			workerPool.ActualState = core.StringNilMapper(pool.Lifecycle.ActualState)
+		}
+		for _, zone := range pool.Zones {
+			workerPool.Zones = append(workerPool.Zones, WorkerPoolZone{
+				ID:                 core.StringNilMapper(zone.ID),
+				WorkerCount:        int64Value(zone.WorkerCount),
+				AutobalanceEnabled: boolValue(zone.AutobalanceEnabled),
+			})
+		}
+		mapped = append(mapped, workerPool)
+	}
+	return mapped
+}
+
+// workersFromSDK maps the SDK's worker models. workers may be empty.
+func workersFromSDK(workers []kubernetesserviceapiv1.GetWorkerResponse) []Worker {
+	mapped := make([]Worker, 0, len(workers))
+	for _, worker := range workers {
+		w := Worker{
+			ID:     core.StringNilMapper(worker.ID),
+			PoolID: core.StringNilMapper(worker.PoolID),
+			Zone:   core.StringNilMapper(worker.Location),
+		}
+		if worker.Lifecycle != nil {
+			w.ActualState = core.StringNilMapper(worker.Lifecycle.ActualState)
+			w.PendingOperation = core.StringNilMapper(worker.Lifecycle.PendingOperation)
+		}
+		if worker.Health != nil {
+			w.HealthState = core.StringNilMapper(worker.Health.State)
+		}
+		if worker.KubeVersion != nil {
+			w.KubeVersionActual = core.StringNilMapper(worker.KubeVersion.Actual)
+			w.KubeVersionTarget = core.StringNilMapper(worker.KubeVersion.Target)
+			w.KubeVersionDesired = core.StringNilMapper(worker.KubeVersion.Desired)
+		}
+		mapped = append(mapped, w)
 	}
 	return mapped
 }

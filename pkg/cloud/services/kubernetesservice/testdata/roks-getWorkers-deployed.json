@@ -1,0 +1,80 @@
+[
+  {
+    "id": "kube-roksclusterid0000002-exampletest-default-000001ec",
+    "lifecycle": {
+      "desiredState": "deployed",
+      "actualState": "provision_pending",
+      "message": "",
+      "messageDate": "",
+      "pendingOperation": "",
+      "reasonForDelete": "",
+      "messageDetails": "",
+      "messageDetailsDate": "",
+      "desiredOperatingSystem": "RHCOS",
+      "actualOperatingSystem": ""
+    },
+    "health": {
+      "state": "",
+      "message": ""
+    },
+    "kubeVersion": {
+      "desired": "4.21.40_1540_openshift",
+      "actual": "",
+      "target": "4.21.40_1540_openshift",
+      "eos": "",
+      "masterEOS": ""
+    },
+    "flavor": "bx2.4x16",
+    "location": "eu-de-1",
+    "poolID": "roksclusterid0000002-00000b2",
+    "poolName": "default",
+    "provider": "vpc-gen2",
+    "networkInterfaces": [
+      {
+        "subnetID": "02b7-00000000-0000-4000-8000-000000000002",
+        "ipAddress": "",
+        "cidr": "",
+        "primary": true
+      }
+    ]
+  },
+  {
+    "id": "kube-roksclusterid0000002-exampletest-default-0000029f",
+    "lifecycle": {
+      "desiredState": "deployed",
+      "actualState": "provision_pending",
+      "message": "",
+      "messageDate": "",
+      "pendingOperation": "",
+      "reasonForDelete": "",
+      "messageDetails": "",
+      "messageDetailsDate": "",
+      "desiredOperatingSystem": "RHCOS",
+      "actualOperatingSystem": ""
+    },
+    "health": {
+      "state": "",
+      "message": ""
+    },
+    "kubeVersion": {
+      "desired": "4.21.40_1540_openshift",
+      "actual": "",
+      "target": "4.21.40_1540_openshift",
+      "eos": "",
+      "masterEOS": ""
+    },
+    "flavor": "bx2.4x16",
+    "location": "eu-de-1",
+    "poolID": "roksclusterid0000002-00000b2",
+    "poolName": "default",
+    "provider": "vpc-gen2",
+    "networkInterfaces": [
+      {
+        "subnetID": "02b7-00000000-0000-4000-8000-000000000002",
+        "ipAddress": "",
+        "cidr": "",
+        "primary": true
+      }
+    ]
+  }
+]

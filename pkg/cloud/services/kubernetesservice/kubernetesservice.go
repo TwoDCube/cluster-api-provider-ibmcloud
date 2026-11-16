@@ -52,4 +52,24 @@ type KubernetesService interface {
 	// GetCACertificate returns the cluster CA (PEM) and IBM's rotatedAt value. It never returns a credential, so the
 	// ownership proof and the CA re-check may call it. A compat function (compat.go).
 	GetCACertificate(ctx context.Context, clusterID string) (*CACertificate, error)
+
+	// ListWorkerPools returns every pool of the cluster. The SDK method calls GET /v2/getWorkerPools, whose array shape
+	// on VPC clusters only the swagger documents (GetCombinedWorkerPoolResponse; same zone schema as the VPC one); it is
+	// not yet verified against IBM Cloud. GET /v2/vpc/getWorkerPools was observed to answer an array; fallback: a compat
+	// decoder for that path, because the SDK's VpcGetWorkerPools decodes a single object (ListWorkerPoolsViaSDK). SDK
+	// GetWorkerPools1WithContext.
+	ListWorkerPools(ctx context.Context, clusterID string) ([]WorkerPool, error)
+	// CreateWorkerPool creates a pool with its zones and subnets in one call and returns the new pool's ID. Never
+	// retried by the client. A compat function (POST /v2/vpc/createWorkerPool); its fallback behind CreatePoolWithZones
+	// is a zone-less SDK create plus one SDK zone add per zone.
+	CreateWorkerPool(ctx context.Context, req CreateWorkerPoolRequest) (string, error)
+
+	// ListWorkers returns every worker of the cluster, including deleted ones (showDeleted=true), so that a worker
+	// leaves providerIDList on IBM's "deleted" record rather than on its absence from one listing: dropping a live
+	// worker's ID would make Cluster API delete its Node. SDK VpcGetWorkersWithContext (GET /v2/vpc/getWorkers).
+	ListWorkers(ctx context.Context, clusterID string) ([]Worker, error)
+	// ReplaceWorker replaces one worker; CAPIBM always sends update=true (newest fix pack of the master minor).
+	// POST /v2/vpc/replaceWorker {cluster, update, workerID}; IBM answers 204 (observed on IBM Cloud). SDK
+	// VpcReplaceWorkerWithContext.
+	ReplaceWorker(ctx context.Context, clusterID, workerID string, update bool) error
 }

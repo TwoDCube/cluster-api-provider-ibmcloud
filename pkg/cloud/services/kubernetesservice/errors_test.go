@@ -71,6 +71,13 @@ func TestClassify(t *testing.T) {
 		{name: "other 409 on CreateCluster", op: OpCreateCluster, err: apiError(OpCreateCluster, http.StatusConflict, ""), expected: ClassUnknown},
 		{name: "500 on CreateCluster", op: OpCreateCluster, err: apiError(OpCreateCluster, http.StatusInternalServerError, ""), expected: ClassTransient},
 		{name: "A0656 on another operation is only its status", op: OpGetCluster, err: apiError(OpGetCluster, http.StatusForbidden, "A0656"), expected: ClassPermissionDenied},
+
+		{name: "409 E0d39 on CreateWorkerPool", op: OpCreateWorkerPool, err: apiError(OpCreateWorkerPool, http.StatusConflict, "E0d39"), expected: ClassPoolNameExists},
+		{name: "other 409 on CreateWorkerPool is OperationInProgress", op: OpCreateWorkerPool, err: apiError(OpCreateWorkerPool, http.StatusConflict, "E9999"), expected: ClassOperationInProgress},
+		{name: "403 on CreateWorkerPool is PermissionDenied", op: OpCreateWorkerPool, err: apiError(OpCreateWorkerPool, http.StatusForbidden, ""), expected: ClassPermissionDenied},
+		{name: "E0d39 on CreateCluster has no pool meaning", op: OpCreateCluster, err: apiError(OpCreateCluster, http.StatusConflict, "E0d39"), expected: ClassUnknown},
+		{name: "404 on ListWorkers", op: OpListWorkers, err: apiError(OpListWorkers, http.StatusNotFound, ""), expected: ClassNotFound},
+		{name: "409 on ReplaceWorker has no specific meaning", op: OpReplaceWorker, err: apiError(OpReplaceWorker, http.StatusConflict, ""), expected: ClassUnknown},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {

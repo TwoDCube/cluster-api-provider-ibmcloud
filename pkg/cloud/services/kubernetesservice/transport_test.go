@@ -91,6 +91,37 @@ func limiterCalls(t *testing.T) []limiterCall {
 				return err
 			},
 		},
+		{
+			name:   "ListWorkerPools",
+			answer: reply(http.StatusOK, fixture(t, "iks-getWorkerPools-normal.json")),
+			call: func(ctx context.Context, s *Service) error {
+				_, err := s.ListWorkerPools(ctx, testIKSClusterID)
+				return err
+			},
+		},
+		{
+			name:   "CreateWorkerPool",
+			answer: reply(http.StatusCreated, []byte(`{"workerPoolID":"p1"}`)),
+			call: func(ctx context.Context, s *Service) error {
+				_, err := s.CreateWorkerPool(ctx, iksCreateWorkerPoolRequest())
+				return err
+			},
+		},
+		{
+			name:   "ListWorkers",
+			answer: reply(http.StatusOK, fixture(t, "iks-getWorkers-normal.json")),
+			call: func(ctx context.Context, s *Service) error {
+				_, err := s.ListWorkers(ctx, testIKSClusterID)
+				return err
+			},
+		},
+		{
+			name:   "ReplaceWorker",
+			answer: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) },
+			call: func(ctx context.Context, s *Service) error {
+				return s.ReplaceWorker(ctx, testIKSClusterID, "w1", true)
+			},
+		},
 	}
 }
 

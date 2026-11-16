@@ -39,6 +39,13 @@ package kubernetesservice
 //     and validity, and the getCACert keys. They hold no key material; the probe's OpenShift OAuth block was removed
 //     and the certificate fingerprint replaced by a placeholder. The tests synthesize the kubeconfig bodies from
 //     these shapes with certificates generated in the test (compat_test.go).
+//   - {iks,roks}-getWorkerPools-{deploying,deployed,pending,normal}.json: GET /v2/vpc/getWorkerPools in each create
+//     state, an array. ListWorkerPools calls the SDK's /v2/getWorkerPools, whose answer on a VPC cluster is not yet
+//     verified against IBM Cloud; until it is captured, the tests serve these /v2/vpc bodies on it.
+//   - {iks,roks}-getWorkers-{deploying,deployed,pending,normal}.json: GET /v2/vpc/getWorkers in each create state,
+//     with kubeVersion{desired, actual, target}; roks-getWorkers-deploying.json is IBM's empty list.
+//   - golden/createWorkerPool.json: not a capture; the body CreateWorkerPool must send for
+//     iksCreateWorkerPoolRequest (zones with subnetID, no operatingSystem).
 
 import (
 	"context"

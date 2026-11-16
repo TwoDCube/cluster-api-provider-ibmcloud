@@ -202,6 +202,80 @@ type CACertificate struct {
 	RotatedAt string
 }
 
+// CreateWorkerPoolRequest is the input of CreateWorkerPool. CreateWorkerPool validates it before sending anything.
+type CreateWorkerPoolRequest struct {
+	// ClusterID is the IBM cluster ID. Required.
+	ClusterID string
+	// Name is the pool name (IBMCloudManagedMachinePool spec.poolName). Required.
+	Name string
+	// Flavor is the worker flavor, for example "bx2.4x16". Required.
+	Flavor string
+	// VPCID is the VPC the workers attach to. Required.
+	VPCID string
+	// WorkerCountPerZone is the number of workers in each zone. Required, at least 1.
+	WorkerCountPerZone int64
+	// Zones lists the zones and the subnet of each; they are created with the pool in the same call, or added one by
+	// one right after it when the zone-by-zone fallback is switched on (CreatePoolWithZones). Required, at least one, no
+	// zone twice.
+	Zones []ZoneSubnet
+	// Entitlement is "" or "ocp_entitled" (ROKS with an OpenShift entitlement).
+	Entitlement string
+}
+
+// WorkerPool is one worker pool as ListWorkerPools reports it.
+type WorkerPool struct {
+	// ID is IBM's pool ID, "<clusterID>-<7 hex characters>" (observed on IBM Cloud).
+	ID string
+	// Name is the pool name.
+	Name string
+	// Flavor is the worker flavor.
+	Flavor string
+	// ActualState is lifecycle.actualState; "" on a steady pool, "deleting" or "deleted" while it goes.
+	ActualState string
+	// SizePerZone is the pool's workerCount: the desired workers per zone.
+	SizePerZone int64
+	// Zones are the pool's zones.
+	Zones []WorkerPoolZone
+	// AutoscaleEnabled is true when IBM's cluster autoscaler owns the pool size; CAPIBM then never resizes it.
+	AutoscaleEnabled bool
+	// IsBalanced is IBM's balance flag.
+	IsBalanced bool
+	// OperatingSystem is informational, for example "UBUNTU_24_64" or "RHCOS".
+	OperatingSystem string
+}
+
+// WorkerPoolZone is one zone of a worker pool.
+type WorkerPoolZone struct {
+	// ID is the zone, for example "eu-de-1".
+	ID string
+	// WorkerCount is IBM's current worker count in the zone; it was observed to lag the pool's SizePerZone after create.
+	WorkerCount int64
+	// AutobalanceEnabled gates worker replacement; SDK WorkerPoolZoneResponse.AutobalanceEnabled.
+	AutobalanceEnabled bool
+}
+
+// Worker is one worker as ListWorkers reports it.
+type Worker struct {
+	// ID is IBM's worker ID; the Node's provider ID ends with it.
+	ID string
+	// PoolID is the ID of the worker's pool.
+	PoolID string
+	// Zone is the worker's zone (IBM's location).
+	Zone string
+	// ActualState is lifecycle.actualState, for example "provisioning", "deployed", "deleting", "deleted".
+	ActualState string
+	// PendingOperation is lifecycle.pendingOperation; "" on every steady worker observed on IBM Cloud.
+	PendingOperation string
+	// HealthState is health.state, for example "normal".
+	HealthState string
+	// KubeVersionActual is the version the worker runs, for example "1.36.5_1540"; "" while provisioning.
+	KubeVersionActual string
+	// KubeVersionTarget is the version IBM would move the worker to.
+	KubeVersionTarget string
+	// KubeVersionDesired is the version IBM provisions the worker with.
+	KubeVersionDesired string
+}
+
 // entitlementOCPEntitled is the one worker-pool entitlement besides none: the customer brings its own OpenShift
 // license (ROKS only).
 const entitlementOCPEntitled = "ocp_entitled"
@@ -227,6 +301,35 @@ func (r CreateClusterRequest) validate() error {
 		return nil
 	}
 	return invalidRequest(OpCreateCluster, strings.Join(problems, "; "))
+}
+
+// validate checks r before CreateWorkerPool sends it. The error names every missing or malformed field and the
+// accepted form, and wraps ErrInvalidRequest.
+func (r CreateWorkerPoolRequest) validate() error {
+	var problems []string
+	if r.ClusterID == "" {
+		problems = append(problems, "ClusterID is empty; pass status.clusterID of the IBMCloudManagedControlPlane")
+	}
+	if r.Name == "" {
+		problems = append(problems, "Name is empty; pass the pool name (IBMCloudManagedMachinePool spec.poolName)")
+	}
+	if r.Flavor == "" {
+		problems = append(problems, "Flavor is empty; pass a VPC worker flavor such as bx2.4x16")
+	}
+	if r.VPCID == "" {
+		problems = append(problems, "VPCID is empty; pass the ID of the VPC the workers attach to")
+	}
+	if r.WorkerCountPerZone < 1 {
+		problems = append(problems, fmt.Sprintf("WorkerCountPerZone is %d; pass at least 1", r.WorkerCountPerZone))
+	}
+	if r.Entitlement != "" && r.Entitlement != entitlementOCPEntitled {
+		problems = append(problems, fmt.Sprintf("Entitlement %q is not supported; pass \"\" or %q", r.Entitlement, entitlementOCPEntitled))
+	}
+	problems = append(problems, zoneProblems("Zones", r.Zones)...)
+	if len(problems) == 0 {
+		return nil
+	}
+	return invalidRequest(OpCreateWorkerPool, strings.Join(problems, "; "))
 }
 
 // problems lists what is missing or malformed in p, each with the accepted form.

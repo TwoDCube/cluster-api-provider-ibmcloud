@@ -45,6 +45,14 @@ const (
 	OpGetAdminKubeconfig Operation = "GetAdminKubeconfig"
 	// OpGetCACertificate is KubernetesService.GetCACertificate.
 	OpGetCACertificate Operation = "GetCACertificate"
+	// OpListWorkerPools is KubernetesService.ListWorkerPools.
+	OpListWorkerPools Operation = "ListWorkerPools"
+	// OpCreateWorkerPool is KubernetesService.CreateWorkerPool.
+	OpCreateWorkerPool Operation = "CreateWorkerPool"
+	// OpListWorkers is KubernetesService.ListWorkers.
+	OpListWorkers Operation = "ListWorkers"
+	// OpReplaceWorker is KubernetesService.ReplaceWorker.
+	OpReplaceWorker Operation = "ReplaceWorker"
 )
 
 // ErrorClass is what an error from KubernetesService means for a controller. Each controller decides what to do for
@@ -84,6 +92,13 @@ const (
 	ClassTransient ErrorClass = "Transient"
 	// ClassUnknown is any other error; callers treat it like ClassTransient.
 	ClassUnknown ErrorClass = "Unknown"
+	// ClassPoolNameExists is code E0d39 on CreateWorkerPool: a pool with that name exists, also right after a pool
+	// delete while IBM still releases the name (how long that takes is not yet verified against IBM Cloud). The caller
+	// adopts by name or waits.
+	ClassPoolNameExists ErrorClass = "PoolNameExists"
+	// ClassOperationInProgress is any other 409 on CreateWorkerPool ("worker pool create may already be in
+	// progress"; its code is not yet verified against IBM Cloud). The caller retries after a minute and adopts by name.
+	ClassOperationInProgress ErrorClass = "OperationInProgress"
 )
 
 // IBM error codes Classify matches. The error bodies of most operations are not yet verified against IBM Cloud; the
@@ -99,6 +114,8 @@ const (
 	codeCOSInstanceRequired = "E7278"
 	// codeInternalError is IBM's generic internal-error code; it comes with a 5xx.
 	codeInternalError = "E0004"
+	// codePoolNameExists is IBM's "worker pool name already exists" code on createWorkerPool (409).
+	codePoolNameExists = "E0d39"
 )
 
 // ErrInvalidRequest marks a request that KubernetesService refused to send because an argument is missing or
@@ -186,6 +203,25 @@ func classifyOperation(op Operation, apiErr *APIError) ErrorClass {
 	switch op {
 	case OpCreateCluster:
 		return classifyCreateCluster(apiErr)
+	case OpCreateWorkerPool:
+		return classifyCreateWorkerPool(apiErr)
+	default:
+		return ClassUnknown
+	}
+}
+
+// classifyCreateWorkerPool applies the CreateWorkerPool rows to apiErr. IBM's 409 "zone already exists in the worker
+// pool" (a zone add that is already done) is not here: the only zone adds this package sends are those of the
+// inactive zone-by-zone fallback, to the pool it has just created, which cannot hold the zone yet. The row matters
+// when a pool left half created is repaired by adding its missing zones, which needs AddWorkerPoolZone in the
+// interface and in the controller; it arrives with them, with the support for adding and removing zones.
+func classifyCreateWorkerPool(apiErr *APIError) ErrorClass {
+	switch {
+	case apiErr.Code == codePoolNameExists:
+		return ClassPoolNameExists
+	case apiErr.StatusCode == http.StatusConflict:
+		// Matched by operation and status, because the code of "create may already be in progress" was never observed.
+		return ClassOperationInProgress
 	default:
 		return ClassUnknown
 	}
