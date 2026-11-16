@@ -956,6 +956,25 @@ func TestDisruptionCallOutcome(t *testing.T) {
 		{name: "a request the service refused to send is left to the caller", call: removeCall,
 			err:  fmt.Errorf("%w: RemoveWorkerPool: the pool ID is empty", kubernetesservice.ErrInvalidRequest),
 			want: StepHold, wantPhase: waitIBM, wantReason: ReasonRemovingWorkerPool, wantClass: kubernetesservice.ClassBadRequest, wantHandled: false},
+
+		// ResizeWorkerPool, the call of a scale-down.
+		{name: "resize accepted", call: kubernetesservice.OpResizeWorkerPool, err: nil,
+			want: StepWaitForRemoval, wantPhase: removal, wantReason: ReasonResizing, wantClass: kubernetesservice.ClassNone, wantHandled: true},
+		{name: "live IKS E1437 on resizeWorkerPool holds the Nodes cordoned", call: kubernetesservice.OpResizeWorkerPool,
+			err:  liveAPIError(t, "error-E1437-iks-resize.json", kubernetesservice.OpResizeWorkerPool, http.StatusBadRequest),
+			want: StepHold, wantPhase: waitIBM, wantReason: ReasonWaitingForClusterMinimum, wantClass: kubernetesservice.ClassClusterMinimum, wantHandled: true},
+		{name: "live ROKS E1437 on resizeWorkerPool holds the Nodes cordoned", call: kubernetesservice.OpResizeWorkerPool,
+			err:  liveAPIError(t, "error-E1437-roks-resize.json", kubernetesservice.OpResizeWorkerPool, http.StatusBadRequest),
+			want: StepHold, wantPhase: waitIBM, wantReason: ReasonWaitingForClusterMinimum, wantClass: kubernetesservice.ClassClusterMinimum, wantHandled: true},
+		{name: "409 on resizeWorkerPool waits for IBM", call: kubernetesservice.OpResizeWorkerPool,
+			err:  apiError(kubernetesservice.OpResizeWorkerPool, http.StatusConflict, "", ""),
+			want: StepWaitForIBM, wantPhase: waitIBM, wantReason: ReasonResizing, wantClass: kubernetesservice.ClassOperationInProgress, wantHandled: true},
+		{name: "autoscaled refusal of a resize of an autoscaled pool holds", call: kubernetesservice.OpResizeWorkerPool, autoscaleEnabled: true,
+			err:  apiError(kubernetesservice.OpResizeWorkerPool, http.StatusForbidden, "", autoscaledRefusal),
+			want: StepHold, wantPhase: waitIBM, wantReason: ReasonExternallyAutoscaled, wantClass: kubernetesservice.ClassAutoscaled, wantHandled: true},
+		{name: "autoscaled refusal of a resize of a pool that is not autoscaled is PermissionDenied", call: kubernetesservice.OpResizeWorkerPool,
+			err:  apiError(kubernetesservice.OpResizeWorkerPool, http.StatusForbidden, "", autoscaledRefusal),
+			want: StepHold, wantPhase: waitIBM, wantReason: ReasonResizing, wantClass: kubernetesservice.ClassPermissionDenied, wantHandled: false},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {

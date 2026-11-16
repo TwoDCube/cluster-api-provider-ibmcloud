@@ -805,3 +805,10 @@ func TestPoolMutationAllowed(t *testing.T) {
 	}
 	NewWithT(t).Expect(PoolMutationAllowed("normal", "Reboot")).To(BeFalse(), "an unknown operation is never allowed")
 }
+
+// TestScaleDownDecisionPoint pins the scale-down strategy, ScaleDownMode.
+func TestScaleDownDecisionPoint(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(ScaleDownMode).To(Equal(ScaleDownPredictThenResize))
+	g.Expect(ScaleDownResizeOnly).NotTo(Equal(ScaleDownPredictThenResize))
+}

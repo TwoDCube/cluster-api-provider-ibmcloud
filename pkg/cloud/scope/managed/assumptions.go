@@ -696,3 +696,22 @@ func PoolMutationAllowed(state string, op PoolOperation) bool {
 		return true
 	}
 }
+
+// Scale-down.
+
+// ScaleDownStrategy is how a pool shrinks. Not yet verified against IBM Cloud (see ScaleDownMode).
+type ScaleDownStrategy string
+
+const (
+	// ScaleDownPredictThenResize predicts the workers IBM removes, drains them, resizes, and verifies the prediction.
+	// Not yet verified against IBM Cloud (see ScaleDownMode).
+	ScaleDownPredictThenResize ScaleDownStrategy = "PredictThenResize"
+	// ScaleDownResizeOnly resizes without draining first; the book warns that PodDisruptionBudgets are then not
+	// honoured. Not yet verified against IBM Cloud (see ScaleDownMode).
+	ScaleDownResizeOnly ScaleDownStrategy = "ResizeOnly"
+)
+
+// ScaleDownMode is the strategy the pool controller uses. Not yet verified against IBM Cloud: whether
+// resizeWorkerPool removes exactly the predicted victims, and whether a cordon changes IBM's ranking; default
+// ScaleDownPredictThenResize; fallback: ScaleDownResizeOnly.
+const ScaleDownMode = ScaleDownPredictThenResize

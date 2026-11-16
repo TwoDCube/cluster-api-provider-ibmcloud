@@ -1008,8 +1008,8 @@ type DisruptionCallResult struct {
 // caller's common error handling (DisruptionCallResult.Handled).
 //
 // Parameters:
-//   - call: the IBM call the caller made for the removal: kubernetesservice.OpReplaceWorker (Replace) or
-//     OpRemoveWorkerPool (DeletePool).
+//   - call: the IBM call the caller made for the removal: kubernetesservice.OpReplaceWorker (Replace),
+//     OpRemoveWorkerPool (DeletePool) or OpResizeWorkerPool (ScaleDown).
 //   - err: the error the call returned; nil for success.
 //   - autoscaleEnabled: the pool's autoscaleEnabled in IBM's latest pool listing (kubernetesservice.WorkerPool).
 //
@@ -1053,9 +1053,11 @@ func removalCallReason(call kubernetesservice.Operation) (DisruptionReason, erro
 		return ReasonReplacingWorker, nil
 	case kubernetesservice.OpRemoveWorkerPool:
 		return ReasonRemovingWorkerPool, nil
+	case kubernetesservice.OpResizeWorkerPool:
+		return ReasonResizing, nil
 	default:
-		return "", fmt.Errorf("DisruptionCallOutcome call is %q; want the IBM call of StepCallIBM: %q or %q", call,
-			kubernetesservice.OpReplaceWorker, kubernetesservice.OpRemoveWorkerPool)
+		return "", fmt.Errorf("DisruptionCallOutcome call is %q; want the IBM call of StepCallIBM: %q, %q or %q", call,
+			kubernetesservice.OpReplaceWorker, kubernetesservice.OpRemoveWorkerPool, kubernetesservice.OpResizeWorkerPool)
 	}
 }
 
