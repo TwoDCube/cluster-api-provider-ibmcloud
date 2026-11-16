@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/ibmversion"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/managedkubeconfig"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/workloadprobe"
 )
 
 // The tests of this file pin every value of assumptions.go to its source, so that switching a decision point after a
@@ -545,4 +546,42 @@ func TestReportedKubernetesVersion(t *testing.T) {
 		// IBM reports the update done: the next probe is published.
 		g.Expect(ReportedKubernetesVersion(published, "v1.36.6+IKS", false)).To(Equal("v1.36.6+IKS"))
 	})
+}
+
+func TestProvesOwnership(t *testing.T) {
+	ibmAdmins := []string{"ibm-admins", "system:authenticated"} // the admin certificate's groups observed on IBM Cloud
+	testCases := []struct {
+		name   string
+		result workloadprobe.Result
+		want   bool
+	}{
+		{
+			// The certificate was fetched by another IAM identity than the one CAPIBM acts as now (a key rotation
+			// or a clusterctl move target). The username is never compared, so the access review alone decides.
+			name:   "other_callers_certificate_with_cluster_admin_proves_ownership",
+			result: workloadprobe.Result{Username: "KubeCert#<synthetic-iam-id-of-another-caller>", Groups: ibmAdmins, GitVersion: "v1.36.5+IKS", ClusterAdmin: true},
+			want:   true,
+		},
+		{
+			name:   "same_result_without_a_username_proves_ownership",
+			result: workloadprobe.Result{Groups: ibmAdmins, GitVersion: "v1.36.5+IKS", ClusterAdmin: true},
+			want:   true,
+		},
+		{
+			name:   "denied access review does not prove ownership even with the ibm-admins group",
+			result: workloadprobe.Result{Username: "KubeCert#<synthetic-iam-id>", Groups: ibmAdmins, GitVersion: "v1.34.9", ClusterAdmin: false},
+			want:   false,
+		},
+		{
+			name:   "empty result does not prove ownership",
+			result: workloadprobe.Result{},
+			want:   false,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(ProvesOwnership(tc.result)).To(Equal(tc.want))
+		})
+	}
 }

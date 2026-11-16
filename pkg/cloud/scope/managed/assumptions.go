@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/ibmversion"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/managedkubeconfig"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/workloadprobe"
 )
 
 // This file holds every fact about IBM's API that only a live probe can settle, in one place, so that a reviewer sees
@@ -454,4 +455,22 @@ func ReportedKubernetesVersion(current, probe string, rolling bool) string {
 		return probe
 	}
 	return current
+}
+
+// Ownership proof (DecideBinding).
+
+// ProvesOwnership reports whether a probe result proves cluster-admin possession of a cluster, which DecideBinding
+// requires before it binds a cluster that only the kubeconfig Secret or a matching endpoint names: the credential's
+// SelfSubjectAccessReview for verb "*" on resource "*" in group "*" was allowed. The proof is
+// credential-identity-agnostic: it never compares the certificate's subject or the SelfSubjectReview username with
+// whoever CAPIBM currently acts as, because such a comparison would fail after a key rotation, on a clusterctl move
+// target that runs with other credentials, and after any later change of identity.
+// Not yet verified against IBM Cloud: whether IBM's admin certificate passes the access review; fallback: also
+// require IBM's admin group ibm-admins in Groups (observed on IBM Cloud), still without any look at the username.
+//
+// Parameters:
+//   - r: the result of workloadprobe.Prober.Probe for the candidate's kubeconfig, built from the Secret's user entry
+//     with the candidate's masterURL and the flavor's trust, never with the Secret's server or CA.
+func ProvesOwnership(r workloadprobe.Result) bool {
+	return r.ClusterAdmin
 }
