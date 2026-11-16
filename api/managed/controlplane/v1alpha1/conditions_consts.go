@@ -87,12 +87,13 @@ const (
 	IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInfrastructureReason = "WaitingForInfrastructure"
 
 	// IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInitialWorkerPoolReason surfaces while no
-	// IBMCloudManagedMachinePool with spec.poolName "default" belongs to the Cluster (IBM creates the first pool with the
-	// cluster).
+	// IBMCloudManagedMachinePool of the Cluster has spec.creation WithCluster (IBM creates that pool together with the
+	// cluster), or while CAPI has not yet linked that pool to its MachinePool.
 	IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInitialWorkerPoolReason = "WaitingForInitialWorkerPool"
 
 	// IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason surfaces for an invalid name, CIDR or
-	// initial pool, and for IBM 400 answers such as P4102 and E7278.
+	// initial pool (including more than one pool with spec.creation WithCluster), and for IBM 400 answers such as P4102
+	// and E7278.
 	IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason = "InvalidConfiguration"
 
 	// IBMCloudManagedControlPlaneIBMClusterProvisionedVersionNotAvailableReason surfaces when IBM does not offer
