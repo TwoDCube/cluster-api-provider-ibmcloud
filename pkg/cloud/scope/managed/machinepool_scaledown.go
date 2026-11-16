@@ -594,7 +594,8 @@ func (s *MachinePoolScope) newScaleDownInput(ctx context.Context, clients *poolC
 // never decides StepCallIBM. Returning the guard's Terminal outcome right away instead would freeze the scale-down with
 // its Nodes cordoned and excluded from load balancers and the Cluster's disruption token held, blocking every other
 // pool, until a human fixes the spec. While the scale-down runs, the guard's message is added to its WorkerPoolReady
-// messages; once it ended, the guard is reported alone.
+// messages; once it ended, the guard is reported alone. A worker replace in flight is settled the same way by its own
+// flow (settleReplace).
 //
 // Parameters:
 //   - ctx is the reconcile context.
@@ -605,13 +606,15 @@ func (s *MachinePoolScope) newScaleDownInput(ctx context.Context, clients *poolC
 func (s *MachinePoolScope) reconcileGuardBlocked(ctx context.Context, clients *poolClients, pool *kubernetesservice.WorkerPool,
 	workers []kubernetesservice.Worker, guards PoolGuardResult) Outcome {
 	inFlight := s.Pool.Status.Disruption.Operation
-	if inFlight != "" && inFlight != infrav1.WorkerDisruptionOperationScaleDown {
-		// A removal of another operation (a worker replace) settles in its own flow.
+	if inFlight != "" && inFlight != infrav1.WorkerDisruptionOperationScaleDown && inFlight != infrav1.WorkerDisruptionOperationReplace {
 		return s.guardOutcome(guards)
 	}
 	input, err := s.newScaleDownInput(ctx, clients, pool, workers, guards.DesiredSizePerZone)
 	if err != nil {
 		return Transient(err)
+	}
+	if inFlight == infrav1.WorkerDisruptionOperationReplace {
+		return s.settleReplace(ctx, input, guards)
 	}
 	if inFlight == "" && len(input.marked) == 0 {
 		return s.guardOutcome(guards)

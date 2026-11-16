@@ -46,10 +46,11 @@ import (
 // This file is the IBMCloudManagedMachinePool scope: it adopts the IBM worker pool of the same name or creates it,
 // observes the pool and its workers, publishes the InfraMachinePool contract (spec.providerIDList, status.replicas,
 // status.ready, status.initialization.provisioned), grows the pool and dispatches its scale-down
-// (machinepool_scaledown.go). Every decision is one of the pure functions of this package (PoolGuards,
-// PoolMutationAllowed, BuildProviderIDList, SummarizeWorkerVersions, PlanScaleDown, DecideDisruptionStep); the scope
-// only gathers their inputs, makes the IBM calls they allow and writes their results. A pool reconcile costs at most
-// ListWorkerPools, ListWorkers and one mutation.
+// (machinepool_scaledown.go) and its worker rollout (machinepool_rollout.go). Every decision is one of the pure
+// functions of this package (PoolGuards, PoolMutationAllowed, BuildProviderIDList, SummarizeWorkerVersions,
+// PlanScaleDown, SummarizeRollout, PickReplacement, DecideDisruptionStep); the scope only gathers their inputs, makes
+// the IBM calls they allow and writes their results. A pool reconcile costs at most ListWorkerPools, ListWorkers and
+// one mutation.
 
 const (
 	// EventWorkerPoolAdopted is the Normal event emitted when CAPIBM takes over an IBM pool that it did not create. It
@@ -144,6 +145,9 @@ type MachinePoolScope struct {
 	// scaleDownMode is ScaleDownMode. It is a field so that the tests of this package can run the ScaleDownResizeOnly
 	// fallback, which the constant leaves unreachable unless IBM Cloud turns out not to remove the predicted victims.
 	scaleDownMode ScaleDownStrategy
+	// rolloutRecheckAt is RolloutRecheckAt: when the worker rollout of this reconcile decides differently without a
+	// watched change; zero for never.
+	rolloutRecheckAt time.Time
 }
 
 // poolClients are one reconcile's IBM clients for the Cluster's identity.
@@ -711,12 +715,15 @@ func (s *MachinePoolScope) masterMinor() ibmversion.Minor {
 }
 
 // reconcileSize sizes the pool and makes at most one disruptive step per reconcile, in this priority: a removal in
-// flight, then the scale-down, then a worker rollout (which a later change adds). A scale-down in flight runs before
+// flight, then the scale-down, then a worker rollout (machinepool_rollout.go). A scale-down in flight runs before
 // anything else, also when it is to be given up because spec.replicas went back up, so that its cordons are reverted
 // before the pool grows; so does a removal whose status was lost, which this pool's drain-owner markers on its Nodes
-// reveal. Otherwise an autoscaled pool is left alone, growth is requested at once (it removes nothing), and a
-// smaller MachinePool starts the scale-down. A removal of another operation in flight (a worker replace) keeps every
-// other step out; this flow only reports readiness then.
+// reveal, unless the marked Node is the one worker a lost replace was draining (workerRollout.chooseVictim). An
+// autoscaled pool is never resized, while a replace in flight on it runs on and a new one waits in its
+// ExternallyAutoscaled gate. Growth is requested at once, also while a replace is in flight (it removes nothing, so it
+// is not disruptive); a smaller MachinePool starts the scale-down unless a replace is in flight. Otherwise the rollout
+// runs, after WorkerPoolReady reports the pool's readiness. WorkersUpToDate is reported in every case: the rollout's
+// step, or why it waits.
 //
 // Parameters:
 //   - ctx is the reconcile context.
@@ -726,28 +733,37 @@ func (s *MachinePoolScope) masterMinor() ibmversion.Minor {
 //   - desired is the size per zone the MachinePool asks for.
 func (s *MachinePoolScope) reconcileSize(ctx context.Context, clients *poolClients, pool *kubernetesservice.WorkerPool,
 	workers []kubernetesservice.Worker, desired int64) Outcome {
-	inFlight := s.Pool.Status.Disruption.Operation
-	if inFlight != "" && inFlight != infrav1.WorkerDisruptionOperationScaleDown {
-		return s.reportReadiness(pool, workers, desired)
-	}
 	input, err := s.newScaleDownInput(ctx, clients, pool, workers, desired)
 	if err != nil {
 		return Transient(err)
 	}
+	rollout, err := s.newWorkerRollout(ctx, input, false)
+	if err != nil {
+		return Transient(err)
+	}
+	inFlight := s.Pool.Status.Disruption.Operation
+	replacing := inFlight == infrav1.WorkerDisruptionOperationReplace || rollout.resumed
 	switch {
-	case inFlight != "" || len(input.marked) > 0:
+	case inFlight == infrav1.WorkerDisruptionOperationScaleDown || (inFlight == "" && len(input.marked) > 0 && !rollout.resumed):
+		rollout.reportHeldByScaleDown()
 		return s.reconcileScaleDown(ctx, input)
 	case pool.AutoscaleEnabled:
 		s.setWorkerPoolReady(metav1.ConditionTrue, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyExternallyAutoscaledReason,
 			fmt.Sprintf("IBM's cluster autoscaler owns the size of pool %s; CAPIBM does not apply MachinePool %s spec.replicas",
 				pool.Name, s.MachinePool.Name))
-		return Done()
+		outcome := rollout.reconcile(ctx, Done())
+		if !replacing && outcome.Kind == OutcomeNotDone {
+			// A new replace waits in its gates (ExternallyAutoscaled) for a human; the pool itself is fine.
+			return Done()
+		}
+		return outcome
 	case desired > pool.SizePerZone:
 		return s.growPool(ctx, clients, pool, desired)
-	case desired < pool.SizePerZone:
+	case desired < pool.SizePerZone && !replacing:
+		rollout.reportHeldByScaleDown()
 		return s.reconcileScaleDown(ctx, input)
 	}
-	return s.reportReadiness(pool, workers, desired)
+	return rollout.reconcile(ctx, s.reportReadiness(pool, workers, desired))
 }
 
 // growPool asks IBM for more workers per zone (growth is not disruptive and runs at once) when the cluster state

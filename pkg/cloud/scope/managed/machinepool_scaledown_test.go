@@ -916,14 +916,18 @@ func TestMachinePoolScopeScaleDownResumes(t *testing.T) {
 		g.Expect(f.pool.Status.Disruption.WorkerIDs).To(Equal([]string{"w0", "w1"}))
 	})
 	t.Run("a replace in flight comes first", func(t *testing.T) {
+		// A removal in flight goes before a scale-down. w3 is a minor behind the master, so its replace runs on
+		// (machinepool_rollout.go) while the MachinePool asks for fewer workers.
 		g := NewWithT(t)
 		f := newScaleDownFixture(t, nil)
+		f.workers[3].KubeVersionActual = "1.35.9_1530"
 		f.pool.Status.Disruption = infrav1.WorkerDisruptionStatus{Operation: infrav1.WorkerDisruptionOperationReplace,
 			Phase: infrav1.WorkerDisruptionPhaseDraining, WorkerIDs: []string{"w3"}}
 		f.expect()
-		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalGuarded, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyResizingReason)))
-		g.Expect(f.calls.all()).To(BeEmpty(), "no scale-down step runs")
+		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNode))))
+		g.Expect(f.cordoned()).To(Equal([]string{sdNodeName("w3")}), "the scale-down's victims are not touched")
 		g.Expect(f.pool.Status.Disruption.Operation).To(Equal(infrav1.WorkerDisruptionOperationReplace))
+		g.Expect(f.pool.Status.Disruption.WorkerIDs).To(Equal([]string{"w3"}))
 	})
 }
 

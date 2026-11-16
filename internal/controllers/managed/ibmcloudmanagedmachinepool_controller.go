@@ -76,9 +76,10 @@ var machinePoolOwnedConditions = []string{
 
 // IBMCloudManagedMachinePoolReconciler reconciles IBMCloudManagedMachinePool objects, the InfraMachinePool of a managed
 // (IKS or ROKS) cluster: one IBM worker pool. It adopts or creates the pool, publishes its workers as
-// spec.providerIDList and grows it, shrinks it only after draining the workers IBM is predicted to remove, and on a
-// stand-alone deletion drains every Node of the pool before it removes the IBM pool; every IBM call goes through the
-// scope, with the credentials resolved from the Cluster's IBMCloudManagedCluster.
+// spec.providerIDList and grows it, shrinks it only after draining the workers IBM is predicted to remove, replaces
+// its workers one at a time, drained, to follow the master minor, take IBM fix packs and honour spec.rollout.after,
+// and on a stand-alone deletion drains every Node of the pool before it removes the IBM pool; every IBM call goes
+// through the scope, with the credentials resolved from the Cluster's IBMCloudManagedCluster.
 type IBMCloudManagedMachinePoolReconciler struct {
 	// Client is the manager's client.
 	Client client.Client
@@ -235,14 +236,16 @@ func (r *IBMCloudManagedMachinePoolReconciler) scopeParams() *managedscope.Scope
 	}
 }
 
-// reconcileNormal runs the pool flow (adopt or create the IBM pool, observe it, publish its workers, grow it) and
-// requeues at steadyStatePoll once the pool is ready, so that IBM's own changes (autorecovery, fix packs, health) show
-// up in status. scope is this reconcile's scope.
+// reconcileNormal runs the pool flow (adopt or create, observe, publish, resize, roll out) and requeues at
+// steadyStatePoll once the pool is ready, so that IBM's own changes (autorecovery, fix packs, health) show up in
+// status, and no later than the time the worker rollout waits for (spec.rollout.after, a replacement's
+// minReadySeconds; requeueForRollout). scope is this reconcile's scope.
 func (r *IBMCloudManagedMachinePoolReconciler) reconcileNormal(ctx context.Context, scope *managedscope.MachinePoolScope) (ctrl.Result, error) {
 	outcome := scope.ReconcileNormal(ctx)
 	r.recordWorkers(scope)
 	logMachinePoolTerminal(ctx, "The IBMCloudManagedMachinePool needs attention", outcome)
-	return resultFor(outcome, managedscope.IntervalSteadyState)
+	result, err := resultFor(outcome, managedscope.IntervalSteadyState)
+	return requeueForRollout(result, err, outcome.Kind, scope.RolloutRecheckAt(), r.Clock.Now()), err
 }
 
 // recordWorkers updates the first-seen map from this reconcile's worker listing, whatever the outcome: every listing

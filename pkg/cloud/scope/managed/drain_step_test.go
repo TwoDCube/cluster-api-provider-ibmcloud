@@ -38,6 +38,7 @@ import (
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	"sigs.k8s.io/cluster-api/util/index"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/v1alpha1"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/drain"
@@ -85,11 +86,13 @@ func (w *workloadCalls) count(prefix string) int {
 }
 
 // newWorkloadClient returns a fake workload cluster holding objs that records its calls in calls; an eviction of a pod
-// named in refusals answers that error, every other eviction deletes the pod.
+// named in refusals answers that error, every other eviction deletes the pod. Nodes are indexed by provider ID, as
+// ClusterCache indexes them (NodeProviderIDIndex), and a lookup through that index is recorded as "find node <id>".
 func newWorkloadClient(t *testing.T, calls *workloadCalls, refusals map[string]error, objs ...client.Object) client.Client {
 	t.Helper()
 	c := fake.NewClientBuilder().WithScheme(poolScheme(t)).WithObjects(objs...).
 		WithIndex(&corev1.Pod{}, "spec.nodeName", func(o client.Object) []string { return []string{o.(*corev1.Pod).Spec.NodeName} }).
+		WithIndex(&corev1.Node{}, index.NodeProviderIDField, index.NodeByProviderID).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
 				if _, isNode := obj.(*corev1.Node); isNode {
@@ -115,7 +118,7 @@ func newWorkloadClient(t *testing.T, calls *workloadCalls, refusals map[string]e
 					}
 					calls.add("list pods " + node)
 				case *corev1.NodeList:
-					calls.add("list nodes")
+					calls.add(nodeListCall(opts))
 				case *storagev1.VolumeAttachmentList:
 					calls.add("list volumeattachments")
 				}
@@ -509,4 +512,17 @@ func TestEarliest(t *testing.T) {
 	g.Expect(earliest(poolTestNow, later)).To(Equal(poolTestNow))
 	g.Expect(earliest(later, poolTestNow)).To(Equal(poolTestNow))
 	g.Expect(ptrValue(nil)).To(BeZero())
+}
+
+// nodeListCall names a Node listing for workloadCalls: "find node <provider ID>" for a lookup through the provider ID
+// index, "list nodes" otherwise.
+func nodeListCall(opts []client.ListOption) string {
+	listOpts := &client.ListOptions{}
+	listOpts.ApplyOptions(opts)
+	if listOpts.FieldSelector != nil {
+		if providerID, found := listOpts.FieldSelector.RequiresExactMatch(index.NodeProviderIDField); found {
+			return "find node " + providerID
+		}
+	}
+	return "list nodes"
 }
