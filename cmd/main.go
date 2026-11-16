@@ -422,6 +422,12 @@ func setupReconcilers(ctx context.Context, mgr ctrl.Manager, serviceEndpoint []e
 
 	if feature.Gates.Enabled(feature.ManagedKubernetes) {
 		setupManagedReconcilers(ctx, mgr, serviceEndpoint, watchFilterValue)
+	} else if err := mgr.Add(managedcontroller.NewGateOffDetector(mgr.GetAPIReader(), mgr.GetEventRecorderFor("ibmcloudmanaged-gate"))); err != nil {
+		// With the gate off, a one-shot runnable warns about existing IBMCloudManagedControlPlanes: they are then
+		// neither reconciled nor deletable (for example after a clusterctl upgrade run without
+		// EXP_MANAGED_KUBERNETES=true).
+		setupLog.Error(err, "unable to add the ManagedKubernetes gate-off detector")
+		os.Exit(1)
 	}
 }
 
