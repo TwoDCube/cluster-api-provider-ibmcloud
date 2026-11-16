@@ -49,6 +49,26 @@ of service on IBM's schedule (in November 2026 IBM listed 2027-01-20 for IKS 1.3
   update again with a backoff of 1 hour, then 2, 4, ... hours, at most 24 hours between attempts.
 * If IBM refuses the request with HTTP 403, the reason is `PermissionDenied`. The message names the missing Kubernetes
   Service role, the credentials ("the CAPIBM controller identity") and the time of the next attempt.
+* Before the request, CAPIBM lists the versions IBM offers in the region and the workers of the cluster. If IBM refuses
+  one of these listings, CAPIBM sends no request, and `MasterVersionUpToDate=False` names the listing:
+  * HTTP 403, reason `PermissionDenied`: "IBM Cloud Kubernetes Service refused listing the workers of IBM cluster <id>
+    with HTTP 403 (IBM code <c>), so the master update to <minor> waits: the credentials of the CAPIBM controller
+    identity need ...". Grant those credentials the Administrator platform role and the Manager service role of
+    Kubernetes Service on the cluster's resource group ([IAM permissions](./prerequisites.md#iam-permissions)).
+  * HTTP 400 or 404, reason `IBMAPIError`, with IBM's code. Look the code up together with IBM's description and
+    incident ID in the controller log; if it points to no fix on your side, open an IBM support case with them.
+
+  Unlike a refused `UpdateMaster`, a refused listing is tried again at every poll of the control plane (about every
+  5 minutes), so a granted role takes effect within minutes. A 401, a 429 or a 5xx answer changes no condition: CAPIBM
+  rebuilds the credentials, waits for IBM's `Retry-After`, or retries with a backoff. Once the listings succeed, the
+  update continues; a request already on record keeps its retry time.
+* If IBM reports a master version that CAPIBM cannot parse, `MasterVersionUpToDate` is `Unknown` with the reason
+  `UnparsableMasterVersion`, and the message quotes the value: "IBM reports master version "<value>" for IBM cluster
+  <id>, which CAPIBM cannot parse, ...". CAPIBM cannot tell which minor the master runs, so it requests no master update
+  and leaves `RollingOut` as it is; the cluster itself is not affected. CAPIBM looks again at every poll and continues
+  as soon as IBM reports a version it can parse. If the condition stays, IBM uses a version format that CAPIBM does not
+  know yet: report the quoted value to the Cluster API Provider IBM Cloud project. Until a CAPIBM release parses it, the
+  master minor of this cluster cannot be updated through CAPIBM.
 
 <aside class="note warning">
 

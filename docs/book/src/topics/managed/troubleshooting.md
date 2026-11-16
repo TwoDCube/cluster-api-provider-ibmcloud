@@ -196,8 +196,16 @@ per zone ([Topology](./topology.md#smaller-topologies-are-not-ha)). CAPIBM ignor
   Kubernetes Service role and when CAPIBM asks again. **Accepted limitation**: a role granted meanwhile takes effect
   only at that retry time, which backs off 1, 2, 4, ... hours up to 24 hours after repeated refusals; there is no manual
   trigger ([Upgrades](./upgrades.md#when-ibm-does-not-take-the-update)).
+* **`PermissionDenied`** or **`IBMAPIError`** naming a listing ("refused listing the versions IBM Cloud offers in region
+  ..." or "refused listing the workers of IBM cluster ..."): IBM refused a call CAPIBM makes before the upgrade request,
+  so no request was sent. For a 403, grant the roles the message names; for a 400 or 404, check IBM's code and the
+  description in the controller log. CAPIBM tries the listing again at every poll, so a fix takes effect within minutes
+  ([Upgrades](./upgrades.md#when-ibm-does-not-take-the-update)).
 * **`UpgradeFailed`**: the requested minor has not taken effect and IBM shows no update in progress; CAPIBM asks again
   at the time in the message. Check the cluster in IBM Cloud.
+* **`UnparsableMasterVersion`** (`MasterVersionUpToDate=Unknown`): IBM reports a master version CAPIBM cannot parse,
+  and the message quotes it; no master update is requested until IBM reports a version CAPIBM can parse. If it stays,
+  report the quoted value ([Upgrades](./upgrades.md#when-ibm-does-not-take-the-update)).
 * **`BlockedByWorkerSkew`**: some workers are too many minors behind; let the workers catch up (they follow the master
   minor automatically; see `WaitingForCapacity` below).
 * **`BlockedByCARotation`**, **`BlockedByClusterState`**: wait for the CA rotation or for IBM's cluster state; the
