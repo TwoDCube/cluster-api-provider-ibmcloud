@@ -66,7 +66,7 @@ linters:
           msg: "SDK constructors that read the environment are forbidden; pass an authenticator"
         - pattern: ^vpc\.NewService$
           pkg: ^sigs\.k8s\.io/cluster-api-provider-ibmcloud/pkg/cloud/services/vpc$
-          msg: "reads the environment; use ClientBuilder.VPC (vpc.NewServiceWithAuthenticator)"
+          msg: "reads the environment; use ClientBuilder.VPC (vpc.NewServiceWithAuthenticatorAndTimeout)"
         - pattern: ^resourcemanager\.NewService$
           pkg: ^sigs\.k8s\.io/cluster-api-provider-ibmcloud/pkg/cloud/services/resourcemanager$
           msg: "falls back to the environment on a nil authenticator; use ClientBuilder.ResourceManager"
@@ -148,10 +148,6 @@ linters:
       # forbidigo applies only to the managed paths; the VPC and PowerVS code is not changed by this feature.
       - linters: [forbidigo]
         path-except: ^(pkg/cloud/credentials|pkg/cloud/scope/managed|internal/controllers/managed|webhooks/managed|pkg/cloud/services/kubernetesservice|pkg/util/(managedkubeconfig|workloadprobe|drain))/
-      # the one guarded call: newResourceManager rejects a nil authenticator before resourcemanager.NewService
-      - linters: [forbidigo]
-        path: ^pkg/cloud/scope/managed/client_builder\.go$
-        text: resourcemanager\.NewService
       # the GetAdminKubeconfig debug-log test switches go-sdk-core to debug level and restores it in t.Cleanup
       - linters: [forbidigo]
         path: _test\.go$
