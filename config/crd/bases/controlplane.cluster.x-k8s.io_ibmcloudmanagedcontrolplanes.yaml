@@ -1,0 +1,480 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: ibmcloudmanagedcontrolplanes.controlplane.cluster.x-k8s.io
+spec:
+  group: controlplane.cluster.x-k8s.io
+  names:
+    categories:
+    - cluster-api
+    kind: IBMCloudManagedControlPlane
+    listKind: IBMCloudManagedControlPlaneList
+    plural: ibmcloudmanagedcontrolplanes
+    shortNames:
+    - ibmcmcp
+    singular: ibmcloudmanagedcontrolplane
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - description: Cluster to which this IBMCloudManagedControlPlane belongs
+      jsonPath: .metadata.labels.cluster\.x-k8s\.io/cluster-name
+      name: Cluster
+      type: string
+    - description: Kubernetes (IKS) or OpenShift (ROKS)
+      jsonPath: .spec.distribution
+      name: Distribution
+      type: string
+    - description: IBM master version
+      jsonPath: .status.distributionVersion
+      name: Version
+      type: string
+    - description: Kubernetes version the API server reports
+      jsonPath: .status.version
+      name: Kubernetes
+      type: string
+    - description: IBM cluster state
+      jsonPath: .status.state
+      name: State
+      type: string
+    - description: Control plane available
+      jsonPath: .status.conditions[?(@.type=='Available')].status
+      name: Available
+      type: string
+    - description: Time duration since creation of IBMCloudManagedControlPlane
+      jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    - description: IBM cluster ID
+      jsonPath: .status.clusterID
+      name: ID
+      priority: 1
+      type: string
+    - description: Control plane endpoint host
+      jsonPath: .spec.controlPlaneEndpoint.host
+      name: Endpoint
+      priority: 1
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: IBMCloudManagedControlPlane is an IBM Cloud Kubernetes Service
+          or Red Hat OpenShift on IBM Cloud cluster (VPC Gen2).
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec is the desired IBM cluster.
+            properties:
+              controlPlaneEndpoint:
+                description: |-
+                  controlPlaneEndpoint is the CAPI contract field. The controller sets it once from the IBM master URL; do not set
+                  it. Once set, CAPIBM treats the IBM cluster as existing and never creates one.
+                minProperties: 1
+                properties:
+                  host:
+                    description: host is the API server host name.
+                    maxLength: 512
+                    minLength: 1
+                    type: string
+                  port:
+                    description: port is the API server port.
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                type: object
+                x-kubernetes-validations:
+                - message: controlPlaneEndpoint needs both host and port
+                  rule: has(self.host) && has(self.port)
+              distribution:
+                description: distribution selects IKS (Kubernetes) or ROKS (OpenShift).
+                  Immutable.
+                enum:
+                - Kubernetes
+                - OpenShift
+                type: string
+                x-kubernetes-validations:
+                - message: distribution is immutable
+                  rule: self == oldSelf
+              distributionVersion:
+                description: |-
+                  distributionVersion is the IBM product minor, MAJOR.MINOR only: "1.36" for Kubernetes, "4.21" for OpenShift.
+                  IBM deploys the newest patch of that minor and applies later master patches itself; a patch cannot be chosen,
+                  and CAPIBM never requests or tracks master patches (it reports them in status). Raise it by exactly one minor to
+                  upgrade the master; it can never go down. The controller never writes this field.
+                maxLength: 8
+                minLength: 3
+                type: string
+                x-kubernetes-validations:
+                - message: 'distributionVersion must be MAJOR.MINOR, for example 1.36
+                    or 4.21: IBM always applies the newest patch, so patch versions,
+                    a v prefix, _openshift and build suffixes are not accepted'
+                  rule: self.matches('^[1-9][0-9]*[.](0|[1-9][0-9]*)$')
+              endpoints:
+                description: endpoints configures the master service endpoints at
+                  creation.
+                minProperties: 1
+                properties:
+                  publicServiceEndpoint:
+                    description: |-
+                      publicServiceEndpoint enables (when omitted) or disables the public master endpoint. With Disabled the cluster
+                      is private-only and the management cluster must reach the private master URL (VPN, Direct Link, Transit Gateway
+                      or running in IBM Cloud). Not yet verified against IBM Cloud. Immutable (spec-level rule compares effective values).
+                    enum:
+                    - Enabled
+                    - Disabled
+                    type: string
+                type: object
+              ibmCloudClusterName:
+                description: |-
+                  ibmCloudClusterName is the IBM Cloud cluster name. Omitted means the owning CAPI Cluster's metadata.name; that
+                  derivation never changes in this API version. IBM rules: starts with a letter; letters, digits, '.' and '-';
+                  at most 35 characters; unique in the account across regions. Keep the first 24 characters unique: re-creating
+                  the same prefix five times in seven days hits the Let's Encrypt limit for the Ingress subdomain. Immutable.
+                  CAPI Cluster names are unique only per namespace, so the admission webhook returns a warning when this field is
+                  omitted; management clusters with several namespaces should use a convention such as <namespace>-<name>.
+                maxLength: 35
+                minLength: 1
+                pattern: ^[a-zA-Z][a-zA-Z0-9.-]*$
+                type: string
+                x-kubernetes-validations:
+                - message: ibmCloudClusterName is immutable
+                  rule: self == oldSelf
+              openShift:
+                description: openShift holds ROKS-only settings. Required for, and
+                  only valid with, distribution OpenShift.
+                properties:
+                  imageRegistry:
+                    description: |-
+                      imageRegistry configures the storage of the OpenShift internal image registry. Required: IBM rejects a ROKS
+                      create on VPC without a Cloud Object Storage instance (HTTP 400, E7278). Immutable: IBM attaches it only at
+                      creation.
+                    properties:
+                      cos:
+                        description: |-
+                          cos references the existing standard Cloud Object Storage instance in which IBM creates the registry bucket.
+                          The bucket is retained when the cluster is deleted.
+                        properties:
+                          instanceCRN:
+                            description: instanceCRN is the CRN of a standard COS
+                              instance (the CAPIBM service ID needs the COS Administrator
+                              role on it).
+                            maxLength: 512
+                            minLength: 1
+                            type: string
+                            x-kubernetes-validations:
+                            - message: instanceCRN must be a Cloud Object Storage
+                                instance CRN
+                              rule: self.startsWith('crn:v1:') && self.contains(':cloud-object-storage:')
+                        required:
+                        - instanceCRN
+                        type: object
+                    required:
+                    - cos
+                    type: object
+                    x-kubernetes-validations:
+                    - message: 'imageRegistry is immutable: IBM attaches registry
+                        storage only at creation'
+                      rule: self == oldSelf
+                required:
+                - imageRegistry
+                type: object
+            required:
+            - distribution
+            - distributionVersion
+            type: object
+            x-kubernetes-validations:
+            - message: distribution Kubernetes needs a 1.x distributionVersion and
+                no openShift; distribution OpenShift needs a 4.x distributionVersion
+                and openShift.imageRegistry.cos.instanceCRN
+              rule: 'self.distribution == ''Kubernetes'' ? (self.distributionVersion.startsWith(''1.'')
+                && !has(self.openShift)) : (self.distributionVersion.startsWith(''4.'')
+                && has(self.openShift))'
+            - message: ibmCloudClusterName cannot be added or removed after creation
+              rule: has(self.ibmCloudClusterName) == has(oldSelf.ibmCloudClusterName)
+            - message: 'endpoints.publicServiceEndpoint is immutable: IBM cannot switch
+                a cluster between public and private-only'
+              rule: '(has(self.endpoints) && has(self.endpoints.publicServiceEndpoint)
+                ? self.endpoints.publicServiceEndpoint : ''Enabled'') == (has(oldSelf.endpoints)
+                && has(oldSelf.endpoints.publicServiceEndpoint) ? oldSelf.endpoints.publicServiceEndpoint
+                : ''Enabled'')'
+            - message: controlPlaneEndpoint cannot be changed or removed once set
+              rule: '!has(oldSelf.controlPlaneEndpoint) || (has(self.controlPlaneEndpoint)
+                && self.controlPlaneEndpoint == oldSelf.controlPlaneEndpoint)'
+          status:
+            description: status is the observed state.
+            minProperties: 1
+            properties:
+              clusterCRN:
+                description: clusterCRN is the IBM cluster CRN; its account segment
+                  builds worker providerIDs.
+                maxLength: 512
+                minLength: 1
+                type: string
+              clusterID:
+                description: clusterID is the IBM cluster ID (cache; durable copy
+                  on the kubeconfig Secret).
+                maxLength: 64
+                minLength: 1
+                type: string
+              conditions:
+                description: |-
+                  conditions are Ready, Available, IBMClusterProvisioned, KubeconfigReady, MasterVersionUpToDate, RollingOut,
+                  Deleting and Paused.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                maxItems: 32
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              createIntent:
+                description: |-
+                  createIntent is written immediately BEFORE createCluster is sent and cleared once the cluster is observed by
+                  ID, or once every attempt was answered definitively. It lets a lost response be told apart from a foreign
+                  same-named cluster.
+                minProperties: 1
+                properties:
+                  clusterName:
+                    description: clusterName is the IBM name the requests used.
+                    maxLength: 35
+                    minLength: 1
+                    type: string
+                  firstUnknownOutcomeTime:
+                    description: firstUnknownOutcomeTime is when the first attempt
+                      with an unknown outcome was sent.
+                    format: date-time
+                    type: string
+                  inFlightAttemptTime:
+                    description: |-
+                      inFlightAttemptTime is written immediately BEFORE a POST. A definitive refusal clears it; a timeout, 429 or 5xx
+                      moves it into the unknown-outcome bounds; a 201 leaves it (with status.clusterID) until the cluster is observed
+                      by ID, as the reference for the read-after-create grace. If it is still set when no status.clusterID exists (a
+                      crash or a lost status patch after the POST), that attempt's outcome is unknown and it counts in the window.
+                    format: date-time
+                    type: string
+                  lastUnknownOutcomeTime:
+                    description: lastUnknownOutcomeTime is when the latest attempt
+                      with an unknown outcome was sent.
+                    format: date-time
+                    type: string
+                required:
+                - clusterName
+                type: object
+              deletionRequestTime:
+                description: |-
+                  deletionRequestTime is when the controller last sent DELETE for the IBM cluster. DeleteReissueAfter is measured
+                  from it, never from a condition: lastTransitionTime does not move when only the reason changes (util/conditions
+                  setter.go:64).
+                format: date-time
+                type: string
+              distributionVersion:
+                description: |-
+                  distributionVersion is IBM's master version without the "(pending)" marker, for example "1.36.5_1537" or
+                  "4.21.35_1537_openshift". It moves when IBM applies a master patch on its own; CAPIBM never requests master patches.
+                maxLength: 64
+                minLength: 1
+                type: string
+              distributionVersionEndOfSupport:
+                description: |-
+                  distributionVersionEndOfSupport is IBM's versionEOS for the master minor as IBM reports it (empty when IBM
+                  reports none, as IBM Cloud was observed to do for 1.36 and 4.21).
+                maxLength: 32
+                minLength: 1
+                type: string
+              externalManagedControlPlane:
+                description: |-
+                  externalManagedControlPlane is always true (CAPI contract for managed control planes). It is a *bool because
+                  the CAPI control plane contract defines it so (a KAL exclusion in .golangci-kal.yml).
+                type: boolean
+              initialization:
+                description: initialization holds controlPlaneInitialized, the CAPI
+                  contract flag; sticky.
+                minProperties: 1
+                properties:
+                  controlPlaneInitialized:
+                    description: |-
+                      controlPlaneInitialized is true once spec.controlPlaneEndpoint is persisted and a verified kubeconfig Secret
+                      carrying the cluster-id annotation exists. It never goes back to false. It is a *bool because the CAPI control
+                      plane contract defines it so (a KAL exclusion in .golangci-kal.yml).
+                    type: boolean
+                type: object
+              master:
+                description: master holds stable IBM master tokens. Free-text masterStatus
+                  is never stored.
+                minProperties: 1
+                properties:
+                  health:
+                    description: |-
+                      health is lifecycle.masterHealth (IBM documents error, normal, unavailable, unsupported; IBM Cloud was observed to
+                      report "" for the first minutes after the master reports Ready, and such a value is omitted here).
+                    maxLength: 32
+                    minLength: 1
+                    type: string
+                  state:
+                    description: state is lifecycle.masterState (deploying, deployed,
+                      updating, ...).
+                    maxLength: 32
+                    minLength: 1
+                    type: string
+                type: object
+              masterUpdate:
+                description: |-
+                  masterUpdate records the latest master minor update CAPIBM requested. It is written BEFORE UpdateMaster is sent,
+                  so a failed or lost update is retried with backoff instead of on every poll.
+                minProperties: 1
+                properties:
+                  attempts:
+                    description: attempts counts the requests sent for this version;
+                      the retry backoff doubles with each.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  lastRequestTime:
+                    description: lastRequestTime is when the latest request for this
+                      version was sent.
+                    format: date-time
+                    type: string
+                  version:
+                    description: version is the IBM version string sent, for example
+                      "1.37" or "4.22_openshift".
+                    maxLength: 32
+                    minLength: 1
+                    type: string
+                required:
+                - attempts
+                - lastRequestTime
+                - version
+                type: object
+              nonCriticalCreateErrorCodes:
+                description: |-
+                  nonCriticalCreateErrorCodes are the IBM codes of the non_critical_errors a successful (201) createCluster
+                  returned, for example E49df. The descriptions go to a Warning event; status keeps only stable codes.
+                items:
+                  maxLength: 16
+                  type: string
+                maxItems: 16
+                type: array
+                x-kubernetes-list-type: set
+              state:
+                description: state is IBM's cluster state token (deploying, deployed,
+                  pending, normal, warning, updating, ...).
+                maxLength: 32
+                minLength: 1
+                type: string
+              targetDistributionVersion:
+                description: |-
+                  targetDistributionVersion is IBM's targetVersion for the master (equal to distributionVersion when no update is
+                  pending, as observed on IBM Cloud).
+                maxLength: 64
+                minLength: 1
+                type: string
+              version:
+                description: |-
+                  version mirrors versions[0].version. It is the contract's deprecated fallback (control-plane.md:433-447),
+                  kept so that tooling reading only status.version sees the same truthful Kubernetes version.
+                maxLength: 256
+                minLength: 1
+                type: string
+              versions:
+                description: |-
+                  versions is the CAPI contract field: exactly one entry, the Kubernetes gitVersion the API server reports on
+                  /version (IKS "v1.36.5+IKS", ROKS 4.21 "v1.34.9", as observed on IBM Cloud). Never an IBM or OpenShift version.
+                  Empty until the API server answered once. While IBM rolls the master it keeps the lowest version seen (the
+                  contract's minimum), so alternating answers from old and new API server replicas never flip it.
+                items:
+                  description: StatusVersion has the JSON shape of clusterv1.StatusVersion;
+                    replicas is never set for this control plane.
+                  properties:
+                    version:
+                      description: version is a Kubernetes semantic version with the
+                        "v" prefix, as the API server reports it.
+                      maxLength: 256
+                      minLength: 1
+                      type: string
+                  required:
+                  - version
+                  type: object
+                maxItems: 1
+                type: array
+                x-kubernetes-list-map-keys:
+                - version
+                x-kubernetes-list-type: map
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
