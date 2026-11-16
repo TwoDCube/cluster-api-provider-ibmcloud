@@ -45,9 +45,10 @@ import (
 
 // This file is the IBMCloudManagedMachinePool scope: it adopts the IBM worker pool of the same name or creates it,
 // observes the pool and its workers, publishes the InfraMachinePool contract (spec.providerIDList, status.replicas,
-// status.ready, status.initialization.provisioned) and grows the pool. Every decision is one of the pure functions of
-// this package (PoolGuards, PoolMutationAllowed, BuildProviderIDList, SummarizeWorkerVersions); the scope only gathers
-// their inputs, makes the IBM calls they allow and writes their results. A pool reconcile costs at most
+// status.ready, status.initialization.provisioned), grows the pool and dispatches its scale-down
+// (machinepool_scaledown.go). Every decision is one of the pure functions of this package (PoolGuards,
+// PoolMutationAllowed, BuildProviderIDList, SummarizeWorkerVersions, PlanScaleDown, DecideDisruptionStep); the scope
+// only gathers their inputs, makes the IBM calls they allow and writes their results. A pool reconcile costs at most
 // ListWorkerPools, ListWorkers and one mutation.
 
 const (
@@ -140,6 +141,9 @@ type MachinePoolScope struct {
 	// workersListed tells whether one succeeded (an empty list is an answer too); see ListedWorkers.
 	listedWorkers []kubernetesservice.Worker
 	workersListed bool
+	// scaleDownMode is ScaleDownMode. It is a field so that the tests of this package can run the ScaleDownResizeOnly
+	// fallback, which the constant leaves unreachable unless IBM Cloud turns out not to remove the predicted victims.
+	scaleDownMode ScaleDownStrategy
 }
 
 // poolClients are one reconcile's IBM clients for the Cluster's identity.
@@ -184,13 +188,14 @@ func NewMachinePoolScope(params *ScopeParams, in MachinePoolScopeInput) (*Machin
 		return nil, errors.New("managed: MachinePoolScope: " + strings.Join(problems, "; "))
 	}
 	return &MachinePoolScope{
-		params:      params,
-		Cluster:     in.Cluster,
-		MachinePool: in.MachinePool,
-		Pool:        in.Pool,
-		firstSeen:   in.TransitionalSince,
-		dropAfter:   in.ProviderIDDropAfter,
-		persist:     in.Persist,
+		params:        params,
+		Cluster:       in.Cluster,
+		MachinePool:   in.MachinePool,
+		Pool:          in.Pool,
+		firstSeen:     in.TransitionalSince,
+		dropAfter:     in.ProviderIDDropAfter,
+		persist:       in.Persist,
+		scaleDownMode: ScaleDownMode,
 	}, nil
 }
 
@@ -229,6 +234,7 @@ func (s *MachinePoolScope) ReconcileNormal(ctx context.Context) Outcome {
 	// pool CAPIBM never saw is not even looked up, so a misconfigured new pool (for example one whose size does not
 	// divide by its zones) costs no IBM call.
 	if guards.StopsPublication || (guards.Blocked() && (clusterID == "" || s.Pool.Status.PoolID == "")) {
+		s.addNote(s.removalHeldNote(guards))
 		return s.guardOutcome(guards)
 	}
 	if clusterID == "" {
@@ -251,7 +257,8 @@ func (s *MachinePoolScope) ReconcileNormal(ctx context.Context) Outcome {
 		return outcome
 	}
 	if guards.Blocked() {
-		return s.guardOutcome(guards)
+		// No mutation, but a scale-down in flight is settled first instead of frozen (reconcileGuardBlocked).
+		return s.reconcileGuardBlocked(ctx, clients, pool, workers, guards)
 	}
 	return s.reconcileSize(ctx, clients, pool, workers, guards.DesiredSizePerZone)
 }
@@ -691,9 +698,13 @@ func (s *MachinePoolScope) masterMinor() ibmversion.Minor {
 	return version.MinorVersion()
 }
 
-// reconcileSize grows the pool when the MachinePool asks for more workers per zone than IBM's pool has (growth is not
-// disruptive and runs at once), leaves an autoscaled pool alone, and otherwise reports the pool's readiness.
-// Shrinking is the disruptive scale-down flow and is not started here.
+// reconcileSize sizes the pool and makes at most one disruptive step per reconcile, in this priority: a removal in
+// flight, then the scale-down, then a worker rollout (which a later change adds). A scale-down in flight runs before
+// anything else, also when it is to be given up because spec.replicas went back up, so that its cordons are reverted
+// before the pool grows; so does a removal whose status was lost, which this pool's drain-owner markers on its Nodes
+// reveal. Otherwise an autoscaled pool is left alone, growth is requested at once (it removes nothing), and a
+// smaller MachinePool starts the scale-down. A removal of another operation in flight (a worker replace) keeps every
+// other step out; this flow only reports readiness then.
 //
 // Parameters:
 //   - ctx is the reconcile context.
@@ -703,15 +714,39 @@ func (s *MachinePoolScope) masterMinor() ibmversion.Minor {
 //   - desired is the size per zone the MachinePool asks for.
 func (s *MachinePoolScope) reconcileSize(ctx context.Context, clients *poolClients, pool *kubernetesservice.WorkerPool,
 	workers []kubernetesservice.Worker, desired int64) Outcome {
-	if pool.AutoscaleEnabled {
+	inFlight := s.Pool.Status.Disruption.Operation
+	if inFlight != "" && inFlight != infrav1.WorkerDisruptionOperationScaleDown {
+		return s.reportReadiness(pool, workers, desired)
+	}
+	input, err := s.newScaleDownInput(ctx, clients, pool, workers, desired)
+	if err != nil {
+		return Transient(err)
+	}
+	switch {
+	case inFlight != "" || len(input.marked) > 0:
+		return s.reconcileScaleDown(ctx, input)
+	case pool.AutoscaleEnabled:
 		s.setWorkerPoolReady(metav1.ConditionTrue, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyExternallyAutoscaledReason,
 			fmt.Sprintf("IBM's cluster autoscaler owns the size of pool %s; CAPIBM does not apply MachinePool %s spec.replicas",
 				pool.Name, s.MachinePool.Name))
 		return Done()
+	case desired > pool.SizePerZone:
+		return s.growPool(ctx, clients, pool, desired)
+	case desired < pool.SizePerZone:
+		return s.reconcileScaleDown(ctx, input)
 	}
-	if desired <= pool.SizePerZone {
-		return s.reportReadiness(pool, workers, desired)
-	}
+	return s.reportReadiness(pool, workers, desired)
+}
+
+// growPool asks IBM for more workers per zone (growth is not disruptive and runs at once) when the cluster state
+// allows it.
+//
+// Parameters:
+//   - ctx is the reconcile context.
+//   - clients are this reconcile's IBM clients.
+//   - pool is the IBM pool.
+//   - desired is the size per zone the MachinePool asks for; larger than the pool's.
+func (s *MachinePoolScope) growPool(ctx context.Context, clients *poolClients, pool *kubernetesservice.WorkerPool, desired int64) Outcome {
 	if outcome, blocked := s.clusterStateGate(PoolOperationGrow); blocked {
 		return outcome
 	}

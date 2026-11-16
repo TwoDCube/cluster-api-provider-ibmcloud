@@ -557,6 +557,23 @@ func TestDecideDisruptionStep(t *testing.T) {
 			o.TriggerActive = false
 			o.IBMRequestTime = now.Add(-10 * time.Minute)
 		}, want: StepWaitForIBM, wantPhase: waitIBM, wantReason: ReasonReplacingWorker, wantMessage: "no second call is made"},
+		{name: "trigger gone after a call IBM refused: abort at once", op: scaleDown, phase: waitIBM, modify: func(o *DisruptionObservation) {
+			o.TriggerActive = false
+			o.IBMRequestTime = now.Add(-time.Minute)
+			o.LastCallRefused = true
+		}, want: StepAbort, wantPhase: waitIBM, wantRelease: true, wantMessage: "after IBM refused the call of 2026-11-16T11:59:00Z"},
+		{name: "a refused call while the trigger holds is retried after DisruptionSettleDelay, not aborted", op: scaleDown, phase: waitIBM,
+			modify: func(o *DisruptionObservation) {
+				o.IBMRequestTime = now.Add(-DisruptionSettleDelay)
+				o.LastCallRefused = true
+			}, want: StepCallIBM, wantPhase: waitIBM, wantReason: ReasonResizing},
+		{name: "trigger gone after a refused call that IBM carries out anyway: follow IBM", op: scaleDown, phase: waitIBM,
+			modify: func(o *DisruptionObservation) {
+				o.TriggerActive = false
+				o.IBMRequestTime = now.Add(-time.Minute)
+				o.LastCallRefused = true
+				o.IBM.Removing = true
+			}, want: StepWaitForRemoval, wantPhase: removal, wantReason: ReasonResizing},
 		{name: "trigger gone and IBM ignored the call for WorkerStuckAfter: abort", op: scaleDown, phase: waitIBM, modify: func(o *DisruptionObservation) {
 			o.TriggerActive = false
 			o.IBMRequestTime = now.Add(-WorkerStuckAfter)
@@ -822,8 +839,9 @@ func TestDecideDisruptionStepSafetyProperties(t *testing.T) {
 	for range 50000 {
 		o := DisruptionObservation{
 			Operation: operations[rng.IntN(len(operations))], Phase: phases[rng.IntN(len(phases))],
-			ResumeFromNodeMarkers: coin(), Now: now, ClusterDeleting: rng.IntN(8) == 0, PoolDeleting: rng.IntN(4) == 0,
-			TriggerActive: coin(), Token: tokens[rng.IntN(len(tokens))], WorkloadClusterConnected: coin(),
+			ResumeFromNodeMarkers: coin(), Now: now, LastCallRefused: rng.IntN(4) == 0, ClusterDeleting: rng.IntN(8) == 0,
+			PoolDeleting: rng.IntN(4) == 0, TriggerActive: coin(), Token: tokens[rng.IntN(len(tokens))],
+			WorkloadClusterConnected: coin(),
 			Gates: DisruptionGates{ClusterStateAllows: coin(), MasterUpdating: coin(), Disruption: check(),
 				Autoscaled: coin(), AutobalanceEnabled: coin()},
 			Drain: DrainProgress{Excluded: rng.IntN(4) == 0, TimedOut: rng.IntN(4) == 0, Done: coin(), Blocked: coin(),
@@ -874,7 +892,8 @@ func TestDecideDisruptionStepSafetyProperties(t *testing.T) {
 			g.Expect(o.Operation).NotTo(Equal(infrav1.WorkerDisruptionOperationDeletePool), "%+v", o)
 			g.Expect(phase).To(BeElementOf(infrav1.WorkerDisruptionPhaseDraining, infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach,
 				infrav1.WorkerDisruptionPhaseWaitingForIBM), "abort after the IBM call: %+v", o)
-			g.Expect(o.IBMRequestTime.IsZero() || !now.Before(o.IBMRequestTime.Add(WorkerStuckAfter))).To(BeTrue(),
+			// A call IBM refused is one IBM never acts on (LastCallRefused).
+			g.Expect(o.IBMRequestTime.IsZero() || o.LastCallRefused || !now.Before(o.IBMRequestTime.Add(WorkerStuckAfter))).To(BeTrue(),
 				"abort while IBM may still act on the call: %+v", o)
 			// The one abort while IBM removes the victims: they are gone and CAPIBM never called.
 			g.Expect(!o.IBM.Removing || (o.IBM.Removed && o.IBMRequestTime.IsZero())).To(BeTrue(),

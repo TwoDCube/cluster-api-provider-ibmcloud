@@ -465,8 +465,17 @@ type DisruptionObservation struct {
 
 	// IBMRequestTime is status.disruption.ibmRequestTime: when the IBM call was last attempted, or when the caller
 	// first saw IBM removing the victims without a call (see StepWaitForRemoval); zero when neither happened. The
-	// removal is aborted at once only while it is zero, and the stuck and replacement timers count from it.
+	// removal is aborted at once only while it is zero or LastCallRefused holds, and the stuck and replacement timers
+	// count from it.
 	IBMRequestTime time.Time
+
+	// LastCallRefused is true when IBM refused the call of IBMRequestTime synchronously and shows no effect of it
+	// (E1437, which was observed on IBM Cloud to be synchronous and side-effect free, or the 403 of an autoscaled
+	// pool): IBM never acts on such a call, so the removal is as far as before the call. A replace or scale-down whose
+	// trigger went away is then aborted at once, uncordoning and releasing the token, instead of waiting
+	// WorkerStuckAfter for an IBM action that never comes, exactly as when the replicas go back up before the call.
+	// False keeps that wait, so a caller that cannot tell fails closed.
+	LastCallRefused bool
 
 	// ClusterDeleting is true when the Cluster has a deletionTimestamp: no drain and no IBM pool call.
 	ClusterDeleting bool
@@ -630,12 +639,12 @@ func (d DisruptionDecision) CallsIBM() bool {
 //
 // Before the phase rules: a Cluster deletion stops everything; a pool deletion hands a replace or scale-down over to
 // DeletePool, restarting at Draining; victims IBM removes before CAPIBM's call are waited out, then the removal aborts
-// (RemovalProgress); a trigger that went away aborts before the IBM call, and after a call attempt only once IBM
-// ignored it for WorkerStuckAfter (the call is never repeated for a removal nobody wants); and every phase needs the
-// token. In WaitingForRemoval a mispredicted scale-down corrects its victims (StepCorrectVictims). Before the IBM call
-// the drain and the volume detach are re-checked in every phase, so a pod that arrived after the drain sends the
-// removal back to Draining: the IBM call is never decided while evictable pods remain, unless the drain timed out or is
-// excluded.
+// (RemovalProgress); a trigger that went away aborts before the IBM call or after a call IBM refused (LastCallRefused),
+// and after any other call attempt only once IBM ignored it for WorkerStuckAfter (the call is never repeated for a
+// removal nobody wants); and every phase needs the token. In WaitingForRemoval a mispredicted scale-down corrects its
+// victims (StepCorrectVictims). Before the IBM call the drain and the volume detach are re-checked in every phase, so a
+// pod that arrived after the drain sends the removal back to Draining: the IBM call is never decided while evictable
+// pods remain, unless the drain timed out or is excluded.
 //
 // Parameters:
 //   - o: the observation; see DisruptionObservation.
@@ -829,11 +838,12 @@ func (o DisruptionObservation) decideRemovedOutOfBand(phase infrav1.WorkerDisrup
 	return DisruptionDecision{}, false
 }
 
-// decideTriggerGone handles a replace or scale-down whose reason went away: before the IBM call it aborts. After a call
-// attempt that IBM shows no sign of, it neither repeats the call (nobody wants the removal any more) nor uncordons at
-// once (IBM may still act on it, and the Nodes must then be drained): it waits until WorkerStuckAfter after the attempt
-// and aborts only then. Once IBM removes the victims, the removal is followed to its end. It returns decided false when
-// the trigger is active or the phase rules apply.
+// decideTriggerGone handles a replace or scale-down whose reason went away: before the IBM call it aborts, and so it
+// does after a call IBM refused synchronously (LastCallRefused), which IBM never acts on. After a call attempt that IBM
+// shows no sign of, it neither repeats the call (nobody wants the removal any more) nor uncordons at once (IBM may
+// still act on it, and the Nodes must then be drained): it waits until WorkerStuckAfter after the attempt and aborts
+// only then. Once IBM removes the victims, the removal is followed to its end. It returns decided false when the
+// trigger is active or the phase rules apply.
 //
 // Parameters:
 //   - phase: the effective phase.
@@ -844,6 +854,11 @@ func (o DisruptionObservation) decideTriggerGone(phase infrav1.WorkerDisruptionP
 	if o.IBMRequestTime.IsZero() {
 		return DisruptionDecision{Step: StepAbort, Phase: phase, ReleaseToken: true,
 			Message: "the reason for the removal went away before the IBM call; uncordoning what CAPIBM cordoned"}, true
+	}
+	if o.LastCallRefused {
+		return DisruptionDecision{Step: StepAbort, Phase: phase, ReleaseToken: true,
+			Message: fmt.Sprintf("the reason for the removal went away after IBM refused the call of %s; uncordoning "+
+				"what CAPIBM cordoned", o.IBMRequestTime.UTC().Format(time.RFC3339))}, true
 	}
 	if abortAt := o.IBMRequestTime.Add(WorkerStuckAfter); o.Now.Before(abortAt) {
 		return DisruptionDecision{Step: StepWaitForIBM, Phase: infrav1.WorkerDisruptionPhaseWaitingForIBM,

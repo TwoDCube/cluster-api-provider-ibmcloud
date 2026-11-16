@@ -76,9 +76,9 @@ var machinePoolOwnedConditions = []string{
 
 // IBMCloudManagedMachinePoolReconciler reconciles IBMCloudManagedMachinePool objects, the InfraMachinePool of a managed
 // (IKS or ROKS) cluster: one IBM worker pool. It adopts or creates the pool, publishes its workers as
-// spec.providerIDList and grows it, and on a stand-alone deletion drains every Node of the pool before it removes the
-// IBM pool; every IBM call goes through the scope, with the credentials resolved from the Cluster's
-// IBMCloudManagedCluster.
+// spec.providerIDList and grows it, shrinks it only after draining the workers IBM is predicted to remove, and on a
+// stand-alone deletion drains every Node of the pool before it removes the IBM pool; every IBM call goes through the
+// scope, with the credentials resolved from the Cluster's IBMCloudManagedCluster.
 type IBMCloudManagedMachinePoolReconciler struct {
 	// Client is the manager's client.
 	Client client.Client

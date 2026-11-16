@@ -1061,13 +1061,15 @@ func TestMachinePoolScopeSize(t *testing.T) {
 		g.Expect(ready.Status).To(Equal(metav1.ConditionTrue))
 		g.Expect(ready.Reason).To(Equal(infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyExternallyAutoscaledReason))
 	})
-	t.Run("a smaller MachinePool is reported, not shrunk here", func(t *testing.T) {
+	t.Run("a_smaller_MachinePool_starts_the_scale_down_behind_the_guards", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newPoolFixture(t)
 		f.machinePool.Spec.Replicas = ptr.To[int32](2)
 		f.expectObservation([]kubernetesservice.WorkerPool{ibmPool("workers", 2, "us-south-1", "us-south-2")}, readyWorkers(4))
+		// gomock fails on a ResizeWorkerPool: the first observation of the pool starts the settle delay.
 		g.Expect(f.scope().ReconcileNormal(context.Background())).
-			To(Equal(NotDone(IntervalGuarded, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyResizingReason)))
+			To(Equal(NotDone(IntervalGuarded, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForSettledClusterReason)))
+		g.Expect(f.pool.Status.Disruption).To(Equal(infrav1.WorkerDisruptionStatus{}), "nothing is recorded before the first cordon")
 	})
 	refusals := []struct {
 		name string
