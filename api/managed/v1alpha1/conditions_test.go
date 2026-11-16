@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1_test
 
 import (
+	"slices"
 	"testing"
 
 	. "github.com/onsi/gomega"
@@ -35,6 +36,7 @@ import (
 // every binary that only needs the types.
 var (
 	_ conditions.Setter = &infrav1.IBMCloudManagedCluster{}
+	_ conditions.Setter = &infrav1.IBMCloudManagedMachinePool{}
 )
 
 // TestIBMCloudManagedClusterConditions checks that SetConditions and GetConditions use status.conditions, through CAPI's
@@ -84,7 +86,7 @@ var managedInfraConditionCatalogue = []conditionCatalogue{
 
 // TestConditionCatalogueIsValid validates every declared condition type and reason with the API server's rules.
 func TestConditionCatalogueIsValid(t *testing.T) {
-	for _, entry := range managedInfraConditionCatalogue {
+	for _, entry := range slices.Concat(managedInfraConditionCatalogue, managedMachinePoolConditionCatalogue) {
 		t.Run(entry.conditionType, func(t *testing.T) {
 			g := NewWithT(t)
 			// A condition without its own reason list (Ready, Paused) is validated with a placeholder reason.
@@ -104,4 +106,98 @@ func TestConditionCatalogueIsValid(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestIBMCloudManagedMachinePoolConditions checks that SetConditions and GetConditions use status.conditions, through
+// CAPI's util/conditions as the controller will.
+func TestIBMCloudManagedMachinePoolConditions(t *testing.T) {
+	g := NewWithT(t)
+	obj := &infrav1.IBMCloudManagedMachinePool{}
+	g.Expect(obj.GetConditions()).To(BeEmpty())
+
+	conditions.Set(obj, metav1.Condition{
+		Type:   infrav1.IBMCloudManagedMachinePoolDrainingCondition,
+		Status: metav1.ConditionTrue,
+		Reason: infrav1.IBMCloudManagedMachinePoolDrainingDrainBlockedReason,
+	})
+
+	g.Expect(obj.Status.Conditions).To(HaveLen(1))
+	g.Expect(conditions.IsTrue(obj, infrav1.IBMCloudManagedMachinePoolDrainingCondition)).To(BeTrue())
+	g.Expect(conditions.GetReason(obj, infrav1.IBMCloudManagedMachinePoolDrainingCondition)).To(Equal("DrainBlocked"))
+}
+
+// managedMachinePoolConditionCatalogue is the IBMCloudManagedMachinePool part of the catalogue.
+var managedMachinePoolConditionCatalogue = []conditionCatalogue{
+	{conditionType: infrav1.IBMCloudManagedMachinePoolReadyCondition},
+	{conditionType: infrav1.IBMCloudManagedMachinePoolPausedCondition},
+	{
+		conditionType: infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCondition,
+		reasons: []string{
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyExternallyAutoscaledReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForControlPlaneReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForInfrastructureReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyUnknownZoneReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyReplicasNotDivisibleByZonesReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyZeroReplicasNotSupportedReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyInvalidForDistributionReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyPoolNameConflictReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyPoolConflictReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForClusterStateReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyPoolNameBeingReleasedReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCreatingReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyProvisioningReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyResizingReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWorkersNotReadyReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForSettledClusterReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForClusterMinimumReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForDisruptionTokenReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForWorkloadClusterReason,
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyDrainingNodeReason,
+		},
+	},
+	{
+		conditionType: infrav1.IBMCloudManagedMachinePoolWorkersUpToDateCondition,
+		reasons: []string{
+			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateReason,
+			infrav1.IBMCloudManagedMachinePoolWorkersUpToDatePatchUpdateAvailableReason,
+			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateRollingOutReason,
+			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateDrainingNodeReason,
+			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateReplacingWorkerReason,
+			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForReplacementReason,
+			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForControlPlaneUpgradeReason,
+			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForCapacityReason,
+			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForClusterMinimumReason,
+			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForSettledClusterReason,
+			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForClusterStateReason,
+			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForDisruptionTokenReason,
+			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForWorkloadClusterReason,
+			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateAutoRebalanceDisabledReason,
+			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateReplacementNotCreatedReason,
+			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWorkerOperationStuckReason,
+		},
+	},
+	{
+		conditionType: infrav1.IBMCloudManagedMachinePoolDrainingCondition,
+		reasons: []string{
+			infrav1.IBMCloudManagedMachinePoolDrainingNodeReason,
+			infrav1.IBMCloudManagedMachinePoolDrainingDrainBlockedReason,
+			infrav1.IBMCloudManagedMachinePoolDrainingWaitingForVolumeDetachReason,
+			infrav1.IBMCloudManagedMachinePoolDrainingWaitingForWorkloadClusterReason,
+			infrav1.IBMCloudManagedMachinePoolNotDrainingReason,
+		},
+	},
+	{
+		conditionType: infrav1.IBMCloudManagedMachinePoolDeletingCondition,
+		reasons: []string{
+			infrav1.IBMCloudManagedMachinePoolNotDeletingReason,
+			infrav1.IBMCloudManagedMachinePoolDeletingWaitingForInfrastructureReason,
+			infrav1.IBMCloudManagedMachinePoolDeletingWaitingForClusterStateReason,
+			infrav1.IBMCloudManagedMachinePoolDeletingWaitingForClusterMinimumReason,
+			infrav1.IBMCloudManagedMachinePoolDeletingWaitingForSettledClusterReason,
+			infrav1.IBMCloudManagedMachinePoolDeletingWaitingForDisruptionTokenReason,
+			infrav1.IBMCloudManagedMachinePoolDeletingDrainingNodesReason,
+			infrav1.IBMCloudManagedMachinePoolDeletingRemovingWorkerPoolReason,
+		},
+	},
 }

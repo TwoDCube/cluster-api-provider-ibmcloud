@@ -37,9 +37,14 @@ var (
 
 	// TestMachineCRD will generate a Machine CustomResourceDefinition.
 	TestMachineCRD = generateTestClusterAPICRD("machine", "machines")
+
+	// TestMachinePoolCRD will generate a MachinePool CustomResourceDefinition with a status subresource. The managed
+	// (IKS and ROKS) kinds use MachinePools as the owners of IBMCloudManagedMachinePools, so envtest suites need the kind.
+	// The kind is passed in its final casing because the title-casing below keeps every letter after the first.
+	TestMachinePoolCRD = generateTestClusterAPICRD("MachinePool", "machinepools")
 )
 
-// Generates fake CRDs of Cluster API clusters and machines.
+// Generates fake CRDs of Cluster API kinds (clusters, machines, machine pools) that accept any spec and status.
 func generateTestClusterAPICRD(kind, pluralKind string) *apiextensionsv1.CustomResourceDefinition {
 	return &apiextensionsv1.CustomResourceDefinition{
 		TypeMeta: metav1.TypeMeta{

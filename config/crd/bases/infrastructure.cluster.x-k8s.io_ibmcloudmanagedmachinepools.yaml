@@ -1,0 +1,463 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: ibmcloudmanagedmachinepools.infrastructure.cluster.x-k8s.io
+spec:
+  group: infrastructure.cluster.x-k8s.io
+  names:
+    categories:
+    - cluster-api
+    kind: IBMCloudManagedMachinePool
+    listKind: IBMCloudManagedMachinePoolList
+    plural: ibmcloudmanagedmachinepools
+    shortNames:
+    - ibmcmmp
+    singular: ibmcloudmanagedmachinepool
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - description: Cluster to which this IBMCloudManagedMachinePool belongs
+      jsonPath: .metadata.labels.cluster\.x-k8s\.io/cluster-name
+      name: Cluster
+      type: string
+    - description: IBM worker pool name
+      jsonPath: .spec.poolName
+      name: Pool
+      type: string
+    - description: VPC worker flavor
+      jsonPath: .spec.flavor
+      name: Flavor
+      type: string
+    - description: IBM workers in the pool that are not deleted
+      jsonPath: .status.replicas
+      name: Replicas
+      type: integer
+    - description: The IBM pool exists
+      jsonPath: .status.ready
+      name: Ready
+      type: boolean
+    - description: Workers with a newer minor or fix pack available
+      jsonPath: .status.workersWithUpdateAvailable
+      name: Updates
+      type: integer
+    - description: Fix-pack update policy (omitted means Manual)
+      jsonPath: .spec.workerUpdates.policy
+      name: Policy
+      priority: 1
+      type: string
+    - description: Time duration since creation of IBMCloudManagedMachinePool
+      jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: 'IBMCloudManagedMachinePool is the InfraMachinePool of an IBM
+          Cloud managed (IKS or ROKS) cluster: one IBM worker pool.'
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec is the desired worker pool.
+            properties:
+              entitlement:
+                description: |-
+                  entitlement is OCPEntitled for OpenShift pools covered by a Cloud Pak licence; omitted means none.
+                  OpenShift only (controller guard). Immutable.
+                enum:
+                - OCPEntitled
+                type: string
+                x-kubernetes-validations:
+                - message: entitlement is immutable
+                  rule: self == oldSelf
+              flavor:
+                description: |-
+                  flavor is the VPC worker flavor, for example bx2.4x16 (ROKS needs at least 4 vCPU and 16 GB). Immutable:
+                  to change it, add a new pool and delete this one.
+                maxLength: 64
+                minLength: 3
+                pattern: ^[a-z0-9]+(\.[a-z0-9]+)+$
+                type: string
+                x-kubernetes-validations:
+                - message: flavor is immutable; create a new pool
+                  rule: self == oldSelf
+              poolName:
+                description: |-
+                  poolName is the IBM worker pool name, unique within the Cluster. The pool named "default" is created together
+                  with the IBM cluster. Immutable. IBM honours custom names (observed on IBM Cloud); MaxLength stays conservative.
+                maxLength: 32
+                minLength: 1
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                type: string
+                x-kubernetes-validations:
+                - message: poolName is immutable
+                  rule: self == oldSelf
+              providerIDList:
+                description: |-
+                  providerIDList is the CAPI contract field, maintained by the controller: ibm://<account>///<clusterID>/<workerID>
+                  for every IBM worker of the pool that is not deleted. A worker leaves the list only when IBM lists it as deleted,
+                  or when two listings at least poolTransitionPoll apart omit it (status.missingWorkers). Never set it yourself.
+                items:
+                  maxLength: 256
+                  type: string
+                maxItems: 500
+                type: array
+                x-kubernetes-list-type: atomic
+              rollout:
+                description: rollout triggers worker replacements (CAPI MachineDeployment/KubeadmControlPlane
+                  idiom).
+                minProperties: 1
+                properties:
+                  after:
+                    description: |-
+                      after is a trigger time: once it has passed, every worker whose Node was created before it is replaced, one at
+                      a time and drained, with update=true, so it comes back on the newest IBM fix pack of the control plane minor.
+                      This is the MachineDeployment semantics (rollout even without changes), so it also recycles workers that are up
+                      to date, for example after a CA rotation. Workers created after it are never replaced because of it. RFC 3339,
+                      for example "2026-11-20T09:00:00Z". CAPI never reads this field (MachinePool has no rollout field, and the only
+                      rollout.after accessor is the control plane's, used by topology); `clusterctl alpha rollout restart` supports
+                      only MachineDeployment and KubeadmControlPlane, so users set it with kubectl patch (the book gives the command).
+                    format: date-time
+                    type: string
+                type: object
+              workerUpdates:
+                description: |-
+                  workerUpdates configures how the pool takes newer IBM fix packs (patch updates) for its workers. Minor updates
+                  are not configurable: every worker follows the control plane minor automatically.
+                minProperties: 1
+                properties:
+                  policy:
+                    description: |-
+                      policy is Manual (also when omitted) or Automatic. Manual: workers with a newer fix pack are only reported
+                      (WorkersUpToDate=False, reason PatchUpdateAvailable) until spec.rollout.after is set to a time that has passed.
+                      Automatic: CAPIBM replaces them, one at a time and drained, as soon as IBM reports a newer fix pack.
+                    enum:
+                    - Manual
+                    - Automatic
+                    type: string
+                type: object
+              zones:
+                description: |-
+                  zones lists the pool's zones; each must be a zone of the IBMCloudManagedCluster. Immutable in v1alpha1.
+                  For ROKS, give the "default" pool every zone the cluster will ever use: IBM does not extend the router load
+                  balancer to zones added later.
+                items:
+                  description: WorkerPoolZone is one zone of a pool. A per-pool subnet
+                    override can be added later (additive optional field).
+                  properties:
+                    name:
+                      description: name is the VPC zone, for example us-south-1.
+                      maxLength: 40
+                      minLength: 1
+                      pattern: ^[a-z]{2}-[a-z]+-[0-9]+$
+                      type: string
+                  required:
+                  - name
+                  type: object
+                maxItems: 3
+                minItems: 1
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+                x-kubernetes-validations:
+                - message: zones are immutable in v1alpha1
+                  rule: self.size() == oldSelf.size() && self.all(z, oldSelf.exists(o,
+                    o.name == z.name))
+            required:
+            - flavor
+            - poolName
+            - zones
+            type: object
+            x-kubernetes-validations:
+            - message: entitlement cannot be added or removed after creation
+              rule: has(self.entitlement) == has(oldSelf.entitlement)
+          status:
+            description: status is the observed state.
+            minProperties: 1
+            properties:
+              conditions:
+                description: |-
+                  conditions are Ready (the summary of WorkerPoolReady), WorkerPoolReady, WorkersUpToDate, Draining, Deleting and
+                  Paused.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                maxItems: 32
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              disruption:
+                description: |-
+                  disruption describes the worker removal in flight for this pool; absent when idle. It is an observation cache:
+                  the controller rebuilds it from the Node annotations and IBM worker states after a restart or a clusterctl move.
+                minProperties: 1
+                properties:
+                  drainStartTime:
+                    description: |-
+                      drainStartTime is when the first Node of this operation was cordoned (also kept on the Node, in its
+                      drain-start-time marker).
+                    format: date-time
+                    type: string
+                  ibmRequestTime:
+                    description: ibmRequestTime is when CAPIBM sent the IBM call (replaceWorker,
+                      resizeWorkerPool or removeWorkerPool).
+                    format: date-time
+                    type: string
+                  operation:
+                    description: operation is Replace (rollout), ScaleDown or DeletePool.
+                    enum:
+                    - Replace
+                    - ScaleDown
+                    - DeletePool
+                    type: string
+                  phase:
+                    description: |-
+                      phase is the current step. It is a bounded enum of the steps of one in-flight operation, not an object lifecycle
+                      phase (the Draining, WorkersUpToDate and Deleting conditions carry the state), so .golangci-kal.yml excludes it
+                      from the nophase rule.
+                    enum:
+                    - Draining
+                    - WaitingForVolumeDetach
+                    - WaitingForIBM
+                    - WaitingForRemoval
+                    - WaitingForReplacement
+                    type: string
+                  workerIDs:
+                    description: |-
+                      workerIDs are the IBM workers being removed (one for Replace; the predicted victims for ScaleDown; all for
+                      DeletePool).
+                    items:
+                      maxLength: 128
+                      type: string
+                    maxItems: 500
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-type: set
+                required:
+                - operation
+                - phase
+                - workerIDs
+                type: object
+              initialization:
+                description: initialization holds provisioned, the v1beta2 contract
+                  flag (read by CAPI >= v1.15); sticky.
+                minProperties: 1
+                properties:
+                  provisioned:
+                    description: |-
+                      provisioned is true once the IBM pool exists; sticky. It is a *bool because the CAPI InfraMachinePool contract
+                      defines it so (a KAL exclusion in .golangci-kal.yml).
+                    type: boolean
+                type: object
+              lastDisruptionTime:
+                description: |-
+                  lastDisruptionTime is when this controller last asked IBM to remove capacity from this pool (resize down,
+                  replace, remove). Every pool of the Cluster waits DisruptionSettleDelay after the newest one. When status is empty
+                  (a new object, or after clusterctl move or a restore), the first observation sets it to now, so no disruptive call
+                  can start inside IBM's reflection lag of a disruption the old status recorded.
+                format: date-time
+                type: string
+              missingWorkers:
+                description: |-
+                  missingWorkers lists workers that are still in spec.providerIDList although the latest listing omitted them
+                  without a deleted record. An ID is dropped only when a listing at least poolTransitionPoll after firstMissingTime
+                  still omits it, because dropping a live worker's ID makes Cluster API delete its Node. Lost on move, which only
+                  delays a drop.
+                items:
+                  description: MissingWorker is a worker the latest listing omitted
+                    without a deleted record.
+                  properties:
+                    firstMissingTime:
+                      description: firstMissingTime is the time of the first listing
+                        that omitted it.
+                      format: date-time
+                      type: string
+                    workerID:
+                      description: workerID is the IBM worker ID.
+                      maxLength: 64
+                      minLength: 1
+                      type: string
+                  required:
+                  - firstMissingTime
+                  - workerID
+                  type: object
+                maxItems: 500
+                type: array
+                x-kubernetes-list-map-keys:
+                - workerID
+                x-kubernetes-list-type: map
+              poolID:
+                description: poolID is the IBM worker pool ID, "<clusterID>-<7 hex>"
+                  as observed on IBM Cloud (cache; rediscovered by poolName).
+                maxLength: 64
+                minLength: 1
+                type: string
+              ready:
+                description: |-
+                  ready duplicates initialization.provisioned because CAPI v1.14 reads only status.ready for InfraMachinePools and
+                  re-evaluates it every reconcile. True once the IBM pool exists; never set back to false. It is a *bool because
+                  the CAPI InfraMachinePool contract defines it so (a KAL exclusion in .golangci-kal.yml). It is kept only for CAPI
+                  v1.14; remove it when CAPIBM requires a CAPI release that reads initialization.provisioned.
+                type: boolean
+              replicas:
+                description: |-
+                  replicas is the most recently observed number of IBM workers in the pool that are not deleted, which equals
+                  len(spec.providerIDList) (InfraMachinePool contract, infra-machinepool.md:401; CAPG does the same). CAPI v1.14
+                  also copies it into MachinePool readyReplicas and availableReplicas for pools without MachinePool Machines, so
+                  those count provisioning workers too; worker readiness is reported by the WorkerPoolReady condition. Always
+                  published, including 0.
+                format: int32
+                minimum: 0
+                type: integer
+              sizePerZone:
+                description: sizePerZone is IBM's pool workerCount, which is per zone
+                  (observed on IBM Cloud).
+                format: int32
+                minimum: 0
+                type: integer
+              targetWorkerVersion:
+                description: targetWorkerVersion is the newest IBM fix pack offered
+                  to the pool's workers (the highest kubeVersion.target).
+                maxLength: 64
+                minLength: 1
+                type: string
+              workerVersions:
+                description: |-
+                  workerVersions counts the pool's workers (deleted ones excluded) per IBM version (kubeVersion.actual), for
+                  example {version: "1.36.5_1540", count: 3}. Sorted by version.
+                items:
+                  description: WorkerVersionCount is the number of workers on one
+                    IBM version.
+                  properties:
+                    count:
+                      description: count is the number of workers on that version.
+                      format: int32
+                      minimum: 1
+                      type: integer
+                    version:
+                      description: version is IBM's worker version, for example "1.36.5_1540"
+                        or "4.21.40_1540_openshift".
+                      maxLength: 64
+                      minLength: 1
+                      type: string
+                  required:
+                  - count
+                  - version
+                  type: object
+                maxItems: 16
+                type: array
+                x-kubernetes-list-map-keys:
+                - version
+                x-kubernetes-list-type: map
+              workersWithUpdateAvailable:
+                description: |-
+                  workersWithUpdateAvailable counts the workers that are behind the control plane minor or whose
+                  kubeVersion.actual differs from kubeVersion.target (a newer fix pack). Always published, including 0,
+                  whatever the policy.
+                format: int32
+                minimum: 0
+                type: integer
+              zones:
+                description: zones are the observed zones of the IBM pool.
+                items:
+                  description: ObservedPoolZone is one observed zone.
+                  properties:
+                    name:
+                      description: name is the zone.
+                      maxLength: 40
+                      minLength: 1
+                      type: string
+                    workerCount:
+                      description: |-
+                        workerCount is IBM's worker count for the zone (it lags pool.workerCount while workers provision, as observed on
+                        IBM Cloud).
+                      format: int32
+                      minimum: 0
+                      type: integer
+                  required:
+                  - name
+                  type: object
+                maxItems: 3
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

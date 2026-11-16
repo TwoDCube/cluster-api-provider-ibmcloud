@@ -113,7 +113,9 @@ func (t *TestEnvironment) CreateNamespace(ctx context.Context, generateName stri
 	return ns, nil
 }
 
-// NewTestEnvironmentConfiguration creates a new test environment configuration for running tests.
+// NewTestEnvironmentConfiguration creates a new test environment configuration for running tests. crdDirectoryPaths
+// are relative to the repository root; the fake Cluster API CRDs (Cluster, Machine, MachinePool) are always installed
+// next to them.
 func NewTestEnvironmentConfiguration(crdDirectoryPaths []string) *TestEnvironmentConfiguration {
 	resolvedCrdDirectoryPaths := make([]string, len(crdDirectoryPaths))
 
@@ -128,6 +130,7 @@ func NewTestEnvironmentConfiguration(crdDirectoryPaths []string) *TestEnvironmen
 			CRDs: []*apiextensionsv1.CustomResourceDefinition{
 				TestClusterCRD.DeepCopy(),
 				TestMachineCRD.DeepCopy(),
+				TestMachinePoolCRD.DeepCopy(),
 			},
 		},
 	}
