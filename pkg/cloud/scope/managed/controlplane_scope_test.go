@@ -448,7 +448,7 @@ func TestCPCreateHold(t *testing.T) {
 	refused := func(mutate func(cp *controlplanev1.IBMCloudManagedControlPlane)) *controlplanev1.IBMCloudManagedControlPlane {
 		cp := &controlplanev1.IBMCloudManagedControlPlane{
 			ObjectMeta: metav1.ObjectMeta{Generation: 3, Annotations: map[string]string{
-				CreateHoldAnnotation: now.Add(10 * time.Minute).Format(time.RFC3339),
+				controlplanev1.CreateHoldAnnotation: now.Add(10 * time.Minute).Format(time.RFC3339),
 			}},
 			Status: controlplanev1.IBMCloudManagedControlPlaneStatus{Conditions: []metav1.Condition{{
 				Type:               controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition,
@@ -476,18 +476,18 @@ func TestCPCreateHold(t *testing.T) {
 		{name: "a ClusterNameConflict refusal holds",
 			cp: refused(setReason(controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedClusterNameConflictReason)), want: true},
 		{name: "a hold up to CreateRefusalHold ahead holds", cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) {
-			cp.Annotations[CreateHoldAnnotation] = now.Add(CreateRefusalHold).Format(time.RFC3339)
+			cp.Annotations[controlplanev1.CreateHoldAnnotation] = now.Add(CreateRefusalHold).Format(time.RFC3339)
 		}), want: true},
 		{name: "nil", cp: nil},
 		{name: "no annotation", cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) { cp.Annotations = nil })},
 		{name: "an annotation that is not a time", cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) {
-			cp.Annotations[CreateHoldAnnotation] = "soon"
+			cp.Annotations[controlplanev1.CreateHoldAnnotation] = "soon"
 		})},
 		{name: "a hold that has ended", cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) {
-			cp.Annotations[CreateHoldAnnotation] = now.Format(time.RFC3339)
+			cp.Annotations[controlplanev1.CreateHoldAnnotation] = now.Format(time.RFC3339)
 		})},
 		{name: "a time beyond CreateRefusalHold was not written by CAPIBM", cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) {
-			cp.Annotations[CreateHoldAnnotation] = now.Add(CreateRefusalHold + time.Second).Format(time.RFC3339)
+			cp.Annotations[controlplanev1.CreateHoldAnnotation] = now.Add(CreateRefusalHold + time.Second).Format(time.RFC3339)
 		})},
 		{name: "a spec change ends the hold", cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) { cp.Generation = 4 })},
 		{name: "another report replaced the refusal",
@@ -509,7 +509,7 @@ func TestCPCreateHold(t *testing.T) {
 			until, held := cpCreateHold(tc.cp, now)
 			g.Expect(held).To(Equal(tc.want))
 			if tc.want {
-				g.Expect(until).To(BeTemporally("==", mustParseRFC3339(t, tc.cp.Annotations[CreateHoldAnnotation])))
+				g.Expect(until).To(BeTemporally("==", mustParseRFC3339(t, tc.cp.Annotations[controlplanev1.CreateHoldAnnotation])))
 			} else {
 				g.Expect(until.IsZero()).To(BeTrue())
 			}
@@ -561,5 +561,5 @@ func TestControlPlaneHoldCreates(t *testing.T) {
 	scope.holdCreates(CreateRefusalHold)
 
 	// The fake clock of newCPScopeParams starts at 03:05:30 UTC; the annotation is UTC at second precision.
-	g.Expect(cp.Annotations).To(HaveKeyWithValue(CreateHoldAnnotation, "2026-11-16T03:17:30Z"))
+	g.Expect(cp.Annotations).To(HaveKeyWithValue(controlplanev1.CreateHoldAnnotation, "2026-11-16T03:17:30Z"))
 }

@@ -263,7 +263,7 @@ func (s *ControlPlaneScope) observe(ctx context.Context, decision BindingDecisio
 	c := decision.Cluster
 	cp.Status.ClusterID = decision.ClusterID
 	// A bound control plane sends no create request, so a leftover hold (cpCreateHold) has nothing left to hold.
-	delete(cp.Annotations, CreateHoldAnnotation)
+	delete(cp.Annotations, controlplanev1.CreateHoldAnnotation)
 	if decision.Row == "1" {
 		cp.Status.CreateIntent = controlplanev1.CreateIntent{}
 	}
@@ -791,7 +791,7 @@ func (s *ControlPlaneScope) createCluster(ctx context.Context, name string) Outc
 	previous := cp.Status.CreateIntent
 	cp.Status.CreateIntent = cpIntentForAttempt(previous, name, s.now())
 	// A hold that reaches this point is over (ReconcileNormal returned while it held); it goes with the intent's write.
-	delete(cp.Annotations, CreateHoldAnnotation)
+	delete(cp.Annotations, controlplanev1.CreateHoldAnnotation)
 	s.setProvisioned(metav1.ConditionFalse, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCreatingReason,
 		fmt.Sprintf("CAPIBM creates IBM cluster %s in resource group %s", name, s.InfraCluster.Spec.ResourceGroup.ID))
 	s.setAvailableWaiting()
@@ -1184,14 +1184,12 @@ func cpNonCriticalEventMessage(name, clusterID, incidentID string, item kubernet
 // decide binding row 10 again and send the same request, which IBM refuses again. The controller's own status patch
 // brings that reconcile at once (the For() watch has no predicate), so without a hold one refusal turns into a create
 // request every few milliseconds, each spending the shared IKS rate limit of every other cluster and pool.
+//
+// The hold is recorded in controlplanev1.CreateHoldAnnotation (RFC 3339, UTC). The key lives in the API package with
+// the other controller-owned annotations, so that tooling and the book can name it without importing the controller.
+// Anyone who can edit the control plane can change it, which shifts the next create request by at most
+// CreateRefusalHold (cpCreateHold ignores a later time).
 const (
-	// CreateHoldAnnotation is the CAPIBM annotation on an IBMCloudManagedControlPlane that holds create requests after
-	// a definitive refusal: its value is the time (RFC 3339, UTC) before which CAPIBM sends no new one. It is an
-	// annotation, not a status field, because the API has no field for it in this release; it is in the domain of the
-	// controller-owned annotations. Anyone who can edit the control plane can change it, which shifts the next create
-	// request by at most CreateRefusalHold (cpCreateHold ignores a later time).
-	CreateHoldAnnotation = "ibmcloudmanaged.controlplane.cluster.x-k8s.io/create-hold-until"
-
 	// CreateRefusalHold is how long a Terminal create refusal (A0656, 403, 400, 422, E0007 with no cluster found)
 	// holds the next create request. It is shorter than terminalRecheck (15 minutes, internal/controllers/managed
 	// requeue.go) minus its 10 % jitter, so that the recheck the refusal's Terminal outcome scheduled always finds the
@@ -1228,18 +1226,20 @@ func cpCreateHoldFor(class kubernetesservice.ErrorClass) (time.Duration, bool) {
 	}
 }
 
-// holdCreates records in CreateHoldAnnotation that no create request is sent before now plus hold; the deferred
-// patch persists it with the refusal's condition. hold is CreateRefusalHold or CreateUnauthorizedHold.
+// holdCreates records in controlplanev1.CreateHoldAnnotation that no create request is sent before now plus hold; the
+// deferred patch persists it with the refusal's condition. hold is CreateRefusalHold or CreateUnauthorizedHold.
 func (s *ControlPlaneScope) holdCreates(hold time.Duration) {
-	metav1.SetMetaDataAnnotation(&s.ControlPlane.ObjectMeta, CreateHoldAnnotation, s.now().Add(hold).Format(time.RFC3339))
+	until := s.now().Add(hold).Format(time.RFC3339)
+	metav1.SetMetaDataAnnotation(&s.ControlPlane.ObjectMeta, controlplanev1.CreateHoldAnnotation, until)
 }
 
 // cpCreateHold reports whether a definitive create refusal still holds the next create request of cp, and until when.
 // It holds while all of these are true, so that only the refusal itself, unchanged, keeps CAPIBM from asking again:
 //   - no IBM cluster can be bound (NoIBMClusterCanExist): no status.clusterID, no endpoint and no create attempt of
 //     unknown outcome, which the binding rows resolve on every reconcile;
-//   - CreateHoldAnnotation parses and lies after now, but at most CreateRefusalHold after it; a later value was not
-//     written by CAPIBM (or by a clock far ahead) and is ignored, so that no edit of the annotation stops creates;
+//   - controlplanev1.CreateHoldAnnotation parses and lies after now, but at most CreateRefusalHold after it; a later
+//     value was not written by CAPIBM (or by a clock far ahead) and is ignored, so that no edit of the annotation stops
+//     creates;
 //   - IBMClusterProvisioned is still the refusal's condition: False with a reason of cpCreateRefusalReasons, observed
 //     at the current generation. A spec change therefore ends the hold at once (a Terminal outcome waits for a spec
 //     edit or its recheck), and so does any other report that replaced the refusal's condition since.
@@ -1248,10 +1248,10 @@ func (s *ControlPlaneScope) holdCreates(hold time.Duration) {
 //   - cp is the control plane as read.
 //   - now is the clock's time.
 func cpCreateHold(cp *controlplanev1.IBMCloudManagedControlPlane, now time.Time) (time.Time, bool) {
-	if cp == nil || !NoIBMClusterCanExist(cp) || cp.Annotations[CreateHoldAnnotation] == "" {
+	if cp == nil || !NoIBMClusterCanExist(cp) || cp.Annotations[controlplanev1.CreateHoldAnnotation] == "" {
 		return time.Time{}, false
 	}
-	until, err := time.Parse(time.RFC3339, cp.Annotations[CreateHoldAnnotation])
+	until, err := time.Parse(time.RFC3339, cp.Annotations[controlplanev1.CreateHoldAnnotation])
 	if err != nil || !now.Before(until) || until.Sub(now) > CreateRefusalHold {
 		return time.Time{}, false
 	}

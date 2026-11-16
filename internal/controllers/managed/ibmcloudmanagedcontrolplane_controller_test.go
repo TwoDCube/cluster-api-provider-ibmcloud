@@ -2102,7 +2102,7 @@ func TestControlPlaneCreate(t *testing.T) {
 		g.Expect(f.builder.invalidated).To(BeEmpty(), "A0656 is a missing role, not rejected credentials")
 		cp := f.controlPlane()
 		g.Expect(cp.Status.CreateIntent).To(BeZero())
-		g.Expect(cp.Annotations).To(HaveKeyWithValue(managedscope.CreateHoldAnnotation,
+		g.Expect(cp.Annotations).To(HaveKeyWithValue(controlplanev1.CreateHoldAnnotation,
 			cpTestStart.Add(managedscope.CreateRefusalHold).Format(time.RFC3339)))
 
 		// The refusal's own status patch brings the control plane straight back (no predicate on For): that reconcile makes
@@ -2173,7 +2173,7 @@ func TestControlPlaneCreateHold(t *testing.T) {
 
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(creates).To(Equal(1))
-			g.Expect(f.controlPlane().Annotations).To(HaveKeyWithValue(managedscope.CreateHoldAnnotation,
+			g.Expect(f.controlPlane().Annotations).To(HaveKeyWithValue(controlplanev1.CreateHoldAnnotation,
 				cpTestStart.Add(tc.wantHold).Format(time.RFC3339)))
 			patches, invalidated := len(f.patches()), len(f.builder.invalidated)
 
@@ -2196,7 +2196,7 @@ func TestControlPlaneCreateHold(t *testing.T) {
 			_, err = f.reconcile()
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(creates).To(Equal(2))
-			g.Expect(f.controlPlane().Annotations).To(HaveKeyWithValue(managedscope.CreateHoldAnnotation,
+			g.Expect(f.controlPlane().Annotations).To(HaveKeyWithValue(controlplanev1.CreateHoldAnnotation,
 				cpTestStart.Add(2*tc.wantHold).Format(time.RFC3339)))
 		})
 	}
@@ -2223,14 +2223,14 @@ func TestControlPlaneCreateHold(t *testing.T) {
 		g.Expect(err).NotTo(HaveOccurred())
 		cp = f.controlPlane()
 		g.Expect(cp.Status.ClusterID).To(Equal(cpIKSClusterID))
-		g.Expect(cp.Annotations).NotTo(HaveKey(managedscope.CreateHoldAnnotation), "the hold went with the intent's write")
+		g.Expect(cp.Annotations).NotTo(HaveKey(controlplanev1.CreateHoldAnnotation), "the hold went with the intent's write")
 	})
 
 	t.Run("a hold annotation far in the future is not CAPIBM's and holds nothing", func(t *testing.T) {
 		g := NewWithT(t)
 		objs := newCPObjects()
 		withInitialPool(objs)
-		objs.cp.Annotations = map[string]string{managedscope.CreateHoldAnnotation: "2099-01-01T00:00:00Z"}
+		objs.cp.Annotations = map[string]string{controlplanev1.CreateHoldAnnotation: "2099-01-01T00:00:00Z"}
 		objs.cp.Status.Conditions = append(objs.cp.Status.Conditions, metav1.Condition{
 			Type: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, Status: metav1.ConditionFalse,
 			Reason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason, LastTransitionTime: metav1.NewTime(cpTestStart),
@@ -2628,7 +2628,7 @@ func TestControlPlaneEnvtestCreateRefusalSendsOneCreate(t *testing.T) {
 				persisted := getEnvtestControlPlane(t, key)
 				expectCondition(g, persisted, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition,
 					metav1.ConditionFalse, tc.wantReason)
-				g.Expect(persisted.Annotations).To(HaveKey(managedscope.CreateHoldAnnotation))
+				g.Expect(persisted.Annotations).To(HaveKey(controlplanev1.CreateHoldAnnotation))
 			}, 30*time.Second, 100*time.Millisecond).Should(Succeed())
 
 			// One lookup and one create (E0007: a second lookup). The control plane is created after the manager
