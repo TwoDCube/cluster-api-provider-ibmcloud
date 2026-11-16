@@ -127,8 +127,9 @@ during the replacement must still hold IBM's cluster minimum (1 on IKS, 2 on ROK
 
 * An **IKS** cluster needs at least **2** workers to roll a worker; a **ROKS** cluster at least **3**.
 * Below that, replacements wait with `WorkersUpToDate=False`, reason `WaitingForCapacity`, and the message names the fix:
-  "scale MachinePool <name> to <n+1> to allow a rolling replacement". Scale up by one, let the rollout finish, then
-  scale back down.
+  "...; scale MachinePool <name> to <n> to allow a rolling replacement". `<n>` adds whole workers per zone of the pool
+  (IBM sizes pools per zone), so a single-zone pool grows by one. Scale to it, let the rollout finish, then scale back
+  down.
 * A 1-worker IKS cluster can never roll a worker, and after two master minors its next master upgrade is
   `BlockedByWorkerSkew`. A 2-worker ROKS cluster (for example `managed-roks-single-zone`) needs the temporary third
   worker for every rollout.
@@ -140,7 +141,7 @@ for `minReadySeconds`.
 ## Progress and blockers
 
 While a rollout runs, `WorkersUpToDate` carries the step (`DrainingNode`, `ReplacingWorker`, `WaitingForReplacement`)
-or `RollingOut` between workers, with a message such as "replaced 2 of 6". It waits with the reasons of the
+or `RollingOut` between workers, with a message such as "replaced 2 of 6; ...". It waits with the reasons of the
 [disruption checks](./worker-pools.md#one-disruption-at-a-time) (`WaitingForSettledCluster`,
 `WaitingForDisruptionToken`, `WaitingForClusterState`, `WaitingForWorkloadCluster`), and reports `AutoRebalanceDisabled`
 (IBM auto-rebalance is off in the worker's zone, so IBM would create no replacement; fix: `ibmcloud ks worker-pool

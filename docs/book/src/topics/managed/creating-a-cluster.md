@@ -23,7 +23,8 @@ kubectl apply -f my-iks.yaml
 Always pass `--worker-machine-count` (6 for the HA flavors, 2 for the single-zone flavors, or another multiple of
 the zone count): without the flag or a `WORKER_MACHINE_COUNT` variable, `clusterctl generate cluster` sets
 `WORKER_MACHINE_COUNT` to 0, so the template default does not apply and the control plane stops in
-`InvalidConfiguration` ("spec.replicas=0 is not a positive multiple of the 3 zone(s) ...") before any IBM call.
+`InvalidConfiguration` ("MachinePool <name> spec.replicas=0 is not a positive multiple of the 3 zone(s) ...") before
+any IBM call.
 
 For ROKS use `--flavor managed-roks`, `ROKS_DISTRIBUTION_VERSION` (for example `4.21`) and
 `COS_INSTANCE_CRN=<crn-of-your-cos-instance>`.

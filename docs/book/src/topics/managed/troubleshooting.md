@@ -26,8 +26,10 @@ managed client builder: --service-endpoint entry us-south:containers=http://priv
 is not an absolute https URL without user information, query or fragment; ...
 ```
 
-The error names the region and service of the entry and prints the URL with any password replaced and without query or
-fragment. Fix the entry (`<region>:containers=https://<host>/<path>`), see
+The error names the region and service of the entry and prints the URL with its whole user information (user name and
+password) replaced by `xxxxx` and without query or fragment; a URL without a host, or with an `@` after the host (which
+counts as user information too), is not printed at all, and a URL that does not parse is reported as "... is not a
+valid URL (<kind of problem>) ..." without the URL. Fix the entry (`<region>:containers=https://<host>/<path>`), see
 [Prerequisites](./prerequisites.md#private-service-endpoints), and restart the manager.
 
 ### Creating a managed object is rejected
@@ -174,9 +176,9 @@ CAPIBM created nothing and never touches that cluster.
 | Condition and reason | Meaning |
 |---|---|
 | `KubeconfigReady=False` `WaitingForMaster` | normal for 16 to 25 minutes after the create |
-| `KubeconfigReady=False` `EndpointUnreachable` | the management cluster cannot reach the master URL: check firewalls, CBR rules on the cluster API, and private connectivity for private-only clusters |
-| `KubeconfigReady=False` `CredentialFetchFailed` | IBM's admin kubeconfig or CA could not be fetched (often the Administrator role is missing), or it held no client certificate |
-| `KubeconfigReady=False` `VerificationFailed` | a new credential failed the check against the master; the previous Secret is kept |
+| `KubeconfigReady=False` `EndpointUnreachable` | "The management cluster cannot reach <url> (...); private-only clusters need private connectivity": check firewalls, CBR rules on the cluster API, and private connectivity for private-only clusters |
+| `KubeconfigReady=False` `CredentialFetchFailed` | IBM's admin kubeconfig or CA could not be fetched (often the Administrator role is missing; the message carries IBM's code only, and CAPIBM tries again after 5 minutes for a 401 and 15 minutes for a 403 or 400), or it held no client certificate |
+| `KubeconfigReady=False` `VerificationFailed` | a new credential failed the check against the master (the previous Secret is kept), the stored credential is rejected with 401 (CAPIBM fetches IBM's admin credential again with a backoff of 1 to 10 minutes), or the master's certificate no longer verifies with the stored trust (both trust modes are tried again at most once every 10 minutes) |
 | `KubeconfigReady=False` `UserProvidedSecretInvalid` | your Secret lacks the `cluster.x-k8s.io/cluster-name` label or a non-empty `value` key |
 | `KubeconfigReady=Unknown` `CARotationInProgress` | IBM rotates the cluster CA; CAPIBM fetches the new credential when it is done |
 | `Available=False` `MasterNotReady` | IBM does not report the master ready, or reports its health as `error` or `unavailable` |
@@ -204,8 +206,9 @@ per zone ([Topology](./topology.md#smaller-topologies-are-not-ha)). CAPIBM ignor
 
 ## Workers do not roll or scale
 
-* **`WaitingForCapacity`**: the cluster is too small to remove a worker. Scale the `MachinePool` up by one as the message
-  says, then back down after the rollout ([Upgrades](./upgrades.md#capacity-the-1-worker-a-rollout-needs)).
+* **`WaitingForCapacity`**: the cluster is too small to remove a worker. Scale the `MachinePool` to the count the message
+  names (one more worker per zone of the pool), then back down after the rollout
+  ([Upgrades](./upgrades.md#capacity-the-1-worker-a-rollout-needs)).
 * **`PatchUpdateAvailable`**: not an error; the `Manual` policy waits for `spec.rollout.after`.
 * **`DrainBlocked`** (`Draining` condition): a PodDisruptionBudget refuses an eviction; the message lists the pods and
   budgets. Add capacity, fix the budget, or set `nodeDrainTimeoutSeconds` on the `MachinePool`. CAPIBM never forces.
@@ -226,15 +229,15 @@ per zone ([Topology](./topology.md#smaller-topologies-are-not-ha)). CAPIBM ignor
 * **`PoolNameBeingReleased`**: IBM still lists a deleted pool with that name; it clears by itself.
 * **`ExternallyAutoscaled`**: IBM's autoscaler add-on manages the pool; CAPIBM does not resize it.
 
-### A pool removal waits in WaitingForWorkloadCluster
+### A pool removal or scale-down waits in WaitingForWorkloadCluster
 
 CAPIBM drains Nodes through the workload cluster's API. If it cannot reach the workload cluster:
 
 * when the cluster was reachable when the drain started (Nodes cordoned), a drain or volume detach time limit
   (`nodeDrainTimeoutSeconds`, `nodeVolumeDetachTimeoutSeconds`) still runs out and then lets the removal continue;
-* when CAPIBM **never reached** it for this removal, the removal holds before anything is cordoned
-  (`Deleting=True`, reason `WaitingForWorkloadCluster`) and **a time limit alone does not end the wait**, because no
-  drain has started. This fails safe on purpose.
+* when CAPIBM **never reached** it for this removal, the removal holds before anything is cordoned (reason
+  `WaitingForWorkloadCluster`: `Deleting=True` for a pool removal, `WorkerPoolReady=False` for a scale-down) and **a
+  time limit alone does not end the wait**, because no drain has started. This fails safe on purpose.
 
 The escape hatch is to set **both** exclusion annotations on the `IBMCloudManagedMachinePool`:
 
@@ -244,15 +247,17 @@ kubectl annotate ibmcloudmanagedmachinepool <name> -n <namespace> \
   machine.cluster.x-k8s.io/exclude-wait-for-node-volume-detach=""
 ```
 
-With both, a pool removal needs no workload cluster access: CAPIBM cordons nothing, evicts nothing and does not wait
-for volumes to detach, and calls IBM. The pods on those workers are not drained by CAPIBM; they stop with the workers
-(IBM's own drain gives them about 60 seconds). A whole-Cluster deletion needs neither: it never drains.
+With both, a pool removal and a scale-down need no workload cluster access: CAPIBM cordons nothing, evicts nothing and
+does not wait for volumes to detach, and calls IBM. The pods on those workers are not drained by CAPIBM; they stop with
+the workers (IBM's own drain gives them about 60 seconds). A whole-Cluster deletion needs neither: it never drains.
 
-This escape hatch covers **pool removal only**. A scale-down or a worker replacement still waits in
-`WaitingForWorkloadCluster` while CAPIBM cannot reach the workload cluster, with or without the annotations: both
-check the connection before they start, and a replacement also has to see its new Node become `Ready`. Restore access
-to the workload cluster (network, CBR rules, a valid kubeconfig Secret), or, if the pool can go, remove the whole
-pool with the annotations above.
+The escape hatch does **not** cover a **worker replacement**. A replacement waits in `WaitingForWorkloadCluster`
+(`WorkersUpToDate=False`) before its IBM call while CAPIBM cannot reach the workload cluster, with or without the
+annotations, because it has to see its new Node become `Ready` before the next worker. If the workload cluster went
+away after the drain had started, a drain or detach time limit that runs out still lets the replacement call IBM; the
+replacement then waits in `WaitingForReplacement` until the workload cluster is reachable again. Restore access to the
+workload cluster (network, CBR rules, a valid kubeconfig Secret), or, if the pool can go, remove the whole pool with
+the annotations above.
 
 ## Pool objects stuck in Terminating
 

@@ -50,7 +50,7 @@ condition reports whether the size is reached and every worker is ready.
 Rules checked before any IBM call (each a `WorkerPoolReady=False` reason, see the [reference](./reference.md)):
 
 * `replicas` must be a multiple of the zone count (`ReplicasNotDivisibleByZones`: "replicas=4 is not a multiple of 3
-  zones; use 3 or 6"); IBM sizes pools per zone. `replicas: 0` is not supported (`ZeroReplicasNotSupported`).
+  zones; use 3 or 6 (IBM sizes worker pools per zone)"). `replicas: 0` is not supported (`ZeroReplicasNotSupported`).
 * Every zone must be a zone of the `IBMCloudManagedCluster` (`UnknownZone`, or `WaitingForInfrastructure` while it is
   being resolved).
 * `entitlement` is OpenShift only (`InvalidForDistribution`).
@@ -179,9 +179,11 @@ reconcile, so an edit takes effect during a drain.
 An exclusion annotation counts when present, whatever its value. Put it on the `MachinePool`'s
 `spec.template.metadata.annotations` as a steady setting, or on the `IBMCloudManagedMachinePool` as an emergency
 override (it can be written even while the `MachinePool` is being deleted). With **both** annotations, a **pool
-removal** needs no access to the workload cluster at all; that is the escape hatch for a workload cluster CAPIBM cannot
-reach ([Troubleshooting](./troubleshooting.md#a-pool-removal-waits-in-waitingforworkloadcluster)). A scale-down or a
-worker replacement still needs the workload cluster, annotations or not.
+removal** or a **scale-down** needs no access to the workload cluster at all; that is the escape hatch for a workload
+cluster CAPIBM cannot reach
+([Troubleshooting](./troubleshooting.md#a-pool-removal-or-scale-down-waits-in-waitingforworkloadcluster)). A worker
+replacement still needs the workload cluster, annotations or not: it waits in `WaitingForWorkloadCluster` before its
+IBM call, because it has to see the new Node become `Ready`.
 
 ### What survives restarts and moves
 

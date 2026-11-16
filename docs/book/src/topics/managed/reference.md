@@ -38,8 +38,8 @@ CAPIBM makes no IBM call and writes nothing to the workload cluster.
 | | True | message `EndpointChanged` | IBM's master URL differs from `spec.controlPlaneEndpoint`; the kubeconfig follows IBM |
 | | False | `WaitingForMaster` | the master is not ready yet |
 | | False | `CredentialFetchFailed` | IBM's admin kubeconfig or CA could not be fetched, or its user has no client certificate (or has a token, `exec` or auth provider) |
-| | False | `VerificationFailed` | a new credential failed the check against the master with every trust mode; the old Secret is kept |
-| | False | `EndpointUnreachable` | "the management cluster cannot reach <url>; private-only clusters need private connectivity" |
+| | False | `VerificationFailed` | a new credential failed the check against the master with every trust mode (the old Secret is kept), the stored credential is rejected with 401 (fetched again with a backoff of 1 to 10 minutes), or the master's certificate no longer verifies with the stored trust (both trust modes are tried again at most once every 10 minutes) |
+| | False | `EndpointUnreachable` | "The management cluster cannot reach <url> (...); private-only clusters need private connectivity" |
 | | Unknown | `CARotationInProgress` | IBM rotates the cluster CA; checked every minute |
 | | False | `UserProvidedSecretInvalid` | a user-provided Secret lacks the `cluster.x-k8s.io/cluster-name` label or a non-empty `value` key |
 | `MasterVersionUpToDate` | True | `UpToDate` | the master runs the minor of `spec.distributionVersion`, whatever patch; an end of support within 45 days is mentioned |
@@ -58,11 +58,11 @@ CAPIBM makes no IBM call and writes nothing to the workload cluster.
 | | True | `WaitingForWorkersDeletion` | `MachinePool`s of the Cluster still exist; nothing is deleted yet |
 | | True | `WaitingForInfrastructure` | the `IBMCloudManagedCluster` is gone while an IBM cluster may exist; the finalizer is kept |
 | | True | `DeletionRequested` | `DELETE` was sent |
-| | True | `WaitingForIBMDeletion` | IBM deletes the cluster (also after IBM answered a `DELETE` with 400 or 409) |
+| | True | `WaitingForIBMDeletion` | IBM deletes the cluster (also after IBM answered a `DELETE` with 400 or 409); or IBM answers 404 for a known cluster before CAPIBM sent its `DELETE` and the stored kubeconfig could not be checked against it (a timeout or a 5xx): "IBM answers 404 for cluster <id>, and its kubeconfig Secret could not be checked against it (...), so CAPIBM cannot yet tell a cluster that the credentials of the CAPIBM controller identity cannot see from one that is gone; it checks again every minute until <time> and then counts the cluster as gone" (30 minutes after the deletion started) |
 | | True | `DeleteFailed` | IBM reports `delete_failed`; open an IBM support case |
 | | True | `PossibleOwnClusterFound` | a same-named cluster may come from a create attempt with an unknown outcome; the finalizer is kept and `DELETE` is never sent for it |
 | | True | `OwnershipNotProven` | the cluster to delete cannot be proven to be this control plane's; never deleted |
-| | True | `IBMClusterNotVisible` | IBM returns 404 for a known cluster while the stored kubeconfig still works: "the credentials of the CAPIBM controller identity cannot see cluster <id> in account <account-id>; check the account and IAM scope" |
+| | True | `IBMClusterNotVisible` | IBM returns 404 for a known cluster while the stored kubeconfig still works: "The credentials of the CAPIBM controller identity cannot see IBM cluster <id> in account <account-id>, but its kubeconfig Secret still authenticates against it; check the account and IAM scope of those credentials. CAPIBM keeps the finalizer ... and never deletes a cluster it cannot see; remove the finalizer by hand to orphan the IBM cluster"; once reported, it stays (checked every 15 minutes) also while the kubeconfig cannot be checked ("... its kubeconfig Secret authenticated against it before but cannot be checked now (...); ...") until the kubeconfig is rejected or the finalizer is removed by hand |
 | | True | `PermissionDenied` | IBM refused the `DELETE` with 401 or 403; checked again every 15 minutes |
 | `Paused` | | | `util/paused` |
 
@@ -99,7 +99,7 @@ The `IBMCloudManagedCluster` has no finalizer and no events; a stand-alone delet
 | | False | `WaitingForControlPlane` | no IBM cluster ID yet; or the control plane is not initialized (a `creation: WithCluster` pool waits for IBM to list it: "IBM creates pool <name> together with cluster <id> (spec.creation: WithCluster); waiting for it to be listed") |
 | | False | `WaitingForInfrastructure` | a zone of the pool is not yet resolved by the `IBMCloudManagedCluster` |
 | | False | `UnknownZone` | a zone of the pool is not a zone of the `IBMCloudManagedCluster` |
-| | False | `ReplicasNotDivisibleByZones` | "replicas=4 is not a multiple of 3 zones; use 3 or 6" |
+| | False | `ReplicasNotDivisibleByZones` | "replicas=4 is not a multiple of 3 zones; use 3 or 6 (IBM sizes worker pools per zone)" |
 | | False | `ZeroReplicasNotSupported` | `replicas: 0` |
 | | False | `InvalidForDistribution` | a setting the distribution does not support, such as `entitlement` on IKS |
 | | False | `PoolNameConflict` | another pool object of the Cluster uses the same `poolName`; set on every claimant, none publishes or changes anything |
@@ -115,20 +115,23 @@ The `IBMCloudManagedCluster` has no finalizer and no events; a stand-alone delet
 | | False | `WaitingForDisruptionToken` | another pool of the Cluster holds the disruption token |
 | | False | `WaitingForWorkloadCluster` | the workload cluster is not connected; checked before anything is cordoned |
 | | False | `DrainingNode` | a scale-down drains the predicted workers |
+| | False | `IBMAPIError` | IBM answered a call for the pool with a 401, a 403 for a missing role, a 400 or a 404, or CAPIBM cannot resolve its IBM credentials; the message names the call and IBM's code only. For a scale-down's resize call the report stays, with the Nodes cordoned and the disruption token held, and the call is repeated at most once every 3 minutes |
 | `WorkersUpToDate` | True | `UpToDate` | no worker is due for replacement and none has an update available |
 | | False | `PatchUpdateAvailable` | policy `Manual` and no due `spec.rollout.after`: "3 of 6 workers can move to IBM fix pack 1.36.5_1545; set spec.rollout.after to roll them, or set spec.workerUpdates.policy: Automatic" |
-| | False | `RollingOut` | a rollout is in progress between workers ("replaced 2 of 6") |
+| | False | `RollingOut` | a rollout is in progress between workers ("replaced 2 of 6; ...") |
 | | False | `DrainingNode` | the worker to replace is drained |
 | | False | `ReplacingWorker` | IBM replaces the worker |
 | | False | `WaitingForReplacement` | the replacement is not yet deployed, healthy and `Ready` for `minReadySeconds` |
 | | False | `WaitingForControlPlaneUpgrade` | the master is updating (a requested minor or an IBM patch) |
-| | False | `WaitingForCapacity` | "scale MachinePool <name> to <n> to allow a rolling replacement" |
+| | False | `WaitingForCapacity` | "...; scale MachinePool <name> to <n> to allow a rolling replacement" (`<n>` adds whole workers per zone until the cluster minimum holds during the replacement) |
 | | False | `WaitingForClusterMinimum` | IBM refused the replacement with `E1437`; the Node stays cordoned |
-| | False | `WaitingForSettledCluster`, `WaitingForClusterState`, `WaitingForDisruptionToken`, `WaitingForWorkloadCluster` | the [disruption checks](./worker-pools.md#one-disruption-at-a-time) |
+| | False | `WaitingForSettledCluster`, `WaitingForClusterState`, `WaitingForDisruptionToken`, `WaitingForWorkloadCluster` | the [disruption checks](./worker-pools.md#one-disruption-at-a-time); a replacement waits in `WaitingForWorkloadCluster` in every step before its IBM call, also with both exclusion annotations |
+| | False | `ExternallyAutoscaled` | IBM reports the pool as autoscaled, so CAPIBM replaces none of its workers; also after IBM refused the replacement with its autoscaled-pool 403 |
+| | False | `IBMAPIError` | IBM answered the replacement call with a 401, a 403 for a missing role or a 400 other than `E1437`; the message names the call and IBM's code only; the Node stays cordoned and the call is repeated at most once every 3 minutes |
 | | False | `AutoRebalanceDisabled` | IBM auto-rebalance is off in the worker's zone; fix: `ibmcloud ks worker-pool rebalance` |
 | | False | `ReplacementNotCreated` | no new worker 30 minutes after the old one was deleted |
 | | False | `WorkerOperationStuck` | a worker has been changing for more than 60 minutes |
-| | any | message `VersionIgnored` | `MachinePool.spec.template.spec.version` is set: "ignored: workers follow the control plane minor; fix packs follow spec.workerUpdates" |
+| | any | message `VersionIgnored` | `MachinePool.spec.template.spec.version` is set; the message ends with "...; VersionIgnored: MachinePool spec.template.spec.version is ignored: workers follow the control plane minor; fix packs follow spec.workerUpdates" |
 | `Draining` (activity) | True | `DrainingNode` | Nodes are cordoned and their pods evicted |
 | | True | `DrainBlocked` | a PodDisruptionBudget refuses an eviction; the message lists pods and budgets (at most 3 pods per category plus "and N more") |
 | | True | `WaitingForVolumeDetach` | drained Nodes still have attached volumes |
@@ -142,9 +145,10 @@ The `IBMCloudManagedCluster` has no finalizer and no events; a stand-alone delet
 | | True | `ExternallyAutoscaled` | IBM refused removing an autoscaled pool; retried at most every 3 minutes |
 | | True | `WaitingForSettledCluster` | another worker of the Cluster is changing |
 | | True | `WaitingForDisruptionToken` | another pool holds the disruption token |
-| | True | `WaitingForWorkloadCluster` | the workload cluster was never reached for this removal ([escape hatch](./troubleshooting.md#a-pool-removal-waits-in-waitingforworkloadcluster)) |
+| | True | `WaitingForWorkloadCluster` | the workload cluster was never reached for this removal ([escape hatch](./troubleshooting.md#a-pool-removal-or-scale-down-waits-in-waitingforworkloadcluster)) |
 | | True | `DrainingNodes` | every Node of the pool is drained |
 | | True | `RemovingWorkerPool` | `removeWorkerPool` was sent; waiting until IBM no longer lists the pool |
+| | True | `IBMAPIError` | IBM answered a call of the removal with a 401, a 403 for a missing role, a 400 or a 404; the message names the call and IBM's code only; for `removeWorkerPool` the Nodes stay cordoned and the call is repeated at most once every 3 minutes |
 | `Paused` | | | `util/paused` |
 
 Events: `WorkerPoolAdopted`, `DrainStarted`, `DrainCompleted`, `NodeUncordoned`, `WorkerReplaceRequested` (Normal);

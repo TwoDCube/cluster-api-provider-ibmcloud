@@ -72,10 +72,17 @@ own a cluster it cannot see. These states need a person:
 |---|---|---|
 | `OwnershipNotProven` | the IBM cluster the Secret names cannot be proven to be this control plane's (binding mismatch or failed proof) | put a fresh `ibmcloud ks cluster config --admin` kubeconfig into the Secret ([clusterctl move](./clusterctl-move.md#recovering-from-ownershipnotproven)), or remove the finalizer by hand to leave the IBM cluster alone |
 | `PossibleOwnClusterFound` | a create attempt's outcome was unknown, and a same-named IBM cluster appeared whose creation time does not prove it is ours | check in IBM Cloud: if it is this Cluster's, delete it there; otherwise remove the finalizer by hand |
-| `IBMClusterNotVisible` | IBM says the cluster does not exist, but the stored kubeconfig still works against it: "the credentials of the CAPIBM controller identity cannot see cluster <id> in account <account-id>; check the account and IAM scope" | give CAPIBM's credentials access to that account and resource group (for example after a move to a management cluster with other credentials) |
+| `IBMClusterNotVisible` | IBM says the cluster does not exist, but the stored kubeconfig still works against it: "The credentials of the CAPIBM controller identity cannot see IBM cluster <id> in account <account-id>, but its kubeconfig Secret still authenticates against it; check the account and IAM scope of those credentials. ..."; once reported, it stays while the kubeconfig cannot be checked ("... authenticated against it before but cannot be checked now (...); ...") | give CAPIBM's credentials access to that account and resource group (for example after a move to a management cluster with other credentials), or remove the finalizer by hand to leave the IBM cluster alone |
 | `WaitingForInfrastructure` | the `IBMCloudManagedCluster` is gone while an IBM cluster may exist; CAPIBM needs its resource group to prove which cluster to delete | re-apply it from its manifest, or remove the finalizer by hand to leave the IBM cluster alone |
 | `DeleteFailed` | IBM reports `delete_failed` | open an IBM support case; CAPIBM never sends `DELETE` again for it |
 | `PermissionDenied` | IBM refused the `DELETE` (401 or 403) | grant the Kubernetes Service role ([Prerequisites](./prerequisites.md#iam-permissions)); CAPIBM checks again every 15 minutes |
+
+When IBM answers 404 for a known cluster before CAPIBM sent its `DELETE` and the stored kubeconfig cannot be checked
+(the API server does not answer, or answers with a 5xx), CAPIBM cannot tell a cluster its credentials cannot see from
+one that is gone. It reports `WaitingForIBMDeletion` ("IBM answers 404 for cluster <id>, and its kubeconfig Secret
+could not be checked against it (...); ...") and checks again every minute until 30 minutes after the deletion started;
+then it counts the cluster as deleted out of band and removes the finalizer. A kubeconfig that is rejected (401, a
+certificate that no longer verifies) removes the finalizer at once.
 
 Removing a finalizer by hand (`kubectl patch ibmcmcp <name> -n <namespace> --type json -p
 '[{"op":"remove","path":"/metadata/finalizers"}]'`) deletes the object without touching IBM Cloud: the IBM cluster, if
