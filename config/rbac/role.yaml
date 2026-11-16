@@ -110,6 +110,7 @@ rules:
   - infrastructure.cluster.x-k8s.io
   resources:
   - ibmcloudmanagedclusters/status
+  - ibmcloudmanagedmachinepools/status
   - ibmpowervsclusters/status
   - ibmpowervsimages/status
   - ibmpowervsmachines/status
@@ -125,11 +126,12 @@ rules:
   - infrastructure.cluster.x-k8s.io
   resources:
   - ibmcloudmanagedmachinepools
-  - ibmpowervsmachinetemplates
-  - ibmvpcmachinetemplates
+  - ibmpowervsclustertemplates
   verbs:
   - get
   - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - infrastructure.cluster.x-k8s.io
@@ -150,10 +152,9 @@ rules:
 - apiGroups:
   - infrastructure.cluster.x-k8s.io
   resources:
-  - ibmpowervsclustertemplates
+  - ibmpowervsmachinetemplates
+  - ibmvpcmachinetemplates
   verbs:
   - get
   - list
-  - patch
-  - update
   - watch

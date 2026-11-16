@@ -439,7 +439,8 @@ func setupManagedReconcilers(ctx context.Context, mgr ctrl.Manager, serviceEndpo
 	// The ClusterCache gives the managed controllers their connection to workload clusters (the machine pool controller
 	// drains Nodes through it before IBM removes a worker); it connects only to Clusters whose control plane is an
 	// IBMCloudManagedControlPlane.
-	if _, err := managedcontroller.SetupClusterCache(ctx, mgr, managedcontroller.ClusterCacheOptions{WatchFilterValue: watchFilterValue}); err != nil {
+	clusterCache, err := managedcontroller.SetupClusterCache(ctx, mgr, managedcontroller.ClusterCacheOptions{WatchFilterValue: watchFilterValue})
+	if err != nil {
 		setupLog.Error(err, "unable to create the ClusterCache of the managed controllers")
 		os.Exit(1)
 	}
@@ -465,6 +466,20 @@ func setupManagedReconcilers(ctx context.Context, mgr ctrl.Manager, serviceEndpo
 		WatchFilterValue: watchFilterValue,
 	}).SetupWithManager(ctx, mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "IBMCloudManagedCluster")
+		os.Exit(1)
+	}
+
+	if err := (&managedcontroller.IBMCloudManagedMachinePoolReconciler{
+		Client:           mgr.GetClient(),
+		APIReader:        mgr.GetAPIReader(),
+		Recorder:         mgr.GetEventRecorderFor("ibmcloudmanagedmachinepool-controller"),
+		Resolver:         resolver,
+		ClientBuilder:    clientBuilder,
+		ClusterCache:     clusterCache,
+		Clock:            clock.RealClock{},
+		WatchFilterValue: watchFilterValue,
+	}).SetupWithManager(ctx, mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "IBMCloudManagedMachinePool")
 		os.Exit(1)
 	}
 
