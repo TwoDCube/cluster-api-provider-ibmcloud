@@ -264,14 +264,15 @@ func (f *cpFixture) patches() []string {
 	return append([]string(nil), f.statusPatches...)
 }
 
-// failIfCalledProber is a workloadprobe.Prober for the control plane steps of this release, which never probe.
+// failIfCalledProber is a workloadprobe.Prober for control plane tests whose steps must not probe a kubeconfig: before the
+// master is ready, before the endpoint is recorded, and on every error path.
 type failIfCalledProber struct {
 	t *testing.T
 }
 
 // Probe implements workloadprobe.Prober; it fails the test.
 func (p failIfCalledProber) Probe(context.Context, []byte) (workloadprobe.Result, error) {
-	p.t.Errorf("Prober.Probe called, but no control plane step of this release probes a kubeconfig")
+	p.t.Errorf("Prober.Probe called, but this control plane step must not probe a kubeconfig")
 	return workloadprobe.Result{}, errors.New("failIfCalledProber: unexpected Probe")
 }
 
@@ -697,7 +698,7 @@ func TestControlPlaneReconcileCredentials(t *testing.T) {
 		params := &managedscope.ScopeParams{
 			Client: fake.NewClientBuilder().Build(), APIReader: fake.NewClientBuilder().Build(), Recorder: record.NewFakeRecorder(1),
 			Resolver: failIfCalledResolver{t: t}, ClientBuilder: failIfCalledBuilder{t: t}, Clock: clocktesting.NewFakePassiveClock(cpTestStart),
-			VersionsCache: versions,
+			Prober: failIfCalledProber{t: t}, VersionsCache: versions,
 		}
 		persist := func(context.Context) error { t.Error("the constructor must not persist"); return nil }
 		scope, err := managedscope.NewControlPlaneScope(params, &clusterv1.Cluster{}, &controlplanev1.IBMCloudManagedControlPlane{}, persist)
@@ -1967,7 +1968,9 @@ func TestControlPlaneCreate(t *testing.T) {
 		withInitialPool(objs)
 		f := newCPFixture(t, objs)
 		// Only the observation by ID, once per reconcile: gomock fails the test on a lookup, ListVersions or CreateCluster.
-		f.kube.EXPECT().GetCluster(gomock.Any(), cpIKSClusterID, "").Return(cpCluster("normal"), nil).Times(2)
+		// The master is still deploying, so the kubeconfig step does not run; the IBM cluster exists, which is all the
+		// marker rule depends on.
+		f.kube.EXPECT().GetCluster(gomock.Any(), cpIKSClusterID, "").Return(cpCluster("deploying"), nil).Times(2)
 		_, err := f.reconcile()
 		g.Expect(err).NotTo(HaveOccurred())
 		before := f.controlPlane()

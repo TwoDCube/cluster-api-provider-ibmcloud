@@ -35,7 +35,6 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/conditions"
-	"sigs.k8s.io/cluster-api/util/secret"
 
 	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
 	infrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/v1alpha1"
@@ -87,6 +86,19 @@ type ControlPlaneScope struct {
 
 	// clients are the IBM clients of this reconcile, built by ibm on first use.
 	clients *controlPlaneClients
+
+	// endpointAsRead is spec.controlPlaneEndpoint as read from the API server. Initialization reads it rather than the
+	// in-memory object, so that controlPlaneInitialized is never persisted before the endpoint: the patch helper writes
+	// spec and status in separate requests.
+	endpointAsRead controlplanev1.APIEndpoint
+
+	// kubeconfigSecret is the <cluster>-kubeconfig Secret once loadKubeconfigSecret has read it (nil when it does not
+	// exist), and kubeconfigSecretLoaded records that read, so that the binding and the kubeconfig step share one GET.
+	kubeconfigSecret       *corev1.Secret
+	kubeconfigSecretLoaded bool
+
+	// kubeconfigRequeue is managedkubeconfig.Decide's RequeueAfter of this reconcile (KubeconfigRequeueAfter).
+	kubeconfigRequeue time.Duration
 }
 
 // PersistFunc writes the control plane's in-memory changes to the API server at once. The scope calls it before an IBM
@@ -110,15 +122,15 @@ type controlPlaneClients struct {
 // after the controller's patch helper exists.
 //
 // Parameters:
-//   - params are the shared dependencies; the scope needs Client, APIReader, Recorder, Resolver, ClientBuilder, Clock
-//     and VersionsCache.
+//   - params are the shared dependencies; the scope needs Client, APIReader, Recorder, Resolver, ClientBuilder, Clock,
+//     Prober (the kubeconfig probe and the ownership proof) and VersionsCache.
 //   - cluster is the owning CAPI Cluster.
-//   - cp is the IBMCloudManagedControlPlane being reconciled.
+//   - cp is the IBMCloudManagedControlPlane being reconciled, as read from the API server.
 //   - persist writes cp to the API server at once (PersistFunc); the controller passes its patcher.
 func NewControlPlaneScope(params *ScopeParams, cluster *clusterv1.Cluster, cp *controlplanev1.IBMCloudManagedControlPlane,
 	persist PersistFunc) (*ControlPlaneScope, error) {
 	if err := params.validate("ControlPlaneScope", depClient, depAPIReader, depRecorder, depResolver, depClientBuilder, depClock,
-		depVersionsCache); err != nil {
+		depProber, depVersionsCache); err != nil {
 		return nil, err
 	}
 	if cluster == nil {
@@ -130,7 +142,8 @@ func NewControlPlaneScope(params *ScopeParams, cluster *clusterv1.Cluster, cp *c
 	if persist == nil {
 		return nil, errors.New("managed: ControlPlaneScope needs a PersistFunc that writes the control plane before an IBM mutation, got nil")
 	}
-	return &ControlPlaneScope{params: params, Cluster: cluster, ControlPlane: cp, persist: persist}, nil
+	return &ControlPlaneScope{params: params, Cluster: cluster, ControlPlane: cp, persist: persist,
+		endpointAsRead: cp.Spec.ControlPlaneEndpoint}, nil
 }
 
 // ibm resolves the Cluster's identity with the IBMCloudManagedCluster as the holder and builds its Kubernetes Service
@@ -281,6 +294,7 @@ func (s *ControlPlaneScope) observe(ctx context.Context, decision BindingDecisio
 		s.setProvisioned(metav1.ConditionFalse, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCreatingReason,
 			fmt.Sprintf("IBM is creating %s (state %s)%s", label, c.State, cpNonCriticalNote(cp.Status.NonCriticalCreateErrorCodes)))
 		s.setAvailableWaiting()
+		s.waitForMasterKubeconfig(c)
 		return NotDone(IntervalClusterProvisioning, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCreatingReason)
 	case ClusterStateFailed:
 		return s.notProvisioned(controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCreateFailedReason,
@@ -299,7 +313,7 @@ func (s *ControlPlaneScope) observe(ctx context.Context, decision BindingDecisio
 			notes = append(notes, cpNonCriticalSentence(codes))
 		}
 		s.setProvisioned(metav1.ConditionTrue, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedReason, strings.Join(notes, "; "))
-		return s.reportMaster(c)
+		return s.reconcileAccess(ctx, c)
 	}
 }
 
@@ -307,8 +321,9 @@ func (s *ControlPlaneScope) observe(ctx context.Context, decision BindingDecisio
 // masterStatus is Ready and masterURL is set (IsMasterReady); masterHealth stays "" for minutes after that and does
 // not count, and only error or unavailable health makes it unusable again (IsMasterUnhealthy), as observed on IBM
 // Cloud. The cluster's ingress status is never consulted: IBM reports it as warning or critical without a public
-// gateway or with fewer than two workers per zone. The control plane itself becomes Available only once it is
-// initialized with a verified kubeconfig. c is the cluster GetCluster returned.
+// gateway or with fewer than two workers per zone. It covers the reconciles before the kubeconfig step (the master
+// not ready yet, the one that records the endpoint) and an unhealthy master; reportAvailable reports the rest. c is
+// the cluster GetCluster returned.
 func (s *ControlPlaneScope) reportMaster(c *kubernetesservice.Cluster) Outcome {
 	reason := controlplanev1.IBMCloudManagedControlPlaneAvailableMasterNotReadyReason
 	switch {
@@ -401,13 +416,9 @@ func (s *ControlPlaneScope) decideBinding(ctx context.Context, clients *controlP
 // selects the candidate of DecideBinding row 2, which binds only with the proof of possession. The Secret is read
 // uncached with the API reader, because the manager has no cluster-wide Secret informer. ctx is the reconcile context.
 func (s *ControlPlaneScope) kubeconfigSecretClusterID(ctx context.Context) (string, error) {
-	key := client.ObjectKey{Namespace: s.Cluster.Namespace, Name: secret.Name(s.Cluster.Name, secret.Kubeconfig)}
-	kubeconfig := &corev1.Secret{}
-	if err := s.params.APIReader.Get(ctx, key, kubeconfig); err != nil {
-		if apierrors.IsNotFound(err) {
-			return "", nil
-		}
-		return "", fmt.Errorf("reading the kubeconfig Secret %s: %w", key, err)
+	kubeconfig, err := s.loadKubeconfigSecret(ctx)
+	if err != nil || kubeconfig == nil {
+		return "", err
 	}
 	return kubeconfig.Annotations[controlplanev1.KubeconfigClusterIDAnnotation], nil
 }

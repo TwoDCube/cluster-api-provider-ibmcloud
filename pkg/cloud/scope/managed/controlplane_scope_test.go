@@ -93,6 +93,7 @@ func newCPScopeParams(builder ClientBuilder) *ScopeParams {
 		Resolver:      credentials.ControllerOnly{},
 		ClientBuilder: builder,
 		Clock:         clk,
+		Prober:        &cpTestProber{},
 		VersionsCache: versions,
 	}
 }
@@ -115,7 +116,7 @@ func TestNewControlPlaneScopeValidation(t *testing.T) {
 			wantErr: "ControlPlaneScope needs ScopeParams, got nil"},
 		{name: "every missing dependency is named", params: func() *ScopeParams { return &ScopeParams{} }, cluster: cluster, cp: cp,
 			wantErr: "ControlPlaneScope needs ScopeParams.Client, ScopeParams.APIReader, ScopeParams.Recorder, ScopeParams.Resolver, " +
-				"ScopeParams.ClientBuilder, ScopeParams.Clock, ScopeParams.VersionsCache"},
+				"ScopeParams.ClientBuilder, ScopeParams.Clock, ScopeParams.Prober, ScopeParams.VersionsCache"},
 		{name: "nil Cluster", params: func() *ScopeParams { return newCPScopeParams(&cpScopeBuilder{}) }, cp: cp,
 			wantErr: "ControlPlaneScope needs the owning Cluster"},
 		{name: "nil control plane", params: func() *ScopeParams { return newCPScopeParams(&cpScopeBuilder{}) }, cluster: cluster,
