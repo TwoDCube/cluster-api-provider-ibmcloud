@@ -33,6 +33,10 @@ This book documents Cluster API Provider IBM Cloud v0.15. For other versions ple
 
 Currently, the CAPIBM project exclusively facilitates the deployment of Kubernetes (K8s) clusters solely on two IBM infrastructure offerings, namely [IBM VPC (Virtual Server Instances)](https://cloud.ibm.com/docs/vpc?topic=vpc-about-advanced-virtual-servers) and [IBM PowerVS](https://cloud.ibm.com/docs/power-iaas?topic=power-iaas-about-power-iaas).
 
+As an **experimental** feature behind the `ManagedKubernetes` feature gate (off by default), CAPIBM can also manage
+[IBM Cloud Kubernetes Service (IKS) and Red Hat OpenShift on IBM Cloud (ROKS)](./topics/managed/index.md) clusters on
+VPC Gen2, where IBM runs the control plane.
+
 ## Quick Start
 
 Check out the [getting started](./getting-started.md) section to create your first Kubernetes cluster on IBM Cloud using Cluster API.

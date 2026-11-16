@@ -7,7 +7,9 @@ clusters.
 
 > **Note:** CAPIBM ships a single provider binary but contains **two independent infrastructure
 > providers** — [IBM Power Virtual Server (PowerVS)](#powervs-api-version-lifecycle) and
-> [IBM VPC](#vpc-api-version-lifecycle) — each with their own API version track.
+> [IBM VPC](#vpc-api-version-lifecycle) — each with their own API version track. The
+> **experimental** [managed Kubernetes (IKS and ROKS)](#managed-kubernetes-iks-and-roks-api-version-lifecycle)
+> kinds have a third, separate track.
 
 ---
 
@@ -21,11 +23,12 @@ CAPIBM follows the same support model as upstream CAPI:
   considered case-by-case by maintainers.
 - **N-3 and older** — EOL: no support.
 
-| CAPIBM Release | PowerVS API | VPC API | Status |
-|:---------------|:------------|:--------|:-------|
-| **v0.15.x** | v1beta3 | v1beta2 | ✅ N — Standard support |
-| **v0.14.x** | v1beta3 | v1beta2 | ✅ N-1 — Standard support |
-| **v0.13.x** | v1beta2 | v1beta2 | 🔧 N-2 — Maintenance mode (EOL when v0.16.0 is released) |
+| CAPIBM Release | PowerVS API | VPC API | Managed Kubernetes API | Status |
+|:---------------|:------------|:--------|:-----------------------|:-------|
+| main (unreleased) | v1beta3 | v1beta2 | v1alpha1 (experimental) | Development |
+| **v0.15.x** | v1beta3 | v1beta2 | — | ✅ N — Standard support |
+| **v0.14.x** | v1beta3 | v1beta2 | — | ✅ N-1 — Standard support |
+| **v0.13.x** | v1beta2 | v1beta2 | — | 🔧 N-2 — Maintenance mode (EOL when v0.16.0 is released) |
 
 <details>
 <summary>EOL releases (click to expand)</summary>
@@ -63,6 +66,10 @@ Both providers (PowerVS and VPC) ship in the same binary and share the same CAPI
 
 > **Current stable:** CAPIBM v0.15.x targets **CAPI v1beta2**, which corresponds to
 > CAPI releases `v1.11.x` and `v1.12.x`.
+
+> **Managed Kubernetes (experimental):** the IKS and ROKS kinds on `main` implement the same
+> v1beta2 contract and need **CAPI v1.14.1 or later**; see
+> [their API version lifecycle](#managed-kubernetes-iks-and-roks-api-version-lifecycle).
 
 See the official [Cluster API version support page][capi-versions] for CAPI's own support
 lifecycle and its Kubernetes compatibility matrix.
@@ -179,6 +186,37 @@ track, currently at v1beta2.
 
 - The current stable VPC API version is **v1beta2**.
 - `v1beta1` resources are automatically converted to `v1beta2` (the hub version) at admission.
+
+---
+
+## Managed Kubernetes (IKS and ROKS) API Version Lifecycle
+
+<aside class="note warning">
+
+<h1>Experimental</h1>
+
+The managed Kubernetes kinds are experimental: they run only with the `ManagedKubernetes` feature gate
+(`EXP_MANAGED_KUBERNETES=true`, Alpha, off by default), and their API can change between releases without a
+conversion. See [Managed Kubernetes (IKS and ROKS)](../topics/managed/index.md).
+
+</aside>
+
+The kinds `IBMCloudManagedControlPlane` (`controlplane.cluster.x-k8s.io`), `IBMCloudManagedCluster` and
+`IBMCloudManagedMachinePool` (`infrastructure.cluster.x-k8s.io`) have their own API version track.
+
+| API Version | Provider Releases | Storage | Served | Status |
+|:------------|:------------------|:--------|:-------|:-------|
+| **v1alpha1** | main | ✅ Yes (only version) | ✅ Yes | Experimental, behind the `ManagedKubernetes` feature gate |
+
+- The kinds implement the Cluster API **v1beta2** contract (`cluster.x-k8s.io/v1beta2: v1alpha1`) and need
+  **Cluster API v1.14.1 or later** (CAPIBM's ClusterCache for managed clusters relies on a fix released in v1.14.1).
+- Cluster API's `MachinePool` feature must be enabled (Beta, on by default).
+- The workload cluster versions are IBM's: the IKS Kubernetes minors and the OpenShift minors that IBM Cloud offers.
+  OpenShift 4.22 and clusters with a private-only master endpoint are not verified yet.
+- `v1alpha1` stays until IBM Cloud confirms the behaviours that `pkg/cloud/scope/managed/assumptions.go` marks as not
+  yet verified, the end-to-end tests have passed for IKS and ROKS for four consecutive weeks, one release has collected
+  user feedback, CAPIBM requires a Cluster API release that reads `status.initialization.provisioned` of machine pools,
+  and a decision on ClusterClass is taken. The promotion target is `v1beta1`, with conversion.
 
 ---
 
