@@ -1,0 +1,30 @@
+{
+  "Name": "team-a-dev-roks",
+  "ResourceGroupID": "0123456789abcdef0123456789abcdef",
+  "KubeVersion": "4.21_openshift",
+  "DisablePublicServiceEndpoint": true,
+  "PodSubnet": "172.17.64.0/18",
+  "ServiceSubnet": "172.21.0.0/16",
+  "COSInstanceCRN": "crn:v1:bluemix:public:cloud-object-storage:global:a/a1b2c3d4e5f60718293a4b5c6d7e8f90:00000000-0000-0000-0000-000000000c05::",
+  "DefaultWorkerPoolEntitlement": "",
+  "WorkerPool": {
+    "Name": "default",
+    "Flavor": "bx2.4x16",
+    "VPCID": "r010-00000000-0000-0000-0000-00000000000a",
+    "WorkerCountPerZone": 2,
+    "Zones": [
+      {
+        "Zone": "eu-de-1",
+        "SubnetID": "02b7-00000000-0000-0000-0000-000000000001"
+      },
+      {
+        "Zone": "eu-de-2",
+        "SubnetID": "02b7-00000000-0000-0000-0000-000000000002"
+      },
+      {
+        "Zone": "eu-de-3",
+        "SubnetID": "02b7-00000000-0000-0000-0000-000000000003"
+      }
+    ]
+  }
+}

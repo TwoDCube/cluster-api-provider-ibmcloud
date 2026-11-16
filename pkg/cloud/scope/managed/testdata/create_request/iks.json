@@ -1,0 +1,30 @@
+{
+  "Name": "dev-iks",
+  "ResourceGroupID": "0123456789abcdef0123456789abcdef",
+  "KubeVersion": "1.36",
+  "DisablePublicServiceEndpoint": false,
+  "PodSubnet": "",
+  "ServiceSubnet": "",
+  "COSInstanceCRN": "",
+  "DefaultWorkerPoolEntitlement": "",
+  "WorkerPool": {
+    "Name": "default",
+    "Flavor": "bx2.4x16",
+    "VPCID": "r010-00000000-0000-0000-0000-00000000000a",
+    "WorkerCountPerZone": 2,
+    "Zones": [
+      {
+        "Zone": "eu-de-1",
+        "SubnetID": "02b7-00000000-0000-0000-0000-000000000001"
+      },
+      {
+        "Zone": "eu-de-2",
+        "SubnetID": "02b7-00000000-0000-0000-0000-000000000002"
+      },
+      {
+        "Zone": "eu-de-3",
+        "SubnetID": "02b7-00000000-0000-0000-0000-000000000003"
+      }
+    ]
+  }
+}
