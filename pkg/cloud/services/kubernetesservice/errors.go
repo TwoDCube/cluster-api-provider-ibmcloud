@@ -57,6 +57,8 @@ const (
 	OpRemoveWorkerPool Operation = "RemoveWorkerPool"
 	// OpResizeWorkerPool is KubernetesService.ResizeWorkerPool.
 	OpResizeWorkerPool Operation = "ResizeWorkerPool"
+	// OpUpdateMaster is KubernetesService.UpdateMaster.
+	OpUpdateMaster Operation = "UpdateMaster"
 )
 
 // ErrorClass is what an error from KubernetesService means for a controller. Each controller decides what to do for
@@ -111,6 +113,16 @@ const (
 	// documents for autoscaled pools (for v1 operations only; not yet verified against IBM Cloud for v2). The caller
 	// reports ExternallyAutoscaled when the pool shows autoscaleEnabled, else PermissionDenied.
 	ClassAutoscaled ErrorClass = "Autoscaled"
+	// ClassMasterUpdateAlreadyRequested is a 409 on UpdateMaster ("The specified value is already set on the
+	// cluster"): a re-POST before IBM shows the update as pending. Never an error; the caller keeps polling.
+	ClassMasterUpdateAlreadyRequested ErrorClass = "MasterUpdateAlreadyRequested"
+	// ClassVersionSkipNotAllowed is a 403 on UpdateMaster ("The master is more than two versions behind the targeted
+	// version"). No retry until the spec changes. Caveat for callers: the control plane controller refuses a skip before
+	// calling and only ever requests the observed minor + 1, so CAPIBM's own requests should not provoke IBM's skip
+	// refusal, while a caller without the Kubernetes Service IAM role also gets a 403 here. Every UpdateMaster 403 is
+	// still this class until an IBM code that tells the two apart is observed on IBM Cloud; a message for it should name
+	// both causes.
+	ClassVersionSkipNotAllowed ErrorClass = "VersionSkipNotAllowed"
 )
 
 // IBM error codes Classify matches. The error bodies of most operations are not yet verified against IBM Cloud; the
@@ -227,6 +239,21 @@ func classifyOperation(op Operation, apiErr *APIError) ErrorClass {
 		return classifyCreateWorkerPool(apiErr)
 	case OpRemoveWorkerPool, OpResizeWorkerPool:
 		return classifyPoolSizeChange(apiErr)
+	case OpUpdateMaster:
+		return classifyUpdateMaster(apiErr)
+	default:
+		return ClassUnknown
+	}
+}
+
+// classifyUpdateMaster applies the UpdateMaster rows to apiErr. The live swagger documents both statuses for
+// updateMaster only, so they are matched by operation and status.
+func classifyUpdateMaster(apiErr *APIError) ErrorClass {
+	switch apiErr.StatusCode {
+	case http.StatusConflict:
+		return ClassMasterUpdateAlreadyRequested
+	case http.StatusForbidden:
+		return ClassVersionSkipNotAllowed
 	default:
 		return ClassUnknown
 	}

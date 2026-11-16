@@ -109,6 +109,11 @@ func TestClassify(t *testing.T) {
 			expected: ClassAutoscaled,
 		},
 		{name: "429 on ResizeWorkerPool", op: OpResizeWorkerPool, err: apiError(OpResizeWorkerPool, http.StatusTooManyRequests, ""), expected: ClassRateLimited},
+
+		{name: "UpdateMaster 409 is MasterUpdateAlreadyRequested", op: OpUpdateMaster, err: apiError(OpUpdateMaster, http.StatusConflict, ""), expected: ClassMasterUpdateAlreadyRequested},
+		{name: "UpdateMaster 403 is VersionSkipNotAllowed", op: OpUpdateMaster, err: apiError(OpUpdateMaster, http.StatusForbidden, ""), expected: ClassVersionSkipNotAllowed},
+		{name: "UpdateMaster 404 is NotFound", op: OpUpdateMaster, err: apiError(OpUpdateMaster, http.StatusNotFound, ""), expected: ClassNotFound},
+		{name: "409 on CreateCluster is not MasterUpdateAlreadyRequested", op: OpCreateCluster, err: apiError(OpCreateCluster, http.StatusConflict, ""), expected: ClassUnknown},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {

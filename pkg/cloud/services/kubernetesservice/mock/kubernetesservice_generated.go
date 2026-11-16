@@ -231,3 +231,17 @@ func (mr *MockKubernetesServiceMockRecorder) ResizeWorkerPool(ctx, clusterID, po
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ResizeWorkerPool", reflect.TypeOf((*MockKubernetesService)(nil).ResizeWorkerPool), ctx, clusterID, poolID, sizePerZone)
 }
+
+// UpdateMaster mocks base method.
+func (m *MockKubernetesService) UpdateMaster(ctx context.Context, clusterID, version string) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "UpdateMaster", ctx, clusterID, version)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// UpdateMaster indicates an expected call of UpdateMaster.
+func (mr *MockKubernetesServiceMockRecorder) UpdateMaster(ctx, clusterID, version any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateMaster", reflect.TypeOf((*MockKubernetesService)(nil).UpdateMaster), ctx, clusterID, version)
+}

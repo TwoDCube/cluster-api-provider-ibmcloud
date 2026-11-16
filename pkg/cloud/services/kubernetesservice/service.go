@@ -203,6 +203,26 @@ func (s *Service) DeleteCluster(ctx context.Context, clusterID, resourceGroupID 
 	return nil
 }
 
+// UpdateMaster implements KubernetesService.
+func (s *Service) UpdateMaster(ctx context.Context, clusterID, version string) error {
+	switch {
+	case clusterID == "":
+		return invalidRequest(OpUpdateMaster, "the cluster ID is empty; pass status.clusterID of the IBMCloudManagedControlPlane")
+	case version == "":
+		return invalidRequest(OpUpdateMaster, `the version is empty; pass a minor such as "1.37" or "4.22_openshift"`)
+	}
+	ctx, tracker := trackCall(ctx)
+	response, err := s.sdk.V2UpdateMasterWithContext(ctx, &kubernetesserviceapiv1.V2UpdateMasterOptions{
+		Cluster: core.StringPtr(clusterID),
+		Version: core.StringPtr(version),
+		// Force stays nil: it would skip IBM's own update checks, which CAPIBM relies on.
+	})
+	if err != nil {
+		return callError(OpUpdateMaster, tracker, response, err)
+	}
+	return nil
+}
+
 // ListVersions implements KubernetesService.
 func (s *Service) ListVersions(ctx context.Context) (*Versions, error) {
 	ctx, tracker := trackCall(ctx)

@@ -75,6 +75,13 @@ func limiterCalls(t *testing.T) []limiterCall {
 			},
 		},
 		{
+			name:   "UpdateMaster",
+			answer: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) },
+			call: func(ctx context.Context, s *Service) error {
+				return s.UpdateMaster(ctx, testIKSClusterID, "1.37")
+			},
+		},
+		{
 			// The compat path that bypasses BaseService.Request still waits on the limiter.
 			name:   "GetAdminKubeconfig",
 			answer: reply(http.StatusOK, synthesizeKubeconfig(t, "iks-kubeconfig-shape.json", newTestCredentials(t), kubeconfigOptions{})),

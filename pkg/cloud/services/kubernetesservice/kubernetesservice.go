@@ -40,6 +40,11 @@ type KubernetesService interface {
 	// report 404 about 5 minutes later. resourceGroupID ("" = none) is sent as X-Auth-Resource-Group. SDK
 	// RemoveClusterWithContext (DELETE /v1/clusters/{idOrName}).
 	DeleteCluster(ctx context.Context, clusterID, resourceGroupID string) error
+	// UpdateMaster requests a master minor update to version ("1.37", "4.22_openshift"; that IBM accepts a minor without
+	// a patch here is not yet verified against IBM Cloud); force is never set, so IBM's own checks stay in force. IBM
+	// answers 409 when the version is already requested and 403 for a skip of more than two versions. SDK
+	// V2UpdateMasterWithContext (POST /v2/updateMaster).
+	UpdateMaster(ctx context.Context, clusterID, version string) error
 	// ListVersions returns the offered Kubernetes and OpenShift versions. SDK GetVersionsWithContext
 	// (GET /v1/versions; the SDK's V2GetVersions decodes the wrong shape).
 	ListVersions(ctx context.Context) (*Versions, error)

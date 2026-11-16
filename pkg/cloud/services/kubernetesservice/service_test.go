@@ -1089,3 +1089,66 @@ func TestResizeWorkerPool(t *testing.T) {
 		})
 	}
 }
+
+func TestUpdateMaster(t *testing.T) {
+	noContent := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }
+
+	for _, version := range []string{"1.37", "4.22_openshift"} {
+		t.Run("posts {cluster, version} without force: "+version, func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeIKS(t, servePath("/global/v2/updateMaster", http.StatusNoContent, nil))
+			service, _ := newTestService(t, fake)
+			g.Expect(service.UpdateMaster(context.Background(), testIKSClusterID, version)).To(Succeed())
+			request := fake.last(t)
+			g.Expect(request.Method).To(Equal(http.MethodPost))
+			g.Expect(request.Header.Get("Authorization")).To(Equal("Bearer " + testToken))
+			g.Expect(string(request.Body)).To(MatchJSON(fmt.Sprintf(`{"cluster": %q, "version": %q}`, testIKSClusterID, version)))
+		})
+	}
+
+	// The statuses the live swagger documents for updateMaster only.
+	errorCases := []struct {
+		name     string
+		status   int
+		body     []byte
+		expected ErrorClass
+	}{
+		{name: "updateMaster 409 is MasterUpdateAlreadyRequested", status: http.StatusConflict, body: []byte(`{"description":"The specified value is already set on the cluster."}`), expected: ClassMasterUpdateAlreadyRequested},
+		{name: "updateMaster 403 is VersionSkipNotAllowed", status: http.StatusForbidden, body: []byte(`{"description":"The master is more than two versions behind the targeted version."}`), expected: ClassVersionSkipNotAllowed},
+		{name: "404 is NotFound", status: http.StatusNotFound, body: nil, expected: ClassNotFound},
+		{name: "401 is Unauthorized", status: http.StatusUnauthorized, body: nil, expected: ClassUnauthorized},
+		{name: "500 is Transient and sent once", status: http.StatusInternalServerError, body: nil, expected: ClassTransient},
+	}
+	for _, tc := range errorCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeIKS(t, reply(tc.status, tc.body))
+			service, _ := newTestService(t, fake)
+			err := service.UpdateMaster(context.Background(), testIKSClusterID, "1.37")
+			g.Expect(Classify(OpUpdateMaster, err)).To(Equal(tc.expected))
+			g.Expect(fake.received()).To(HaveLen(1))
+		})
+	}
+
+	refused := []struct {
+		name      string
+		clusterID string
+		version   string
+		message   string
+	}{
+		{name: "empty cluster ID", clusterID: "", version: "1.37", message: "UpdateMaster: the cluster ID is empty"},
+		{name: "empty version", clusterID: testIKSClusterID, version: "", message: `UpdateMaster: the version is empty; pass a minor such as "1.37"`},
+	}
+	for _, tc := range refused {
+		t.Run("refused before sending: "+tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeIKS(t, noContent)
+			service, limiter := newTestService(t, fake)
+			err := service.UpdateMaster(context.Background(), tc.clusterID, tc.version)
+			g.Expect(err).To(MatchError(ErrInvalidRequest))
+			g.Expect(err.Error()).To(ContainSubstring(tc.message))
+			g.Expect(fake.received()).To(BeEmpty())
+			g.Expect(limiter.count()).To(BeZero())
+		})
+	}
+}
