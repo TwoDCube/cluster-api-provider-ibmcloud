@@ -20,8 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -30,6 +32,7 @@ import (
 	"github.com/IBM-Cloud/container-services-go-sdk/kubernetesserviceapiv1"
 	"github.com/IBM/go-sdk-core/v5/core"
 	"github.com/IBM/platform-services-go-sdk/resourcemanagerv2"
+	"github.com/IBM/vpc-go-sdk/vpcv1"
 
 	"k8s.io/apimachinery/pkg/types"
 	clocktesting "k8s.io/utils/clock/testing"
@@ -163,9 +166,10 @@ func TestNewProdClientBuilderValidation(t *testing.T) {
 	limiter := &countingLimiter{}
 
 	testCases := []struct {
-		name    string
-		mutate  func(*ProdClientBuilderOptions)
-		wantErr []string
+		name     string
+		mutate   func(*ProdClientBuilderOptions)
+		wantErr  []string
+		notInErr []string // substrings the error must not contain (secrets)
 	}{
 		{name: "valid options without endpoints", mutate: func(*ProdClientBuilderOptions) {}},
 		{
@@ -226,6 +230,54 @@ func TestNewProdClientBuilderValidation(t *testing.T) {
 			wantErr: []string{"us-south:rm=https:///v2 is not an absolute https URL"},
 		},
 		{
+			// The flag parser admits it; the constructor would reject it only at the first reconcile.
+			name: "rm endpoint with a query is named at start-up without the query",
+			mutate: func(o *ProdClientBuilderOptions) {
+				o.ServiceEndpoints = []endpoints.ServiceEndpoint{{ID: "rm", Region: testRegion, URL: "https://private.resource-controller.cloud.ibm.com?fake-query-token"}}
+			},
+			wantErr:  []string{"us-south:rm=https://private.resource-controller.cloud.ibm.com is not an absolute https URL without user information, query or fragment"},
+			notInErr: []string{"fake-query-token"},
+		},
+		{
+			name: "containers endpoint with an empty query is named",
+			mutate: func(o *ProdClientBuilderOptions) {
+				o.ServiceEndpoints = []endpoints.ServiceEndpoint{{ID: "containers", Region: "eu-de", URL: "https://private.eu-de.containers.cloud.ibm.com/global?"}}
+			},
+			wantErr: []string{"eu-de:containers=https://private.eu-de.containers.cloud.ibm.com/global is not an absolute https URL"},
+		},
+		{
+			name: "vpc endpoint with a fragment is named without the fragment",
+			mutate: func(o *ProdClientBuilderOptions) {
+				o.ServiceEndpoints = []endpoints.ServiceEndpoint{{ID: "vpc", Region: testRegion, URL: "https://us-south.private.iaas.cloud.ibm.com/v1#fake-fragment-token"}}
+			},
+			wantErr:  []string{"us-south:vpc=https://us-south.private.iaas.cloud.ibm.com/v1 is not an absolute https URL"},
+			notInErr: []string{"fake-fragment-token"},
+		},
+		{
+			// A bare "#" leaves no trace in the parsed URL but still swallows the operation path.
+			name: "vpc endpoint with an empty fragment is named",
+			mutate: func(o *ProdClientBuilderOptions) {
+				o.ServiceEndpoints = []endpoints.ServiceEndpoint{{ID: "vpc", Region: testRegion, URL: "https://us-south.private.iaas.cloud.ibm.com/v1#"}}
+			},
+			wantErr: []string{"us-south:vpc=https://us-south.private.iaas.cloud.ibm.com/v1 is not an absolute https URL"},
+		},
+		{
+			name: "plain-http endpoint with a query prints neither the query nor the password",
+			mutate: func(o *ProdClientBuilderOptions) {
+				o.ServiceEndpoints = []endpoints.ServiceEndpoint{{ID: "rm", Region: testRegion, URL: "http://user:secret@private.resource-controller.cloud.ibm.com/?apikey=fake-query-key"}} //nolint:gosec // synthetic test value, never a credential
+			},
+			wantErr:  []string{"us-south:rm=http://user:xxxxx@private.resource-controller.cloud.ibm.com/ is not an absolute https URL"},
+			notInErr: []string{"secret", "apikey", "fake-query-key"},
+		},
+		{
+			name: "unparsable endpoint is named without its text",
+			mutate: func(o *ProdClientBuilderOptions) {
+				o.ServiceEndpoints = []endpoints.ServiceEndpoint{{ID: "vpc", Region: testRegion, URL: "https://user:secret@us-south.iaas.cloud.ibm.com:port/v1"}}
+			},
+			wantErr:  []string{"--service-endpoint entry us-south:vpc is not a valid URL", "invalid port"},
+			notInErr: []string{"secret"},
+		},
+		{
 			name: "endpoints of other services are not this builder's concern",
 			mutate: func(o *ProdClientBuilderOptions) {
 				o.ServiceEndpoints = []endpoints.ServiceEndpoint{{ID: "powervs", Region: testRegion, URL: "http://example.com"}}
@@ -255,6 +307,9 @@ func TestNewProdClientBuilderValidation(t *testing.T) {
 			g.Expect(builder).To(BeNil())
 			for _, want := range tc.wantErr {
 				g.Expect(err.Error()).To(ContainSubstring(want))
+			}
+			for _, secret := range tc.notInErr {
+				g.Expect(err.Error()).NotTo(ContainSubstring(secret))
 			}
 		})
 	}
@@ -608,4 +663,205 @@ func TestNewAuthenticatorWrapsFactoryErrors(t *testing.T) {
 	factory.failures = []error{errors.New("credentials file is unreadable")}
 	_, err := builder.VPC(context.Background(), controllerIdentity(), testRegion)
 	g.Expect(err).To(MatchError(ContainSubstring("building the authenticator of the CAPIBM controller identity: credentials file is unreadable")))
+}
+
+// blackholeAddress starts a TCP listener that accepts connections and never reads or writes on them, like an IBM Cloud
+// endpoint whose response never arrives, and returns its host:port. A plain-HTTP request to it is sent and then waits
+// for response headers; an https request waits in the TLS handshake. The test's cleanup closes the listener and every
+// accepted connection.
+func blackholeAddress(t *testing.T) string {
+	t.Helper()
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening on a loopback port: %v", err)
+	}
+	var conns []net.Conn
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return // the cleanup closed the listener
+			}
+			conns = append(conns, conn)
+		}
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		// Reading conns after the accept loop has ended needs no lock: closing acceptDone orders the two.
+		<-acceptDone
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	})
+	return listener.Addr().String()
+}
+
+// TestProdClientBuilderHTTPTimeoutBoundsEveryClient proves that HTTPTimeout reaches every client the builder returns:
+// against an endpoint that accepts connections and never answers, a call of the IKS, the VPC and the Resource Manager
+// client of one identity fails soon after the timeout instead of blocking the single-worker IBMCloudManagedCluster
+// controller for good.
+func TestProdClientBuilderHTTPTimeoutBoundsEveryClient(t *testing.T) {
+	const timeout = 100 * time.Millisecond
+	// margin is generous, so that a loaded machine or the race detector cannot fail the test, and still below the 10 s
+	// TLS handshake timeout of go-sdk-core's transport, which would otherwise end the https calls: only HTTPTimeout ends
+	// them this early. Without HTTPTimeout the plain-HTTP Resource Manager call would not end at all.
+	const margin = 5 * time.Second
+	address := blackholeAddress(t)
+
+	g := NewWithT(t)
+	clk := clocktesting.NewFakeClock(time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC))
+	opts := validBuilderOptions(clk, &countingSource{prefix: "controller"}, &countingLimiter{})
+	opts.HTTPTimeout = timeout
+	opts.ServiceEndpoints = []endpoints.ServiceEndpoint{
+		{ID: string(endpoints.Containers), Region: testRegion, URL: "https://" + address + "/global"},
+		{ID: string(endpoints.VPC), Region: testRegion, URL: "https://" + address + "/v1"},
+	}
+	builder, err := NewProdClientBuilder(opts)
+	g.Expect(err).NotTo(HaveOccurred())
+	// Resource Manager goes over plain HTTP, so its request is sent and only the response is missing, the hang the
+	// timeout exists for; the IKS and VPC requests wait in the TLS handshake that the endpoint never answers.
+	builder.resourceManagerURL = "http://" + address
+	ctx := context.Background()
+	id := controllerIdentity()
+
+	testCases := []struct {
+		name string
+		// call builds the client of id with builder and sends one request.
+		call func() error
+		// wantErr is a substring of the error; "" for the IKS client, which reports transport errors in its own words.
+		wantErr string
+	}{
+		{
+			name: "IKS client",
+			call: func() error {
+				client, err := builder.KubernetesService(ctx, id, testRegion)
+				if err != nil {
+					return fmt.Errorf("building the client: %w", err)
+				}
+				_, err = client.ListVersions(ctx)
+				return err
+			},
+		},
+		{
+			name: "VPC client",
+			call: func() error {
+				client, err := builder.VPC(ctx, id, testRegion)
+				if err != nil {
+					return fmt.Errorf("building the client: %w", err)
+				}
+				_, _, err = client.GetVPC(&vpcv1.GetVPCOptions{ID: core.StringPtr("r006-00000000-0000-0000-0000-000000000000")})
+				return err
+			},
+			wantErr: "Client.Timeout exceeded",
+		},
+		{
+			name: "Resource Manager client",
+			call: func() error {
+				client, err := builder.ResourceManager(ctx, id)
+				if err != nil {
+					return fmt.Errorf("building the client: %w", err)
+				}
+				return getResourceGroup(client)
+			},
+			wantErr: "Client.Timeout exceeded",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			start := time.Now()
+			err := tc.call()
+			elapsed := time.Since(start)
+
+			g.Expect(err).To(HaveOccurred())
+			g.Expect(err.Error()).NotTo(ContainSubstring("building the client"))
+			g.Expect(err.Error()).To(ContainSubstring(tc.wantErr))
+			g.Expect(elapsed).To(BeNumerically(">=", timeout))
+			g.Expect(elapsed).To(BeNumerically("<", timeout+margin))
+		})
+	}
+}
+
+// TestNewResourceManager covers the managed path's own guard in front of the Resource Manager constructor: nil is
+// refused here, whatever the constructor does, and the constructor's own validation still applies.
+func TestNewResourceManager(t *testing.T) {
+	validAuth := &core.BearerTokenAuthenticator{BearerToken: "test-token"}
+
+	testCases := []struct {
+		name       string
+		auth       core.Authenticator
+		serviceURL string
+		timeout    time.Duration
+		wantErr    string // "" means success
+	}{
+		{name: "valid arguments", auth: validAuth, serviceURL: resourcemanagerv2.DefaultServiceURL, timeout: 30 * time.Second},
+		{name: "nil authenticator is refused first", auth: nil, serviceURL: resourcemanagerv2.DefaultServiceURL, timeout: 0, wantErr: "refusing the environment fallback"},
+		{name: "typed nil authenticator is refused", auth: (*core.IamAuthenticator)(nil), serviceURL: resourcemanagerv2.DefaultServiceURL, timeout: time.Second, wantErr: "refusing the environment fallback"},
+		{name: "the constructor rejects a zero timeout", auth: validAuth, serviceURL: resourcemanagerv2.DefaultServiceURL, timeout: 0, wantErr: "resource manager client request timeout is 0s"},
+		{
+			// validateBuilderEndpoint rejects such an entry at start-up; the constructor is the second line.
+			name:       "the constructor rejects a URL with a query",
+			auth:       validAuth,
+			serviceURL: resourcemanagerv2.DefaultServiceURL + "?debug",
+			timeout:    time.Second,
+			wantErr:    "resource manager service URL must end at the path",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			client, err := newResourceManager(tc.auth, tc.serviceURL, tc.timeout)
+			if tc.wantErr != "" {
+				g.Expect(err).To(MatchError(ContainSubstring(tc.wantErr)))
+				g.Expect(client).To(BeNil())
+				return
+			}
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(client).NotTo(BeNil())
+		})
+	}
+}
+
+// TestPrintableURL covers the form in which errors print a rejected endpoint URL: no password, query or fragment.
+func TestPrintableURL(t *testing.T) {
+	testCases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "URL without anything to drop is unchanged",
+			input: resourcemanagerv2.DefaultServiceURL,
+			want:  resourcemanagerv2.DefaultServiceURL,
+		},
+		{
+			name:  "query and fragment are dropped",
+			input: "https://us-south.iaas.cloud.ibm.com/v1?apikey=fake-query-key#fake-fragment",
+			want:  "https://us-south.iaas.cloud.ibm.com/v1",
+		},
+		{
+			name:  "empty query and empty fragment are dropped",
+			input: "https://us-south.iaas.cloud.ibm.com/v1?#",
+			want:  "https://us-south.iaas.cloud.ibm.com/v1",
+		},
+		{ //nolint:gosec // G101: "hunter2" is a fake password; the case proves it is redacted.
+			name:  "password is redacted and the user name kept",
+			input: "https://user:hunter2@us-south.iaas.cloud.ibm.com/v1?apikey=fake-query-key",
+			want:  "https://user:xxxxx@us-south.iaas.cloud.ibm.com/v1",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			parsed, err := url.Parse(tc.input)
+			g.Expect(err).ToNot(HaveOccurred())
+			before := *parsed
+
+			g.Expect(printableURL(parsed)).To(Equal(tc.want))
+			g.Expect(*parsed).To(Equal(before), "printableURL must not modify its argument")
+		})
+	}
 }

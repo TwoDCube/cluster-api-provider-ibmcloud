@@ -17,8 +17,12 @@ limitations under the License.
 package resourcemanager
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
+	"time"
 
 	"github.com/IBM/go-sdk-core/v5/core"
 	"github.com/IBM/platform-services-go-sdk/resourcemanagerv2"
@@ -32,7 +36,9 @@ type Service struct {
 	client *resourcemanagerv2.ResourceManagerV2
 }
 
-// NewService returns a new service for the resource manager.
+// NewService returns a new service for the resource manager. When options.Authenticator is nil it builds one from the
+// environment (IBM_CREDENTIALS_FILE, IBMCLOUD_*), which the existing VPC and PowerVS callers rely on; the managed
+// Kubernetes controllers use NewServiceWithAuthenticatorAndTimeout, which never does.
 func NewService(options *resourcemanagerv2.ResourceManagerV2Options) (ResourceManager, error) {
 	if options == nil {
 		options = &resourcemanagerv2.ResourceManagerV2Options{}
@@ -51,6 +57,123 @@ func NewService(options *resourcemanagerv2.ResourceManagerV2Options) (ResourceMa
 	return &Service{
 		client: rmClient,
 	}, nil
+}
+
+// serviceURLForm names the URL form NewServiceWithAuthenticatorAndTimeout accepts; every URL error repeats it so that
+// the operator sees the expected value next to the rejected one.
+const serviceURLForm = "an absolute URL of the Resource Manager API, for example " + resourcemanagerv2.DefaultServiceURL +
+	" (the default, or the rm entry of --service-endpoint)"
+
+// NewServiceWithAuthenticatorAndTimeout returns a Resource Manager Service that sends every request to serviceURL,
+// authenticated by auth, and aborts each request, from dialing to reading the whole response body, after timeout. The
+// managed Kubernetes controllers use it.
+//
+// Unlike NewService it never reads credentials from the environment: NewService builds an authenticator from
+// IBM_CREDENTIALS_FILE or IBMCLOUD_* variables when it gets none, so a caller that lost its credentials would silently
+// act as whatever identity the environment holds. Here a nil authenticator is an error, because the managed Kubernetes
+// controllers must act only as the identity they resolved for the Cluster.
+//
+// Why a timeout: go-sdk-core's default HTTP client (core.DefaultHTTPClient, go-sdk-core v5.25.3
+// base_service.go:782-786) has neither an overall Client.Timeout nor a ResponseHeaderTimeout, and the Resource Manager
+// SDK methods take no context. Without a timeout, one response that never arrives blocks the caller for good; for the
+// managed controllers that caller is the IBMCloudManagedCluster controller, which runs a single worker, so every
+// IBMCloudManagedCluster of the manager would stall. The HTTP client is a fresh core.DefaultHTTPClient() with Timeout
+// set, installed with BaseService.SetHTTPClient (base_service.go:244-256), so go-sdk-core's pooled transport and its
+// minimum TLS version 1.2 stay as they are. SDK retries stay off, as go-sdk-core leaves them, so timeout bounds the
+// whole call.
+//
+// Parameters:
+//   - serviceURL is the Resource Manager API URL, for example resourcemanagerv2.DefaultServiceURL or the rm entry of
+//     --service-endpoint. It must be an absolute http or https URL with a host and without user information. The scheme
+//     is the caller's policy, as for NewService: the managed client builder admits only https --service-endpoint
+//     entries, because every request carries a bearer token, and its tests send Resource Manager requests to plain-HTTP
+//     test servers. It must also end at the path, without a query or fragment, because go-sdk-core appends each
+//     operation path (for example /v2/resource_groups/{id}) to it.
+//   - auth authenticates every request. It must not be nil, including a typed nil such as
+//     (*core.IamAuthenticator)(nil): there is deliberately no fallback to the environment.
+//   - timeout bounds each request (http.Client.Timeout) and must be positive. The managed client builder passes
+//     ProdClientBuilderOptions.HTTPTimeout.
+//
+// It makes no network call; go-sdk-core validates auth (for example that an IAM authenticator has an API key) but
+// fetches the first token only on the first request.
+func NewServiceWithAuthenticatorAndTimeout(serviceURL string, auth core.Authenticator, timeout time.Duration) (ResourceManager, error) {
+	if timeout <= 0 {
+		return nil, fmt.Errorf("resource manager client request timeout is %s: pass a positive duration, for example 30s, "+
+			"so that a Resource Manager response that never arrives cannot block the caller", timeout)
+	}
+	// core.IsNil also catches a typed nil inside the interface, which a plain auth == nil check would let through.
+	if core.IsNil(auth) {
+		return nil, errors.New("resource manager client authenticator is nil: pass the authenticator of the IBM Cloud " +
+			"credentials the client acts as (a Resource Manager client built with an explicit authenticator never reads " +
+			"credentials from the environment)")
+	}
+	if err := validateServiceURL(serviceURL); err != nil {
+		return nil, err
+	}
+
+	rmClient, err := resourcemanagerv2.NewResourceManagerV2(&resourcemanagerv2.ResourceManagerV2Options{
+		Authenticator: auth,
+		URL:           serviceURL,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creating the Resource Manager client for %s: %w", serviceURL, err)
+	}
+	// A new client per service: setting Timeout on a shared client would change every other client that uses it.
+	httpClient := core.DefaultHTTPClient()
+	httpClient.Timeout = timeout
+	rmClient.Service.SetHTTPClient(httpClient)
+	return &Service{client: rmClient}, nil
+}
+
+// validateServiceURL returns an error unless serviceURL is an absolute http or https URL with a host and without user
+// information, query or fragment. An empty URL is an error rather than the SDK's default, so that every caller states
+// the endpoint it uses. The messages print the URL only in the form printableURL returns, so neither a password nor a
+// query or fragment typed into it reaches a log or a condition.
+func validateServiceURL(serviceURL string) error {
+	if serviceURL == "" {
+		return fmt.Errorf("resource manager service URL is empty: pass %s", serviceURLForm)
+	}
+	parsed, err := url.Parse(serviceURL)
+	if err != nil {
+		// url.Parse returns a *url.Error whose text quotes the raw input, which may hold a password; only the reason it
+		// wraps is printed.
+		return fmt.Errorf("resource manager service URL is not a valid URL (%v): pass %s", errors.Unwrap(err), serviceURLForm)
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("resource manager service URL %q must not contain user information (credentials come only from the authenticator): pass %s",
+			printableURL(parsed), serviceURLForm)
+	}
+	// url.Parse lower-cases the scheme; an opaque URL such as "https:host" has no Host.
+	if (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+		return fmt.Errorf("resource manager service URL %q is not %s", printableURL(parsed), serviceURLForm)
+	}
+	// go-sdk-core builds each request URL by appending the operation path to the service URL string (go-sdk-core
+	// v5.25.3, core/request_builder.go, ResolveRequestURL), so with "https://host?debug" a GetResourceGroup call would
+	// send GET / with the query "debug/v2/resource_groups/<id>", and a fragment would swallow the path the same way.
+	// Such a URL fails only later, as a confusing 404, so it is rejected here, by the rule of the VPC client
+	// (pkg/cloud/services/vpc). A bare trailing "#" leaves no trace in the parsed URL, which is why the raw string is
+	// checked; url.Parse cuts the fragment at the first "#", so any "#" in it starts a fragment.
+	if parsed.RawQuery != "" || parsed.ForceQuery || strings.Contains(serviceURL, "#") {
+		return fmt.Errorf("resource manager service URL must end at the path: remove the query (?...) or fragment (#...) "+
+			"after %q, because the client appends each operation path (for example /v2/resource_groups) to the URL; pass %s",
+			printableURL(parsed), serviceURLForm)
+	}
+	return nil
+}
+
+// printableURL returns the form of a rejected service URL that errors print: the password replaced by "xxxxx"
+// (url.URL.Redacted) and the query and fragment dropped, because both are arbitrary text that may carry a token. The
+// scheme, user name, host and path stay, so the operator still recognizes the value that was rejected.
+//
+// Parameters:
+//   - parsed is the URL as url.Parse returned it; it is not modified.
+func printableURL(parsed *url.URL) string {
+	shown := *parsed
+	shown.RawQuery = ""
+	shown.ForceQuery = false
+	shown.Fragment = ""
+	shown.RawFragment = ""
+	return shown.Redacted()
 }
 
 // GetResourceGroup returns a Resource Group.

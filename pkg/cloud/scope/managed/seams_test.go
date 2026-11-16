@@ -295,12 +295,12 @@ func TestClientBuilderSeams(t *testing.T) {
 		g.Expect(err).To(HaveOccurred())
 		g.Expect(vpcClient).To(BeNil())
 
-		// newResourceManager refuses nil before resourcemanager.NewService, which would build an authenticator from the
-		// environment above and succeed.
-		rm, err = newResourceManager(nil, "https://resource-controller.cloud.ibm.com")
+		// newResourceManager refuses nil itself, before any constructor runs; resourcemanager.NewService would build an
+		// authenticator from the environment above and succeed.
+		rm, err = newResourceManager(nil, "https://resource-controller.cloud.ibm.com", time.Second)
 		g.Expect(err).To(MatchError(ContainSubstring("refusing the environment fallback")))
 		g.Expect(rm).To(BeNil())
-		rm, err = newResourceManager((*core.BearerTokenAuthenticator)(nil), "https://resource-controller.cloud.ibm.com")
+		rm, err = newResourceManager((*core.BearerTokenAuthenticator)(nil), "https://resource-controller.cloud.ibm.com", time.Second)
 		g.Expect(err).To(MatchError(ContainSubstring("refusing the environment fallback")))
 		g.Expect(rm).To(BeNil())
 

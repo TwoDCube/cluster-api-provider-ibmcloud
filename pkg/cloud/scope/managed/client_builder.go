@@ -43,7 +43,9 @@ import (
 // credentials.Identity, so that a later per-Cluster identity is a new value, not a new parameter. ProdClientBuilder
 // caches one authenticator per identity key and installs a small delegating authenticator in every client it returns,
 // so a rebuilt authenticator (after an hour, a new Version or an IBM 401) reaches clients that already exist. Every IKS
-// client waits on the one process-wide limiter, because IBM limits the request rate per source IP, not per identity.
+// client waits on the one process-wide limiter, because IBM limits the request rate per source IP, not per identity,
+// and every request of every client is bounded by HTTPTimeout, so that an IBM response that never arrives cannot stall
+// a controller.
 
 // ClientBuilder builds IBM Cloud clients for the managed controllers, always for one resolved identity. Adding a
 // second identity later adds a value of credentials.Identity, never a parameter. Tests inject a stub that returns
@@ -53,9 +55,12 @@ type ClientBuilder interface {
 	// --service-endpoint entry "<region>:containers=..." when present, else the global URL. Clients are cached per
 	// (identity, service, URL) and share the one process-wide limiter.
 	KubernetesService(ctx context.Context, id credentials.Identity, region string) (kubernetesservice.KubernetesService, error)
-	// VPC returns the VPC client of identity id for region (vpc.NewServiceWithAuthenticator).
+	// VPC returns the VPC client of identity id for region (vpc.NewServiceWithAuthenticatorAndTimeout: explicit
+	// authenticator, every request bounded by the request timeout).
 	VPC(ctx context.Context, id credentials.Identity, region string) (vpc.Vpc, error)
-	// ResourceManager returns the Resource Manager client of identity id (only GetResourceGroup by ID is used).
+	// ResourceManager returns the Resource Manager client of identity id (only GetResourceGroup by ID is used), built
+	// with resourcemanager.NewServiceWithAuthenticatorAndTimeout: explicit authenticator, every request bounded by the
+	// request timeout.
 	ResourceManager(ctx context.Context, id credentials.Identity) (resourcemanager.ResourceManager, error)
 	// InvalidateAuthenticator drops the cached authenticator of one identity after an IBM 401 for that identity. The
 	// next request of any of its clients builds a new one; other identities are untouched.
@@ -80,14 +85,12 @@ type ProdClientBuilderOptions struct {
 	ServiceEndpoints []endpoints.ServiceEndpoint
 	// Limiter is the one process-wide limiter of IKS requests (--containers-api-qps, --containers-api-burst).
 	Limiter kubernetesservice.RequestLimiter
-	// HTTPTimeout bounds each IKS request, including the limiter wait; > 0.
-	//
-	// Known gap: VPC and Resource Manager requests have no such bound yet. vpc.NewServiceWithAuthenticator and
-	// resourcemanager.NewService accept no HTTP client or timeout, go-sdk-core's default client has neither an overall
-	// nor a response-header timeout, and the methods of both clients take no context. One response that never arrives
-	// therefore blocks the IBMCloudManagedCluster controller, which runs a single worker, for every
-	// IBMCloudManagedCluster of the manager. Closing the gap needs a timeout on both constructors, set from HTTPTimeout
-	// here.
+	// HTTPTimeout bounds each request of every client the builder returns; > 0. For IKS clients it includes the limiter
+	// wait (kubernetesservice.ServiceOptions.HTTPTimeout); VPC and Resource Manager clients get it as their
+	// http.Client.Timeout. Without it one IBM response that never arrives would block the caller for good:
+	// go-sdk-core's default client has neither an overall nor a response-header timeout, and the VPC and Resource
+	// Manager methods take no context, so the IBMCloudManagedCluster controller, which runs a single worker, would
+	// stall for every IBMCloudManagedCluster of the manager.
 	HTTPTimeout time.Duration
 	// UserAgent is sent on every IKS request, for example "cluster-api-provider-ibmcloud/<version>"; one line.
 	UserAgent string
@@ -143,8 +146,8 @@ type clientKey struct {
 // authenticator: the first client of an identity does.
 //
 // Parameters:
-//   - opts are the endpoints, the limiter, the IKS timeout and User-Agent, the clock and the controller-identity
-//     factory; see ProdClientBuilderOptions.
+//   - opts are the endpoints, the limiter, the request timeout of every client, the IKS User-Agent, the clock and the
+//     controller-identity factory; see ProdClientBuilderOptions.
 func NewProdClientBuilder(opts ProdClientBuilderOptions) (*ProdClientBuilder, error) {
 	if err := opts.validate(); err != nil {
 		return nil, err
@@ -193,8 +196,17 @@ func (o ProdClientBuilderOptions) validate() error {
 const httpsScheme = "https"
 
 // validateBuilderEndpoint rejects a --service-endpoint entry of a service this builder uses (containers, vpc, rm)
-// unless it is an absolute https URL. Entries of other services are not this builder's concern. endpoint is one parsed
-// entry of the flag.
+// unless it is an absolute https URL without user information, query or fragment. Entries of other services are not
+// this builder's concern.
+//
+// The query and fragment are rejected here, at start-up, because go-sdk-core appends each operation path to the
+// service URL string (go-sdk-core v5.25.3, core/request_builder.go, ResolveRequestURL): with a query or fragment every
+// request would go to the wrong path. The client constructors reject such a URL as well, but only when the first
+// client is built, during a reconcile; the flag parser (url.ParseRequestURI) admits it. Rejecting it here also keeps
+// every URL the builder later prints in an error (cachedClient) free of a query that may carry a token.
+//
+// Parameters:
+//   - endpoint is one parsed entry of the --service-endpoint flag.
 func validateBuilderEndpoint(endpoint endpoints.ServiceEndpoint) error {
 	switch endpoint.ID {
 	case string(endpoints.Containers), string(endpoints.VPC), string(endpoints.RM):
@@ -202,17 +214,36 @@ func validateBuilderEndpoint(endpoint endpoints.ServiceEndpoint) error {
 		return nil
 	}
 	parsed, err := url.Parse(endpoint.URL)
-	if err != nil || parsed.Scheme != httpsScheme || parsed.Host == "" || parsed.User != nil {
-		// Only the redacted form is printed: a URL typed with user information must not reach a log.
-		shown := endpoint.URL
-		if err == nil {
-			shown = parsed.Redacted()
-		}
-		return fmt.Errorf("managed client builder: --service-endpoint entry %s:%s=%s is not an absolute https URL without user information; "+
-			"every request carries an IAM bearer token, so pass for example %s:%s=https://<host>/<path>",
-			endpoint.Region, endpoint.ID, shown, endpoint.Region, endpoint.ID)
+	if err != nil {
+		// url.Parse returns a *url.Error whose text quotes the raw input, which may hold a password; only the reason it
+		// wraps is printed.
+		return fmt.Errorf("managed client builder: --service-endpoint entry %s:%s is not a valid URL (%v); pass for example %s:%s=https://<host>/<path>",
+			endpoint.Region, endpoint.ID, errors.Unwrap(err), endpoint.Region, endpoint.ID)
+	}
+	// A bare trailing "#" leaves no trace in the parsed URL, which is why the raw string is checked.
+	if parsed.Scheme != httpsScheme || parsed.Host == "" || parsed.User != nil ||
+		parsed.RawQuery != "" || parsed.ForceQuery || strings.Contains(endpoint.URL, "#") {
+		return fmt.Errorf("managed client builder: --service-endpoint entry %s:%s=%s is not an absolute https URL without user information, query or fragment; "+
+			"every request carries an IAM bearer token and the client appends each operation path to the URL, so pass for example %s:%s=https://<host>/<path>",
+			endpoint.Region, endpoint.ID, printableURL(parsed), endpoint.Region, endpoint.ID)
 	}
 	return nil
+}
+
+// printableURL returns the form of a rejected endpoint URL that errors print: the password replaced by "xxxxx"
+// (url.URL.Redacted) and the query and fragment dropped, because both are arbitrary text that may carry a token. The
+// scheme, user name, host and path stay, so the operator still recognizes the entry that was rejected. The VPC and
+// Resource Manager service packages print rejected URLs in the same form.
+//
+// Parameters:
+//   - parsed is the URL as url.Parse returned it; it is not modified.
+func printableURL(parsed *url.URL) string {
+	shown := *parsed
+	shown.RawQuery = ""
+	shown.ForceQuery = false
+	shown.Fragment = ""
+	shown.RawFragment = ""
+	return shown.Redacted()
 }
 
 // KubernetesService implements ClientBuilder.
@@ -260,7 +291,7 @@ func (b *ProdClientBuilder) VPC(_ context.Context, id credentials.Identity, regi
 	serviceURL := endpoints.FetchVPCEndpoint(region, b.opts.ServiceEndpoints)
 	key := clientKey{identity: id.Key, service: string(endpoints.VPC), url: serviceURL}
 	built, err := b.cachedClient(id, key, func(auth core.Authenticator) (any, error) {
-		return vpc.NewServiceWithAuthenticator(serviceURL, auth)
+		return vpc.NewServiceWithAuthenticatorAndTimeout(serviceURL, auth, b.opts.HTTPTimeout)
 	})
 	if err != nil {
 		return nil, err
@@ -284,7 +315,7 @@ func (b *ProdClientBuilder) ResourceManager(_ context.Context, id credentials.Id
 	serviceURL := b.resourceManagerURL
 	key := clientKey{identity: id.Key, service: string(endpoints.RM), url: serviceURL}
 	built, err := b.cachedClient(id, key, func(auth core.Authenticator) (any, error) {
-		return newResourceManager(auth, serviceURL)
+		return newResourceManager(auth, serviceURL, b.opts.HTTPTimeout)
 	})
 	if err != nil {
 		return nil, err
@@ -378,6 +409,8 @@ func (b *ProdClientBuilder) cachedClient(id credentials.Identity, key clientKey,
 	// Built without holding mu: the SDK constructors call identityAuthenticator.Validate, which takes mu.
 	built, err := build(&identityAuthenticator{key: id.Key, b: b})
 	if err != nil {
+		// key.url is safe to print: validateBuilderEndpoint admits no user information, query or fragment, and the
+		// default URLs have none.
 		return nil, fmt.Errorf("managed client builder: building the %s client for %s at %s: %w", key.service, id.Description, key.url, err)
 	}
 	b.mu.Lock()
@@ -543,17 +576,23 @@ func (a *identityAuthenticator) Validate() error {
 	return auth.Validate()
 }
 
-// newResourceManager is the only call of resourcemanager.NewService on the managed path (the forbidigo rule exempts
-// this file for that one name). resourcemanager.NewService silently builds an authenticator from the environment when
-// options.Authenticator is nil (pkg/cloud/services/resourcemanager/service.go:40-46), so nil is rejected first: the
-// managed path never reads credentials from the environment.
+// newResourceManager builds every Resource Manager client of the managed path with
+// resourcemanager.NewServiceWithAuthenticatorAndTimeout, which bounds each request by timeout and never falls back to
+// the environment. The managed path never calls resourcemanager.NewService, which silently builds an authenticator from
+// the environment when it gets none.
+//
+// The nil check stays first, although the constructor rejects nil as well: it keeps the managed path's guard against an
+// environment credential independent of the service package, so a later change there cannot bring the environment
+// fallback back unnoticed (TestNewResourceManager and TestClientBuilderSeams cover it).
 //
 // Parameters:
 //   - auth authenticates every request; nil (also a typed nil) is rejected.
 //   - serviceURL is the Resource Manager API URL.
-func newResourceManager(auth core.Authenticator, serviceURL string) (resourcemanager.ResourceManager, error) {
+//   - timeout bounds each request; the builder passes ProdClientBuilderOptions.HTTPTimeout.
+func newResourceManager(auth core.Authenticator, serviceURL string, timeout time.Duration) (resourcemanager.ResourceManager, error) {
 	if core.IsNil(auth) {
-		return nil, errors.New("resource manager client: the authenticator is nil; refusing the environment fallback of resourcemanager.NewService")
+		return nil, errors.New("resource manager client: the authenticator is nil; refusing the environment fallback " +
+			"(a managed client never builds credentials from IBMCLOUD_* variables or a credentials file)")
 	}
-	return resourcemanager.NewService(&resourcemanagerv2.ResourceManagerV2Options{Authenticator: auth, URL: serviceURL})
+	return resourcemanager.NewServiceWithAuthenticatorAndTimeout(serviceURL, auth, timeout)
 }
