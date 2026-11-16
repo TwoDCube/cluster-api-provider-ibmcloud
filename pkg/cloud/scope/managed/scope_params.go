@@ -28,6 +28,8 @@ import (
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"sigs.k8s.io/cluster-api/controllers/clustercache"
+
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/credentials"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/workloadprobe"
 )
@@ -55,6 +57,9 @@ type ScopeParams struct {
 	// VersionsCache caches IBM's offered versions per identity and region, so that a listing made with one identity's
 	// credentials is never served to another.
 	VersionsCache *VersionsCache
+	// ClusterCache gives the workload-cluster clients of managed Clusters; the pool scope gets a client per reconcile
+	// and maps ErrClusterNotConnected to WaitingForWorkloadCluster.
+	ClusterCache clustercache.ClusterCache
 }
 
 // dependency names one field of ScopeParams in validation errors.
@@ -69,6 +74,7 @@ const (
 	depClock         dependency = "Clock"
 	depProber        dependency = "Prober"
 	depVersionsCache dependency = "VersionsCache"
+	depClusterCache  dependency = "ClusterCache"
 )
 
 // validate returns an error that names every dependency of needs that is unset, or a nil params, so that a reconciler
@@ -118,6 +124,8 @@ func (p *ScopeParams) unset(need dependency) (bool, error) {
 		return core.IsNil(p.Prober), nil
 	case depVersionsCache:
 		return p.VersionsCache == nil, nil
+	case depClusterCache:
+		return core.IsNil(p.ClusterCache), nil
 	default:
 		return false, errors.New("managed: unknown ScopeParams dependency " + string(need) + " (programming error)")
 	}

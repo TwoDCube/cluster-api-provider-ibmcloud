@@ -38,7 +38,7 @@ import (
 // the feature gate on as cmd/main.go does, so that objects pass the same CEL rules and validators as in production.
 //
 // Tests call Reconcile directly, so that each step and its IBM calls are deterministic; the shared manager runs no
-// managed controller. A test that needs watches (a controller's own SetupWithManager) builds a
+// managed controller. A test that needs watches (a controller's own SetupWithManager, the ClusterCache) builds a
 // short-lived manager from testEnv.Config with newTestManager (helpers_test.go). Later work packages add test files
 // only.
 

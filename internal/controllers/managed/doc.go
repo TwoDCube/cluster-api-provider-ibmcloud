@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package managed holds the controllers of the IBM Cloud managed Kubernetes kinds (IKS and ROKS on VPC Gen2):
-// IBMCloudManagedCluster, IBMCloudManagedControlPlane and IBMCloudManagedMachinePool.
+// IBMCloudManagedCluster, IBMCloudManagedControlPlane and IBMCloudManagedMachinePool, and the ClusterCache they share.
 //
 // # Why this package exists
 //
@@ -37,4 +37,6 @@ limitations under the License.
 //     only from the identity resolved for its Cluster, and every shared object is passed in.
 //   - Scope steps return outcomes; requeue.go turns them into results with its named, jittered intervals, so
 //     expected waits never surface as errors.
+//   - The ClusterCache connects only to Clusters whose control plane is an IBMCloudManagedControlPlane, so CAPIBM's
+//     VPC and PowerVS clusters and other providers' clusters cost nothing.
 package managed

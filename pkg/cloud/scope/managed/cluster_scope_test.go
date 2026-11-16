@@ -768,13 +768,14 @@ func TestNewClusterScopeValidation(t *testing.T) {
 }
 
 func TestScopeParamsValidate(t *testing.T) {
-	all := []dependency{depClient, depAPIReader, depRecorder, depResolver, depClientBuilder, depClock, depProber, depVersionsCache}
+	all := []dependency{depClient, depAPIReader, depRecorder, depResolver, depClientBuilder, depClock, depProber, depVersionsCache, depClusterCache}
 
 	t.Run("every unset dependency is named in order", func(t *testing.T) {
 		g := NewWithT(t)
 		err := (&ScopeParams{}).validate("TestScope", all...)
 		g.Expect(err).To(MatchError("managed: TestScope needs ScopeParams.Client, ScopeParams.APIReader, ScopeParams.Recorder, " +
-			"ScopeParams.Resolver, ScopeParams.ClientBuilder, ScopeParams.Clock, ScopeParams.Prober, ScopeParams.VersionsCache; " +
+			"ScopeParams.Resolver, ScopeParams.ClientBuilder, ScopeParams.Clock, ScopeParams.Prober, ScopeParams.VersionsCache, " +
+			"ScopeParams.ClusterCache; " +
 			"set them on the reconciler (cmd/main.go creates them once)"))
 	})
 
