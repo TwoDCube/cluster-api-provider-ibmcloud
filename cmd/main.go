@@ -47,6 +47,7 @@ import (
 	"sigs.k8s.io/cluster-api/controllers/crdmigrator"
 	"sigs.k8s.io/cluster-api/util/flags"
 
+	managedinfrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/v1alpha1"
 	powervsinfrav1beta2 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/powervs/v1beta2"
 	powervsinfrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/powervs/v1beta3"
 	vpcinfrav1beta1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/vpc/v1beta1"
@@ -88,6 +89,7 @@ func init() {
 	utilruntime.Must(powervsinfrav1.AddToScheme(scheme))
 	utilruntime.Must(vpcinfrav1beta1.AddToScheme(scheme))
 	utilruntime.Must(vpcinfrav1.AddToScheme(scheme))
+	utilruntime.Must(managedinfrav1.AddToScheme(scheme))
 	utilruntime.Must(clusterv1.AddToScheme(scheme))
 	utilruntime.Must(apiextensionsv1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme

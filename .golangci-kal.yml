@@ -74,8 +74,8 @@ linters:
       - vendored_openapi\.go$
       - ".*_test.go"  # Exclude test files.
     rules:
-    ## KAL should only run on api/powervs/v1beta3.
-    - path-except: "api/powervs/v1beta3/*"
+    ## KAL should only run on api/powervs/v1beta3 and the managed APIs.
+    - path-except: "api/(powervs/v1beta3|managed/v1alpha1|managed/controlplane/v1alpha1)/*"
       linters:
         - kubeapilinter
     # Conditions in V1Beta2DeprecatedStatus uses clusterv1.Conditions for backwards compatibility and must remain as-is.
@@ -87,6 +87,9 @@ linters:
       linters:
         - kubeapilinter
     - text: "IBMPowerVSMachineInitializationStatus.Provisioned pointer should not use a bool"
+      linters:
+        - kubeapilinter
+    - text: "IBMCloudManagedClusterInitializationStatus.Provisioned pointer should not use a bool"
       linters:
         - kubeapilinter
 
