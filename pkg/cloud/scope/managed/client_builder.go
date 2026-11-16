@@ -187,6 +187,11 @@ func (o ProdClientBuilderOptions) validate() error {
 	return errors.Join(errs...)
 }
 
+// httpsScheme is the only URL scheme this package accepts for an IBM service endpoint, a master URL or a control plane
+// endpoint: every request to them carries an IAM bearer token or a client certificate. Later files of the package
+// compare against this constant instead of repeating the literal (goconst).
+const httpsScheme = "https"
+
 // validateBuilderEndpoint rejects a --service-endpoint entry of a service this builder uses (containers, vpc, rm)
 // unless it is an absolute https URL. Entries of other services are not this builder's concern. endpoint is one parsed
 // entry of the flag.
@@ -197,7 +202,7 @@ func validateBuilderEndpoint(endpoint endpoints.ServiceEndpoint) error {
 		return nil
 	}
 	parsed, err := url.Parse(endpoint.URL)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
+	if err != nil || parsed.Scheme != httpsScheme || parsed.Host == "" || parsed.User != nil {
 		// Only the redacted form is printed: a URL typed with user information must not reach a log.
 		shown := endpoint.URL
 		if err == nil {
