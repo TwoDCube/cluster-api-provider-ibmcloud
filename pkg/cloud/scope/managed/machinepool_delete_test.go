@@ -417,6 +417,110 @@ func TestMachinePoolScopeDeleteGates(t *testing.T) {
 	}
 }
 
+// expectIBMIn expects the IBM reads of one delete reconcile, like expectIBM, with the IBM cluster in state.
+//
+// Parameters:
+//   - state is the IBM cluster state GetCluster answers.
+//   - pools are the pools ListWorkerPools answers.
+func (f *deleteFixture) expectIBMIn(state string, pools ...kubernetesservice.WorkerPool) {
+	f.ibm.EXPECT().GetCluster(gomock.Any(), poolTestClusterID, testResourceGroupID).Return(&kubernetesservice.Cluster{ID: poolTestClusterID, State: state}, nil)
+	f.ibm.EXPECT().ListWorkerPools(gomock.Any(), poolTestClusterID).Return(pools, nil)
+	f.ibm.EXPECT().ListWorkers(gomock.Any(), poolTestClusterID).Return(f.workers, nil)
+}
+
+// TestMachinePoolScopeDeletePreCallClusterState checks that the pool deletion's pre-call gate reads the IBM cluster
+// state of the reconcile again: a cluster that turns unavailable or scaled_down during a long drain gets no
+// RemoveWorkerPool, the drained Nodes stay cordoned, and the removal goes on once the state allows it again. gomock
+// fails on any RemoveWorkerPool the test does not expect.
+func TestMachinePoolScopeDeletePreCallClusterState(t *testing.T) {
+	for _, state := range []string{"unavailable", "scaled_down"} {
+		t.Run("no_RemoveWorkerPool_when_the_cluster_turned_"+state+"_during_the_drain", func(t *testing.T) {
+			testDeletePreCallClusterState(t, state)
+		})
+	}
+	t.Run("unsupported_allows_the_removal_after_the_drain", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newDeleteFixture(t, nil)
+		f.others = append(f.others, heldLease(DisruptionTokenHolder(f.pool)))
+		f.pool.Status.Disruption = infrav1.WorkerDisruptionStatus{Operation: infrav1.WorkerDisruptionOperationDeletePool,
+			Phase: infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach, WorkerIDs: []string{"w0", "w1", "w2", "w3"},
+			DrainStartTime: metav1.NewTime(poolTestNow.Add(-10 * time.Minute))}
+		drainedAll(t, f)
+		f.expectIBMIn("unsupported", ourPool(""))
+		f.ibm.EXPECT().RemoveWorkerPool(gomock.Any(), poolTestClusterID, poolTestPoolID).Return(nil)
+		outcome, remove := f.scope().ReconcileDelete(context.Background())
+		g.Expect(remove).To(BeFalse())
+		g.Expect(outcome).To(Equal(NotDone(IntervalPoolTransition, string(ReasonRemovingWorkerPool))))
+		g.Expect(f.pool.Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseWaitingForRemoval))
+	})
+	t.Run("unsupported_allows_the_drain_to_start", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newDeleteFixture(t, nil)
+		f.expectIBMIn("unsupported", ourPool(""))
+		outcome, _ := f.scope().ReconcileDelete(context.Background())
+		g.Expect(outcome).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNodes))))
+		g.Expect(f.cordoned()).To(HaveLen(4))
+	})
+}
+
+// testDeletePreCallClusterState follows a pool deletion whose IBM cluster turns state while its Nodes drain: the drain
+// goes on (it makes no IBM call), the pre-call gate then holds without RemoveWorkerPool, and the removal resumes once
+// the cluster is normal again.
+//
+// Parameters:
+//   - t is the test.
+//   - state is the IBM cluster state that forbids every pool change: unavailable or scaled_down.
+func testDeletePreCallClusterState(t *testing.T, state string) {
+	t.Helper()
+	g := NewWithT(t)
+	f := newDeleteFixture(t, nil)
+	reconcile := func() (Outcome, bool) { return f.scope().ReconcileDelete(context.Background()) }
+
+	// 1. The cluster is normal: the gates pass and the drain starts.
+	f.expectIBMIn("normal", ourPool(""))
+	outcome, _ := reconcile()
+	g.Expect(outcome).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNodes))))
+	g.Expect(f.cordoned()).To(HaveLen(4))
+
+	// 2. The cluster turns state while the Nodes drain: the drain finishes, as it makes no IBM call.
+	f.clock.Step(20 * time.Second)
+	f.expectIBMIn(state, ourPool(""))
+	outcome, _ = reconcile()
+	g.Expect(outcome).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNodes))))
+	g.Expect(f.pool.Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach))
+
+	// 3. The drain is done, and the pre-call gate reads the state again: no RemoveWorkerPool, the Nodes stay cordoned.
+	held := func(when string) {
+		t.Helper()
+		f.expectIBMIn(state, ourPool(""))
+		outcome, remove := reconcile()
+		g.Expect(remove).To(BeFalse())
+		g.Expect(outcome).To(Equal(NotDone(IntervalGuarded, string(ReasonWaitingForClusterState))), when)
+		g.Expect(f.deleting().Status).To(Equal(metav1.ConditionTrue))
+		g.Expect(f.deleting().Reason).To(Equal(infrav1.IBMCloudManagedMachinePoolDeletingWaitingForClusterStateReason))
+		g.Expect(f.deleting().Message).To(Equal("IBM cluster "+poolTestClusterID+" is "+state+
+			"; IBM accepts no worker pool change in that state; the drained Nodes stay cordoned"), when)
+		g.Expect(f.pool.Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseWaitingForIBM), when)
+		g.Expect(f.pool.Status.Disruption.IBMRequestTime.IsZero()).To(BeTrue(), "%s: no call was attempted", when)
+		g.Expect(f.cordoned()).To(Equal([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"}), when)
+		g.Expect(f.persisted).To(BeEmpty(), "%s: nothing is persisted for a call that is not sent", when)
+		g.Expect(f.lease().Spec.HolderIdentity).To(Equal(ptr.To(DisruptionTokenHolder(f.pool))), "%s: the token stays held", when)
+	}
+	f.clock.Step(20 * time.Second)
+	held("right after the drain")
+	f.clock.Step(2 * time.Minute)
+	held("at the recheck")
+
+	// 4. The cluster is normal again: the removal resumes with its one call.
+	f.clock.Step(2 * time.Minute)
+	f.expectIBMIn("normal", ourPool(""))
+	f.ibm.EXPECT().RemoveWorkerPool(gomock.Any(), poolTestClusterID, poolTestPoolID).Return(nil)
+	outcome, _ = reconcile()
+	g.Expect(outcome).To(Equal(NotDone(IntervalPoolTransition, string(ReasonRemovingWorkerPool))))
+	g.Expect(f.pool.Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseWaitingForRemoval))
+	g.Expect(f.persisted).To(HaveLen(1), "status is persisted before the call")
+}
+
 // otherPoolWorker is the worker o2 of another pool in state; ready capacity elsewhere keeps IBM's minimum, so only the
 // settled-cluster rule can hold the deletion for it.
 func otherPoolWorker(state string) kubernetesservice.Worker {
@@ -870,6 +974,32 @@ func TestMachinePoolScopeDeleteExcludedDrainDetachLimit(t *testing.T) {
 	f.ibm.EXPECT().RemoveWorkerPool(gomock.Any(), poolTestClusterID, poolTestPoolID).Return(nil)
 	g.Expect(reconcile()).To(Equal(NotDone(IntervalPoolTransition, string(ReasonRemovingWorkerPool))), "60 s: the limit ran out")
 	g.Expect(f.cordoned()).To(BeEmpty())
+}
+
+// TestMachinePoolScopeDeleteRemovedWithoutACall checks a pool that IBM removes after the drain without a CAPIBM call
+// (out of band, or after a clusterctl move lost the status of the call): no RemoveWorkerPool, and ibmRequestTime is set
+// once, when the removal is first seen, so that the stuck timer of WaitingForRemoval has a start (StepWaitForRemoval).
+func TestMachinePoolScopeDeleteRemovedWithoutACall(t *testing.T) {
+	g := NewWithT(t)
+	f := newDeleteFixture(t, nil)
+	f.others = append(f.others, heldLease(DisruptionTokenHolder(f.pool)))
+	f.pool.Status.Disruption = infrav1.WorkerDisruptionStatus{Operation: infrav1.WorkerDisruptionOperationDeletePool,
+		Phase: infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach, WorkerIDs: []string{"w0", "w1", "w2", "w3"},
+		DrainStartTime: metav1.NewTime(poolTestNow.Add(-10 * time.Minute))}
+	drainedAll(t, f)
+	// gomock fails on a RemoveWorkerPool.
+	f.expectIBM(ourPool("deleting"))
+	outcome, remove := f.scope().ReconcileDelete(context.Background())
+	g.Expect(remove).To(BeFalse())
+	g.Expect(outcome).To(Equal(NotDone(IntervalPoolTransition, string(ReasonRemovingWorkerPool))))
+	g.Expect(f.pool.Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseWaitingForRemoval))
+	g.Expect(f.pool.Status.Disruption.IBMRequestTime.Time).To(Equal(poolTestNow), "the removal is first seen now")
+
+	f.clock.Step(time.Minute)
+	f.expectIBM(ourPool("deleting"))
+	f.scope().ReconcileDelete(context.Background())
+	g.Expect(f.pool.Status.Disruption.IBMRequestTime.Time).To(Equal(poolTestNow), "and the start is kept")
+	g.Expect(f.persisted).To(BeEmpty(), "no call, so nothing is persisted before one")
 }
 
 func TestMachinePoolScopeDeleteEmptyPool(t *testing.T) {

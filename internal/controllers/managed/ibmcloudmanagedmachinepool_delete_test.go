@@ -296,6 +296,69 @@ func testDeleteWaitsForTheWorkloadCluster(t *testing.T) {
 	g.Expect(deleting.Reason).To(Equal(infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForWorkloadClusterReason), "no RemoveWorkerPool")
 }
 
+// expectDeleteObservationIn expects the IBM reads of one delete reconcile of the steady pool, whose IBM cluster is in
+// state.
+//
+// Parameters:
+//   - state is the IBM cluster state GetCluster answers.
+func (f *machinePoolFixture) expectDeleteObservationIn(state string) {
+	f.ibm.EXPECT().GetCluster(gomock.Any(), mpTestClusterID, testResourceGroupID).Return(&kubernetesservice.Cluster{State: state}, nil)
+	f.ibm.EXPECT().ListWorkerPools(gomock.Any(), mpTestClusterID).Return([]kubernetesservice.WorkerPool{{
+		ID: mpTestPoolID, Name: "workers", Flavor: mpTestFlavor, SizePerZone: 2,
+	}}, nil)
+	f.ibm.EXPECT().ListWorkers(gomock.Any(), mpTestClusterID).Return(mpTestWorkers(), nil)
+}
+
+// TestIBMCloudManagedMachinePoolReconcileDeletePreCallClusterState checks the pre-call cluster-state gate of a pool
+// deletion in the controller: an IBM cluster that turns unavailable while the pool's Nodes drain gets no
+// RemoveWorkerPool (gomock fails on an unexpected one); Deleting says why, the Nodes stay cordoned, the reconcile
+// comes back at guardedPoll, and the call is sent once the cluster is normal again.
+func TestIBMCloudManagedMachinePoolReconcileDeletePreCallClusterState(t *testing.T) {
+	g := NewWithT(t)
+	f := newMachinePoolFixture(t)
+	calls := f.deletingMachinePool(t)
+	r := f.reconciler()
+
+	// 1. The cluster is normal: the drain starts.
+	f.expectDeleteObservationIn("normal")
+	_, err := f.reconcile(r)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(f.stored().Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseDraining))
+
+	// 2. The cluster turns unavailable while the Nodes drain: the drain finishes, as it makes no IBM call.
+	f.clock.Step(20 * time.Second)
+	f.expectDeleteObservationIn("unavailable")
+	_, err = f.reconcile(r)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(f.stored().Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach))
+	drainCalls := calls.all()
+
+	// 3. The pre-call gate reads the state of this reconcile: no RemoveWorkerPool, and the Nodes are left as they are.
+	f.clock.Step(20 * time.Second)
+	f.expectDeleteObservationIn("unavailable")
+	result, err := f.reconcile(r)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(result.RequeueAfter).To(BeNumerically("~", 2*time.Minute, 15*time.Second), "rechecked at guardedPoll")
+	stored := f.stored()
+	g.Expect(stored.Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseWaitingForIBM))
+	g.Expect(stored.Status.Disruption.IBMRequestTime.IsZero()).To(BeTrue(), "no call was attempted")
+	reason, message := f.deletingReason()
+	g.Expect(reason).To(Equal(infrav1.IBMCloudManagedMachinePoolDeletingWaitingForClusterStateReason))
+	g.Expect(message).To(Equal("IBM cluster " + mpTestClusterID + " is unavailable; IBM accepts no worker pool change in that " +
+		"state; the drained Nodes stay cordoned"))
+	g.Expect(calls.all()).To(Equal(drainCalls), "no Node is patched: the cordons stay")
+
+	// 4. The cluster is normal again: RemoveWorkerPool is sent, once.
+	f.clock.Step(2 * time.Minute)
+	f.expectDeleteObservationIn("normal")
+	f.ibm.EXPECT().RemoveWorkerPool(gomock.Any(), mpTestClusterID, mpTestPoolID).Return(nil)
+	_, err = f.reconcile(r)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(f.stored().Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseWaitingForRemoval))
+	reason, _ = f.deletingReason()
+	g.Expect(reason).To(Equal(infrav1.IBMCloudManagedMachinePoolDeletingRemovingWorkerPoolReason))
+}
+
 // expectDeleteObservationWith expects the IBM reads of one delete reconcile of the steady pool, whose IBM cluster also
 // lists extra.
 func (f *machinePoolFixture) expectDeleteObservationWith(extra ...kubernetesservice.Worker) {
