@@ -143,9 +143,87 @@ prerequisites_vpc(){
     export IBMVPC_SSHKEY_NAME=${IBMVPC_SSHKEY_NAME:-"vpc-cloud-bot-key"}
 }
 
+# require_managed_variable fails the run before any cluster is created when a variable of the managed lanes is empty.
+# $1 is the variable name, $2 tells the operator what to set.
+require_managed_variable(){
+    if [[ -z "${!1:-}" ]]; then
+        echo "managed e2e (${E2E_FLAVOR}): ${1} is not set; ${2}" >&2
+        exit 1
+    fi
+}
+
+# validate_managed_flavor fails the run, before a Boskos lease is taken, unless E2E_FLAVOR names a managed lane. Any
+# other managed-* flavor selects the managed e2e config and the managed specs (make set-flavor, GINKGO_FOCUS), but both
+# lanes then skip themselves, so the job would pass without testing anything.
+validate_managed_flavor(){
+    case "${E2E_FLAVOR}" in
+        managed-iks|managed-roks-single-zone) ;;
+        *)
+            echo "managed e2e: E2E_FLAVOR=${E2E_FLAVOR} runs no managed lane; set E2E_FLAVOR=managed-iks (IKS lane," \
+                "3 zones x 2 workers) or E2E_FLAVOR=managed-roks-single-zone (ROKS lane, 1 zone x 2 workers)" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# heartbeat_managed_lease keeps the Boskos lease of a managed run alive until the script ends; the EXIT trap (cleanup)
+# kills it. heartbeat_account (boskos.sh) stops after 120 updates, one a minute, but a managed run lasts up to
+# GINKGO_TIMEOUT plus the lanes' cleanups. A lease that is no longer refreshed is reclaimed by the Boskos reaper and
+# can be handed to a second job while this run still owns clusters in the e2e account and VPC; the second run's
+# inventory diff and janitor rely on one managed run at a time (test/e2e/managedtools/janitor.go JanitorMinimumAge).
+# The loop restarts heartbeat_account whenever it returns; a refused update exits the background shell, as before.
+heartbeat_managed_lease(){
+    while true; do
+        heartbeat_account
+    done
+}
+
+prerequisites_managed(){
+    # Managed Kubernetes (IKS and ROKS) lanes: test/e2e/managed_test.go with test/e2e/config/ibmcloud-e2e-managed.yaml.
+    # The e2e VPC is an existing VPC with one existing subnet in each of three zones of the region; CAPIBM never
+    # creates or deletes VPC resources. Every value can come from the environment; Boskos supplies the region, the
+    # resource group and the VPC name. The zones default to <region>-1..3 and the subnets to <vpc name>-<zone>.
+    export IBMCLOUD_REGION=${IBMCLOUD_REGION:-${BOSKOS_REGION:-}}
+    export IBMCLOUD_RESOURCE_GROUP_ID=${IBMCLOUD_RESOURCE_GROUP_ID:-${BOSKOS_RESOURCE_GROUP:-}}
+    export IBMCLOUD_VPC_NAME=${IBMCLOUD_VPC_NAME:-${BOSKOS_RESOURCE_NAME:-}}
+    require_managed_variable IBMCLOUD_API_KEY "export the IBM Cloud API key the controller runs with"
+    require_managed_variable IBMCLOUD_REGION "export the region of the e2e VPC, for example eu-de"
+    require_managed_variable IBMCLOUD_RESOURCE_GROUP_ID "export the ID of the e2e resource group"
+    require_managed_variable IBMCLOUD_VPC_NAME "export the name of the e2e VPC"
+    export IBMCLOUD_ZONE_1=${IBMCLOUD_ZONE_1:-"${IBMCLOUD_REGION}-1"}
+    export IBMCLOUD_ZONE_2=${IBMCLOUD_ZONE_2:-"${IBMCLOUD_REGION}-2"}
+    export IBMCLOUD_ZONE_3=${IBMCLOUD_ZONE_3:-"${IBMCLOUD_REGION}-3"}
+    export IBMCLOUD_SUBNET_NAME_1=${IBMCLOUD_SUBNET_NAME_1:-"${IBMCLOUD_VPC_NAME}-${IBMCLOUD_ZONE_1}"}
+    export IBMCLOUD_SUBNET_NAME_2=${IBMCLOUD_SUBNET_NAME_2:-"${IBMCLOUD_VPC_NAME}-${IBMCLOUD_ZONE_2}"}
+    export IBMCLOUD_SUBNET_NAME_3=${IBMCLOUD_SUBNET_NAME_3:-"${IBMCLOUD_VPC_NAME}-${IBMCLOUD_ZONE_3}"}
+    if [[ "${E2E_FLAVOR}" == "managed-roks-single-zone" ]]; then
+        require_managed_variable COS_INSTANCE_CRN "export the CRN of the standard COS instance for the ROKS image registry"
+    fi
+    export EXP_MANAGED_KUBERNETES=true
+    # Only the managed specs run. The lanes stop their own steps at their hard timeouts (IKS 3 h, ROKS 4 h, counted
+    # from the lane's set-up); Ginkgo's timeout adds 1 h 30 m for the management cluster set-up and the first
+    # cleanups. It does not bound the cleanups: each runs within its own NodeTimeout (CAPI deletion 90 m, IBM backstop
+    # 10 m, inventory diff 45 m), and Ginkgo v2 grants a cleanup that starts after the suite timeout its full
+    # NodeTimeout, so the IBM backstop always runs and a run can last up to GINKGO_TIMEOUT plus 145 m. The Boskos
+    # lease is held for all of it (heartbeat_managed_lease).
+    export GINKGO_FOCUS="Managed Kubernetes"
+    if [[ "${E2E_FLAVOR}" == "managed-iks" ]]; then
+        export GINKGO_TIMEOUT=${GINKGO_TIMEOUT:-"4h30m"}
+    else
+        export GINKGO_TIMEOUT=${GINKGO_TIMEOUT:-"5h30m"}
+    fi
+}
+
 main(){
 
     [[ "${E2E_FLAVOR}" == "vpc" ]] && RESOURCE_TYPE="vpc-service"
+    # The managed lanes lease a VPC with three subnets. The type name contains "vpc", so boskos.sh exports the resource
+    # group of the lease. With one resource of this type per e2e account, and the lease held until the run returns
+    # (heartbeat_managed_lease), only one managed run at a time uses an e2e account.
+    if [[ "${E2E_FLAVOR}" == managed-* ]]; then
+        validate_managed_flavor
+        RESOURCE_TYPE=${MANAGED_RESOURCE_TYPE:-"managed-kubernetes-vpc-service"}
+    fi
 
     # If BOSKOS_HOST is set then acquire an IBM Cloud resource from Boskos.
     if [ -n "${BOSKOS_HOST:-}" ]; then
@@ -170,7 +248,11 @@ main(){
 
         # Run the heart beat process to tell Boskos that we are still
         # using the checked out resource periodically.
-        heartbeat_account >> "$ARTIFACTS/logs/boskos.log" 2>&1 &
+        if [[ "${E2E_FLAVOR}" == managed-* ]]; then
+            heartbeat_managed_lease >> "$ARTIFACTS/logs/boskos.log" 2>&1 &
+        else
+            heartbeat_account >> "$ARTIFACTS/logs/boskos.log" 2>&1 &
+        fi
         HEART_BEAT_PID=$(echo $!)
     fi
 
@@ -188,6 +270,10 @@ main(){
 
     if [[ "${E2E_FLAVOR}" == "vpc" ]]; then
         prerequisites_vpc
+    fi
+
+    if [[ "${E2E_FLAVOR}" == managed-* ]]; then
+        prerequisites_managed
     fi
 
     # Run the e2e tests

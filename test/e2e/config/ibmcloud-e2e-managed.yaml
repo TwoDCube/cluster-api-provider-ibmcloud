@@ -1,0 +1,118 @@
+# e2e configuration of the managed Kubernetes lanes (IKS and ROKS; test/e2e/managed_test.go). Selected by
+# `make set-flavor` for E2E_FLAVOR=managed-iks (the IKS lane) and E2E_FLAVOR=managed-roks-single-zone (the ROKS lane);
+# `make test-e2e` runs it through envsubst first. The IBM Cloud API key is never a variable here: the CI script exports
+# IBMCLOUD_API_KEY, clusterctl init puts it into manager-bootstrap-credentials, and the lanes read it through their
+# identity fixture (test/e2e/managed_identity.go). No account, resource group or VPC ID is recorded here: every IBM
+# value comes from the environment.
+managementClusterName: capibm-e2e-managed
+
+images:
+  # Use local built images for e2e tests
+  - name: gcr.io/k8s-staging-capi-ibmcloud/cluster-api-ibmcloud-controller:e2e
+    loadBehavior: mustLoad
+
+# The kubeadm providers are installed because the suite's bootstrap (suite_test.go) installs them by default; the
+# managed lanes do not use them.
+providers:
+  - name: cluster-api
+    type: CoreProvider
+    versions:
+      - name: v1.14.0
+        value: https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.14.0/core-components.yaml
+        type: url
+        files:
+          - sourcePath: "${PWD}/test/e2e/data/shared/metadata.yaml"
+  - name: kubeadm
+    type: BootstrapProvider
+    versions:
+      - name: v1.14.0
+        value: https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.14.0/bootstrap-components.yaml
+        type: url
+        files:
+          - sourcePath: "${PWD}/test/e2e/data/shared/metadata.yaml"
+  - name: kubeadm
+    type: ControlPlaneProvider
+    versions:
+      - name: v1.14.0
+        value: https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.14.0/control-plane-components.yaml
+        type: url
+        files:
+          - sourcePath: "${PWD}/test/e2e/data/shared/metadata.yaml"
+  - name: ibmcloud
+    type: InfrastructureProvider
+    versions:
+      - name: v0.16.0
+        value: "${PWD}/config/default"
+        files:
+          - sourcePath: "${PWD}/metadata.yaml"
+            targetName: "metadata.yaml"
+          # Copies of the rendered flavor templates (make generate-e2e-templates), never kustomize builds: kustomize
+          # drops the comments and the quotes these templates need (an unquoted distributionVersion such as 1.36 becomes
+          # a YAML float that the CRD rejects).
+          - sourcePath: "${PWD}/test/e2e/data/templates/cluster-template-managed-iks.yaml"
+            targetName: "cluster-template-managed-iks.yaml"
+          - sourcePath: "${PWD}/test/e2e/data/templates/cluster-template-managed-roks-single-zone.yaml"
+            targetName: "cluster-template-managed-roks-single-zone.yaml"
+
+variables:
+  # The provider's ManagedKubernetes feature gate (config/manager/manager.yaml).
+  EXP_MANAGED_KUBERNETES: "true"
+  # suite_test.go requires a CNI file for every configuration; the managed lanes never apply it (IBM runs the
+  # cluster network), and the managed flavors do not reference CNI_RESOURCES.
+  CNI: "${PWD}/test/e2e/data/cni/calico/calico.yaml"
+  KUBERNETES_VERSION: "${KUBERNETES_VERSION:-v1.35.9}"
+  CUSTOM_KIND_NODE_IMAGE: "${CUSTOM_KIND_NODE_IMAGE:-}"
+  # Name contract: <E2E_NAME_PREFIX>-<E2E_RUN_ID>-<iks|roks>; "<prefix>-<run-id>" must fit into 24 characters and the
+  # whole name into 35. An empty E2E_RUN_ID gets a random 6-character ID. The janitor deletes, by ID, clusters named
+  # "<E2E_NAME_PREFIX>-..." that are older than 4 hours.
+  E2E_NAME_PREFIX: "${E2E_NAME_PREFIX:-capibm-e2e}"
+  E2E_RUN_ID: "${E2E_RUN_ID:-}"
+  # The e2e VPC: an existing VPC with one existing subnet in each of three zones of the region (CAPIBM never creates
+  # or deletes VPC resources). The ROKS lane reads the first zone and subnet.
+  IBMCLOUD_REGION: "${IBMCLOUD_REGION:-}"
+  IBMCLOUD_RESOURCE_GROUP_ID: "${IBMCLOUD_RESOURCE_GROUP_ID:-}"
+  IBMCLOUD_VPC_NAME: "${IBMCLOUD_VPC_NAME:-}"
+  IBMCLOUD_ZONE_1: "${IBMCLOUD_ZONE_1:-}"
+  IBMCLOUD_ZONE_2: "${IBMCLOUD_ZONE_2:-}"
+  IBMCLOUD_ZONE_3: "${IBMCLOUD_ZONE_3:-}"
+  IBMCLOUD_SUBNET_NAME_1: "${IBMCLOUD_SUBNET_NAME_1:-}"
+  IBMCLOUD_SUBNET_NAME_2: "${IBMCLOUD_SUBNET_NAME_2:-}"
+  IBMCLOUD_SUBNET_NAME_3: "${IBMCLOUD_SUBNET_NAME_3:-}"
+  # The IKS lane creates its cluster at the previous minor and upgrades it by exactly one minor.
+  IKS_DISTRIBUTION_VERSION: "${IKS_DISTRIBUTION_VERSION:-1.35}"
+  IKS_DISTRIBUTION_VERSION_UPGRADE_TO: "${IKS_DISTRIBUTION_VERSION_UPGRADE_TO:-1.36}"
+  ROKS_DISTRIBUTION_VERSION: "${ROKS_DISTRIBUTION_VERSION:-4.21}"
+  # The ROKS lane's image registry storage: the CRN of an existing standard COS instance (IBM rejects a ROKS VPC
+  # cluster without one, E7278).
+  COS_INSTANCE_CRN: "${COS_INSTANCE_CRN:-}"
+  WORKER_UPDATE_POLICY: "Manual"
+  # Image of the PodDisruptionBudget probe pods (test/e2e/data/managed); it needs a POSIX shell. The default is pulled
+  # over public egress, so the workers' subnets need a public gateway; without one, set a copy in a registry the
+  # workers reach over private endpoints, or the IKS lane fails at its first PodDisruptionBudget step (wait-probe).
+  MANAGED_E2E_PROBE_IMAGE: "${MANAGED_E2E_PROBE_IMAGE:-registry.k8s.io/e2e-test-images/busybox:1.36.1-1}"
+  # Optional endpoint overrides of the lanes' own IBM clients; empty means the public defaults
+  # (https://containers.cloud.ibm.com/global and https://<region>.iaas.cloud.ibm.com/v1).
+  IBMCLOUD_CONTAINERS_URL: "${IBMCLOUD_CONTAINERS_URL:-}"
+  IBMCLOUD_VPC_URL: "${IBMCLOUD_VPC_URL:-}"
+
+# Each step's timeout is lowered to the time left until the lane's hard timeout (IKS 3 h, ROKS 4 h). The create step
+# takes wait-cluster, wait-control-plane and wait-worker-nodes at its start, so keep their sum below the hard timeout
+# (IKS 10 + 60 + 60 m, ROKS 10 + 120 + 90 m). The cleanups (wait-delete-cluster in the CAPI deletion,
+# wait-inventory-clean) are not lowered: they run after the hard timeout, within their own node timeouts.
+intervals:
+  default/wait-controllers: ["3m", "10s"]
+  default/wait-delete-cluster: ["60m", "30s"]
+  default/wait-probe: ["10m", "10s"]
+  default/wait-contract: ["10m", "15s"]
+  default/wait-cluster: ["10m", "10s"]
+  default/wait-move: ["30m", "15s"]
+  default/wait-ibm-404: ["15m", "30s"]
+  default/wait-inventory-clean: ["30m", "60s"]
+  managed-iks/wait-control-plane: ["60m", "30s"]
+  managed-iks/wait-worker-nodes: ["60m", "30s"]
+  managed-iks/wait-pool-change: ["60m", "30s"]
+  managed-iks/wait-master-upgrade: ["90m", "30s"]
+  managed-iks/wait-worker-rollout: ["90m", "30s"]
+  managed-iks/wait-drain-blocked: ["30m", "15s"]
+  managed-roks/wait-control-plane: ["120m", "30s"]
+  managed-roks/wait-worker-nodes: ["90m", "30s"]

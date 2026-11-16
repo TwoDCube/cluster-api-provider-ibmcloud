@@ -1,0 +1,67 @@
+# PodDisruptionBudget probe of the managed IKS lane (test/e2e/managed_test.go): a Deployment spread over every worker
+# and a budget that allows one disruption at a time. The lane records every probe pod that leaves while CAPIBM drains
+# workers and requires the DisruptionTarget reason EvictionByEvictionAPI and no budget violation. The placeholders (a
+# dollar sign and a name in braces) are filled by the suite (applyProbeManifest with managedtools.ExpandPlaceholders),
+# not by envsubst.
+# A pod keeps running for about 20 seconds after SIGTERM, so the lane's 2-second polling sees it terminating.
+# PROBE_IMAGE needs a POSIX shell (default registry.k8s.io/e2e-test-images/busybox); a VPC without a public gateway
+# needs a copy in a registry the workers reach over private endpoints (MANAGED_E2E_PROBE_IMAGE).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${PROBE_NAMESPACE}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spread
+  namespace: ${PROBE_NAMESPACE}
+spec:
+  replicas: ${PROBE_REPLICAS}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spread
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: spread
+        ${PROBE_LABEL}: "true"
+    spec:
+      terminationGracePeriodSeconds: 60
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: spread
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: probe
+          image: ${PROBE_IMAGE}
+          command: ["sh", "-c", "trap 'sleep 20; exit 0' TERM; while true; do sleep 1; done"]
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: spread
+  namespace: ${PROBE_NAMESPACE}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spread
