@@ -347,7 +347,7 @@ func MasterUpdateHoldsWorkers(cp *controlplanev1.IBMCloudManagedControlPlane) (b
 // Parameters:
 //   - reason is the refusal's reason: WaitingForClusterMinimum (E1437) or ExternallyAutoscaled.
 func replaceRefusalMessage(reason DisruptionReason) string {
-	if reason == ReasonExternallyAutoscaled {
+	if upToDateReason(reason) == infrav1.IBMCloudManagedMachinePoolWorkersUpToDateExternallyAutoscaledReason {
 		return "IBM refused the replace because its cluster autoscaler owns this pool; the drained Node stays cordoned; " +
 			"disable the autoscaler of the pool to let CAPIBM replace its workers"
 	}
@@ -683,7 +683,7 @@ func (ro *workerRollout) newRunner() (*removalRunner, error) {
 // message, which names the call and carries IBM's code only, never the incident ID.
 //
 // Parameters:
-//   - reason is the condition reason, IBMAPIError.
+//   - reason is the condition reason, IBMAPIError, which reportUpToDate writes as WorkersUpToDate's own constant.
 //   - message is ibmProblemOn's message.
 func (ro *workerRollout) reportCallError(reason, message string) {
 	ro.reportUpToDate(DisruptionDecision{Reason: DisruptionReason(reason), Message: message})
@@ -973,13 +973,13 @@ func (ro *workerRollout) finish(ctx context.Context, givenUp string) Outcome {
 }
 
 // reportUpToDate reports a decision on WorkersUpToDate=False (the runner's report of the replace, which adds the
-// Draining condition): the step's reason, with the progress and the worker in the message. A decision without a reason
-// leaves WorkersUpToDate as it is. d is the decision.
+// Draining condition): the step's reason as WorkersUpToDate names it (upToDateReason), with the progress and the worker
+// in the message. A decision without a reason leaves WorkersUpToDate as it is. d is the decision.
 func (ro *workerRollout) reportUpToDate(d DisruptionDecision) {
 	if d.Reason == "" {
 		return
 	}
-	reason, detail := string(d.Reason), d.Message
+	reason, detail := upToDateReason(d.Reason), d.Message
 	switch {
 	case d.Step != StepWait:
 	case d.Reason == ReasonWaitingForClusterState:
@@ -1082,6 +1082,28 @@ func (ro *workerRollout) setUpToDate(status metav1.ConditionStatus, reason, mess
 	}
 	conditions.Set(ro.s.Pool, metav1.Condition{Type: infrav1.IBMCloudManagedMachinePoolWorkersUpToDateCondition,
 		Status: status, Reason: reason, Message: message})
+}
+
+// upToDateReason returns the WorkersUpToDate reason of a decision of the replace. The decisions of
+// DecideDisruptionStep and of the removal runner carry DisruptionReason values, which are the reason constants of the
+// condition the flow reports on. Two of a replace's come from other conditions: ExternallyAutoscaled
+// (WorkerPoolReady's: the autoscaler gate, and DisruptionCallOutcome's hold for an autoscaled pool) and IBMAPIError
+// (the runner's report of a failed call, MachinePoolIBMAPIErrorReason); they become WorkersUpToDate's own constants.
+// Every other reason of a replace already is a WorkersUpToDate constant and is returned as it is. The tokens are the
+// same on every condition, which the runner relies on: it reads its records back from WorkersUpToDate by those tokens
+// (refusalRecord.read, recordedCallError). It is pure.
+//
+// Parameters:
+//   - reason is the decision's reason.
+func upToDateReason(reason DisruptionReason) string {
+	switch reason {
+	case ReasonExternallyAutoscaled:
+		return infrav1.IBMCloudManagedMachinePoolWorkersUpToDateExternallyAutoscaledReason
+	case DisruptionReason(MachinePoolIBMAPIErrorReason):
+		return infrav1.IBMCloudManagedMachinePoolWorkersUpToDateIBMAPIErrorReason
+	default:
+		return string(reason)
+	}
 }
 
 // rfc3339 formats t for a condition message.

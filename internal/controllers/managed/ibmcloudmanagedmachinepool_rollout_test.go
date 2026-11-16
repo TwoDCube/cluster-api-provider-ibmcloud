@@ -19,6 +19,7 @@ package managed
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
@@ -337,6 +338,8 @@ func TestIBMCloudManagedMachinePoolReconcileRollout(t *testing.T) {
 	t.Run("an abort reverts only CAPIBM's cordon and load balancer label", testRolloutAbortKeepsHumanCordon)
 	t.Run("the reconcile is requeued when spec.rollout.after passes", testRolloutRequeuesAtRolloutAfter)
 	t.Run("a paused Cluster stops a replace in flight", testRolloutPaused)
+	t.Run("an autoscaled pool reports ExternallyAutoscaled on WorkersUpToDate", testRolloutAutoscaled)
+	t.Run("a 403 to ReplaceWorker reports IBMAPIError on WorkersUpToDate", testRolloutReplaceForbidden)
 }
 
 // testRolloutOnePerSettledCluster follows the replace of w0 through Reconcile while the spare pool's workers are due
@@ -652,6 +655,64 @@ func testRolloutPaused(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(workload.calls.all()).To(BeEmpty())
 	g.Expect(f.stored().Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseDraining))
+}
+
+// testRolloutAutoscaled checks through Reconcile that workers due on a pool IBM's cluster autoscaler owns are reported
+// with WorkersUpToDate's own ExternallyAutoscaled constant, nothing is cordoned or replaced (gomock fails the test on a
+// ReplaceWorker), and the pool itself stays ready.
+func testRolloutAutoscaled(t *testing.T) {
+	g := NewWithT(t)
+	f := newMachinePoolFixture(t)
+	workload := f.rollingPool(t)
+	r := f.reconciler()
+	ibm := newRoIBM(f, "w0", "w1", "w2", "w3")
+	ibm.mu.Lock()
+	ibm.pools[0].AutoscaleEnabled = true
+	ibm.mu.Unlock()
+
+	f.reconcileNamed(r, "workers")
+
+	upToDate := f.upToDate("workers")
+	g.Expect(upToDate.Status).To(Equal(metav1.ConditionFalse))
+	g.Expect(upToDate.Reason).To(Equal(infrav1.IBMCloudManagedMachinePoolWorkersUpToDateExternallyAutoscaledReason))
+	g.Expect(upToDate.Message).To(Equal("replaced 0 of 4; worker w0 (MinorBehind): IBM's cluster autoscaler owns this pool; " +
+		"CAPIBM neither resizes nor replaces its workers"))
+	g.Expect(workload.cordoned(t)).To(BeEmpty())
+	g.Expect(f.stored().Status.Disruption).To(Equal(infrav1.WorkerDisruptionStatus{}))
+	g.Expect(conditions.IsTrue(f.stored(), infrav1.IBMCloudManagedMachinePoolReadyCondition)).To(BeTrue(), "the pool itself is ready")
+}
+
+// testRolloutReplaceForbidden checks through Reconcile that a 403 to ReplaceWorker for a missing Kubernetes Service
+// role is reported with WorkersUpToDate's own IBMAPIError constant and IBM's code only (IBM's incident ID changes on
+// every call, so a message carrying it would rewrite status on every reconcile), kept with no second call within
+// DisruptionSettleDelay, while the drained Node stays cordoned.
+func testRolloutReplaceForbidden(t *testing.T) {
+	g := NewWithT(t)
+	f := newMachinePoolFixture(t)
+	workload := f.rollingPool(t)
+	r := f.reconciler()
+	newRoIBM(f, "w0", "w1", "w2", "w3")
+	f.ibm.EXPECT().ReplaceWorker(gomock.Any(), mpTestClusterID, "w0", true).Return(&kubernetesservice.APIError{
+		Operation: kubernetesservice.OpReplaceWorker, StatusCode: http.StatusForbidden, Code: "E3e8a", IncidentID: "incident-a"}).Times(1)
+
+	// Drain, volume detach, then the call (as in testRolloutOnePerSettledCluster).
+	for _, step := range []time.Duration{0, 20 * time.Second, 20 * time.Second} {
+		f.clock.Step(step)
+		f.reconcileNamed(r, "workers")
+	}
+
+	refused := f.upToDate("workers")
+	g.Expect(refused.Status).To(Equal(metav1.ConditionFalse))
+	g.Expect(refused.Reason).To(Equal(infrav1.IBMCloudManagedMachinePoolWorkersUpToDateIBMAPIErrorReason))
+	g.Expect(refused.Message).To(ContainSubstring("worker w0 (MinorBehind): IBM Cloud refused the CAPIBM controller identity " +
+		"(HTTP 403, code E3e8a) while replacing worker w0 of IBM cluster " + mpTestClusterID))
+	g.Expect(refused.Message).NotTo(ContainSubstring("incident"))
+	g.Expect(f.stored().Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseWaitingForIBM))
+	g.Expect(workload.cordoned(t)).To(Equal([]string{"10.0.0.1"}))
+
+	f.clock.Step(time.Minute)
+	f.reconcileNamed(r, "workers")
+	g.Expect(f.upToDate("workers")).To(Equal(refused), "the report is kept, with no second call")
 }
 
 // roIndexedClient answers a Node listing by provider ID, which the cached client of ClusterCache answers from its

@@ -254,6 +254,47 @@ func TestReplaceRefusalMessage(t *testing.T) {
 		"fall below its minimum workers (E1437); the drained Node stays cordoned, and the replace is requested again at most once " +
 		"every 3 minutes while CAPIBM's own guards allow it"))
 	g.Expect(replaceRefusalMessage(ReasonExternallyAutoscaled)).To(HavePrefix("IBM refused the replace because its cluster autoscaler owns this pool"))
+	g.Expect(replaceRefusalMessage(DisruptionReason(infrav1.IBMCloudManagedMachinePoolWorkersUpToDateExternallyAutoscaledReason))).To(
+		Equal(replaceRefusalMessage(ReasonExternallyAutoscaled)), "the record read back from WorkersUpToDate has the same message")
+}
+
+// TestUpToDateReason checks that every reason a replace reports on WorkersUpToDate is a WorkersUpToDate API constant,
+// the two that the disruption machinery takes from other conditions included, and that their tokens stay those the
+// removal runner reads its records back by (refusalRecord.read, recordedCallError), so that the replace's refusal hold
+// and call-error hold keep working.
+func TestUpToDateReason(t *testing.T) {
+	testCases := []struct {
+		reason DisruptionReason
+		want   string
+	}{
+		{reason: ReasonExternallyAutoscaled, want: infrav1.IBMCloudManagedMachinePoolWorkersUpToDateExternallyAutoscaledReason},
+		{reason: DisruptionReason(MachinePoolIBMAPIErrorReason), want: infrav1.IBMCloudManagedMachinePoolWorkersUpToDateIBMAPIErrorReason},
+		{reason: ReasonWaitingForClusterState, want: infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForClusterStateReason},
+		{reason: ReasonWaitingForControlPlaneUpgrade, want: infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForControlPlaneUpgradeReason},
+		{reason: ReasonWaitingForSettledCluster, want: infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForSettledClusterReason},
+		{reason: ReasonWaitingForClusterMinimum, want: infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForClusterMinimumReason},
+		{reason: ReasonWaitingForCapacity, want: infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForCapacityReason},
+		{reason: ReasonAutoRebalanceDisabled, want: infrav1.IBMCloudManagedMachinePoolWorkersUpToDateAutoRebalanceDisabledReason},
+		{reason: ReasonWaitingForWorkloadCluster, want: infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForWorkloadClusterReason},
+		{reason: ReasonWaitingForDisruptionToken, want: infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForDisruptionTokenReason},
+		{reason: ReasonDrainingNode, want: infrav1.IBMCloudManagedMachinePoolWorkersUpToDateDrainingNodeReason},
+		{reason: ReasonReplacingWorker, want: infrav1.IBMCloudManagedMachinePoolWorkersUpToDateReplacingWorkerReason},
+		{reason: ReasonWaitingForReplacement, want: infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForReplacementReason},
+		{reason: ReasonReplacementNotCreated, want: infrav1.IBMCloudManagedMachinePoolWorkersUpToDateReplacementNotCreatedReason},
+		{reason: ReasonWorkerOperationStuck, want: infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWorkerOperationStuckReason},
+		{reason: DisruptionReason(infrav1.IBMCloudManagedMachinePoolWorkersUpToDateRollingOutReason),
+			want: infrav1.IBMCloudManagedMachinePoolWorkersUpToDateRollingOutReason},
+	}
+	for _, tc := range testCases {
+		t.Run(string(tc.reason), func(t *testing.T) {
+			NewWithT(t).Expect(upToDateReason(tc.reason)).To(Equal(tc.want))
+		})
+	}
+	t.Run("the_WorkersUpToDate_tokens_are_the_runner's_record_tokens", func(t *testing.T) {
+		g := NewWithT(t)
+		g.Expect(infrav1.IBMCloudManagedMachinePoolWorkersUpToDateExternallyAutoscaledReason).To(Equal(string(ReasonExternallyAutoscaled)))
+		g.Expect(infrav1.IBMCloudManagedMachinePoolWorkersUpToDateIBMAPIErrorReason).To(Equal(MachinePoolIBMAPIErrorReason))
+	})
 }
 
 func TestNodeReadySince(t *testing.T) {
@@ -644,7 +685,7 @@ func TestMachinePoolScopeRolloutGates(t *testing.T) {
 			},
 			wantMessage: "replaced 0 of 2; worker w0 (MinorBehind): the cluster has 2 ready workers; removing 1 would leave 1, below " +
 				"IBM's minimum of 2 workers for a OpenShift cluster (E1437); scale MachinePool workers to 3 to allow a rolling replacement"},
-		{name: "an autoscaled pool", wantReason: string(ReasonExternallyAutoscaled), wantOutcome: Done(),
+		{name: "an autoscaled pool", wantReason: infrav1.IBMCloudManagedMachinePoolWorkersUpToDateExternallyAutoscaledReason, wantOutcome: Done(),
 			modify: func(f *rolloutFixture) { f.ibmPool.AutoscaleEnabled = true }},
 		{name: "auto-rebalance disabled in the worker's zone", wantReason: string(ReasonAutoRebalanceDisabled),
 			modify: func(f *rolloutFixture) { f.ibmPool.Zones[0].AutobalanceEnabled = false }},
@@ -815,7 +856,7 @@ func TestMachinePoolScopeRolloutCallOutcomes(t *testing.T) {
 		g.Expect(f.reconcile().Kind).To(Equal(OutcomeTerminal))
 		g.Expect(f.pool.Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseWaitingForIBM), "the phase stays")
 		refused := f.upToDate().DeepCopy()
-		g.Expect(refused.Reason).To(Equal(MachinePoolIBMAPIErrorReason))
+		g.Expect(refused.Reason).To(Equal(infrav1.IBMCloudManagedMachinePoolWorkersUpToDateIBMAPIErrorReason))
 		g.Expect(refused.Message).To(Equal("replaced 3 of 4; worker w0 (MinorBehind): IBM Cloud refused the CAPIBM controller " +
 			"identity (HTTP 403, code E3e8a) while replacing worker w0 of IBM cluster " + poolTestClusterID + "; grant it " +
 			poolKubernetesServiceRoles + " (the IAM roles of the managed Kubernetes book)"))
