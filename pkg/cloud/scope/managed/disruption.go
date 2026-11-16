@@ -25,6 +25,8 @@ import (
 	"strings"
 	"time"
 
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+
 	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
 	infrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/v1alpha1"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
@@ -388,7 +390,8 @@ const (
 	StepAcquireToken DisruptionStep = "AcquireToken"
 	// StepDrain asks the caller to cordon every victim Node (all of them before the first eviction, so evicted pods
 	// never land on another victim; Cordon is idempotent) and to evict their pods, then to requeue after
-	// DrainRetryInterval.
+	// DrainRetryInterval. Under exclude-node-draining the caller does neither (DrainProgress.Excluded), and the message
+	// says so.
 	StepDrain DisruptionStep = "Drain"
 	// StepWaitForVolumeDetach waits until the drained Nodes have no attached volumes.
 	StepWaitForVolumeDetach DisruptionStep = "WaitForVolumeDetach"
@@ -711,14 +714,33 @@ func (o DisruptionObservation) decideGated() DisruptionDecision {
 	switch o.Token {
 	case TokenHeld:
 		return DisruptionDecision{Step: StepDrain, Phase: infrav1.WorkerDisruptionPhaseDraining,
-			Reason: drainingReason(o.Operation), DrainingReason: ReasonDrainingNode,
-			Message: "cordoning every victim Node, then evicting their pods"}
+			Reason: drainingReason(o.Operation), DrainingReason: ReasonDrainingNode, Message: o.firstDrainMessage()}
 	case TokenHeldByOther:
 		return DisruptionDecision{Step: StepWait, Reason: ReasonWaitingForDisruptionToken,
 			Message: "another pool of the Cluster holds the disruption token; one worker removal runs at a time"}
 	default:
 		return DisruptionDecision{Step: StepAcquireToken, Message: "every gate passed; acquiring the disruption token"}
 	}
+}
+
+// firstDrainMessage is the message of the step that starts the drain once every gate passed: what CAPIBM does to the
+// victim Nodes, followed by the stuck workers the disruption guard no longer counts.
+//
+// Under machine.cluster.x-k8s.io/exclude-node-draining nothing is cordoned and nothing is evicted, as for a CAPI
+// Machine, so the message says that and never says "cordoning". A worker that CheckDisruption let pass because it has
+// been transitional for longer than WorkerStuckAfter is named here: the gates are read only before the first cordon, so
+// this message is where the operator learns why a removal started while IBM was still changing a worker. Both parts are
+// deterministic, so a repeated reconcile writes the same message and no status.
+func (o DisruptionObservation) firstDrainMessage() string {
+	message := "cordoning every victim Node, then evicting their pods"
+	if o.Drain.Excluded {
+		message = fmt.Sprintf("the drain is excluded (%s): CAPIBM leaves the victim Nodes schedulable and evicts no pod",
+			clusterv1.ExcludeNodeDrainingAnnotation)
+	}
+	if gate := o.Gates.Disruption; gate.Allowed && len(gate.StuckWorkerIDs) > 0 && gate.Message != "" {
+		message += "; " + gate.Message
+	}
+	return message
 }
 
 // failingGate returns the reason and message of the first gate that fails, or "" when all pass.

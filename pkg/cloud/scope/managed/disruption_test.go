@@ -674,6 +674,60 @@ func TestDecideDisruptionStepValidation(t *testing.T) {
 	}
 }
 
+// TestDecideDisruptionStepFirstDrainMessage locks the message of the step that starts a drain (golden texts): it says
+// what happens to the victim Nodes, never "cordon" under exclude-node-draining, and it names the workers
+// CheckDisruption let pass as stuck.
+func TestDecideDisruptionStepFirstDrainMessage(t *testing.T) {
+	const stuckWorker = "kube-c1-pool-b-00000005"
+	stuckNote := "WorkerOperationStuck: IBM has been changing worker " + stuckWorker + " for more than 60 minutes; " +
+		"treated like a failed worker, it no longer blocks worker removals"
+	// stuckGate is CheckDisruption's answer for a pool deletion while a worker of another pool has been provisioning for
+	// longer than WorkerStuckAfter, as the pool reconciler's first-seen map reports it.
+	in := replaceCheckInput()
+	in.Operation = infrav1.WorkerDisruptionOperationDeletePool
+	in.MachinePoolName = ""
+	in.Workers = append(in.Workers, newDisruptionWorker(stuckWorker, "c1-bbbbbbb", "provision_pending", ""))
+	in.TransitionalSince = map[string]time.Time{stuckWorker: disruptionNow().Add(-WorkerStuckAfter - time.Minute)}
+	stuckGate, err := CheckDisruption(in)
+	NewWithT(t).Expect(err).NotTo(HaveOccurred())
+	NewWithT(t).Expect(stuckGate.Allowed).To(BeTrue(), stuckGate.Message)
+	testCases := []struct {
+		name        string
+		modify      func(o *DisruptionObservation)
+		wantMessage string
+	}{
+		{name: "the drain cordons and evicts", modify: func(*DisruptionObservation) {},
+			wantMessage: "cordoning every victim Node, then evicting their pods"},
+		{name: "an excluded drain neither cordons nor evicts", modify: func(o *DisruptionObservation) {
+			o.Drain.Excluded = true
+		}, wantMessage: "the drain is excluded (machine.cluster.x-k8s.io/exclude-node-draining): CAPIBM leaves the victim " +
+			"Nodes schedulable and evicts no pod"},
+		{name: "a stuck worker that no longer blocks is named", modify: func(o *DisruptionObservation) {
+			o.Gates.Disruption = stuckGate
+		}, wantMessage: "cordoning every victim Node, then evicting their pods; " + stuckNote},
+		{name: "an excluded drain names the stuck worker too", modify: func(o *DisruptionObservation) {
+			o.Drain.Excluded = true
+			o.Gates.Disruption = stuckGate
+		}, wantMessage: "the drain is excluded (machine.cluster.x-k8s.io/exclude-node-draining): CAPIBM leaves the victim " +
+			"Nodes schedulable and evicts no pod; " + stuckNote},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			o := passingObservation(infrav1.WorkerDisruptionOperationDeletePool, "")
+			tc.modify(&o)
+			got, err := DecideDisruptionStep(o)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(got.Step).To(Equal(StepDrain))
+			g.Expect(got.Reason).To(Equal(ReasonDrainingNodes))
+			g.Expect(got.Message).To(Equal(tc.wantMessage))
+			if o.Drain.Excluded {
+				g.Expect(got.Message).NotTo(ContainSubstring("cordon"), "the drain is excluded: nothing is cordoned")
+			}
+		})
+	}
+}
+
 // TestDecideDisruptionStepHandOver follows a replace or scale-down that a pool deletion interrupts, from every phase,
 // through the decisions of the pool deletion as the caller records them (StepHandOver): it drains every Node of the
 // pool, holds while IBM still carries out the earlier call, and only then removes the pool.
