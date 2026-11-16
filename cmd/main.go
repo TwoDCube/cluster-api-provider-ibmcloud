@@ -429,6 +429,14 @@ func setupReconcilers(ctx context.Context, mgr ctrl.Manager, serviceEndpoint []e
 // factory: the managed packages receive it only through the client builder, so that no code on the managed path reads
 // credentials from the environment itself.
 func setupManagedReconcilers(ctx context.Context, mgr ctrl.Manager, serviceEndpoint []endpoints.ServiceEndpoint, watchFilterValue string) {
+	// The ClusterCache gives the managed controllers their connection to workload clusters (the machine pool controller
+	// drains Nodes through it before IBM removes a worker); it connects only to Clusters whose control plane is an
+	// IBMCloudManagedControlPlane.
+	if _, err := managedcontroller.SetupClusterCache(ctx, mgr, managedcontroller.ClusterCacheOptions{WatchFilterValue: watchFilterValue}); err != nil {
+		setupLog.Error(err, "unable to create the ClusterCache of the managed controllers")
+		os.Exit(1)
+	}
+
 	resolver := credentials.ControllerOnly{}
 	clientBuilder, err := managedscope.NewProdClientBuilder(managedscope.ProdClientBuilderOptions{
 		ServiceEndpoints:           serviceEndpoint,
