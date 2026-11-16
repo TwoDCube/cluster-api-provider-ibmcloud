@@ -93,6 +93,7 @@ func (s *MachinePoolScope) ReconcileDelete(ctx context.Context) (Outcome, bool) 
 		return s.ibmProblem(clients, kubernetesservice.OpListWorkers,
 			fmt.Sprintf("listing the workers of IBM cluster %s", s.ControlPlane.Status.ClusterID), err), false
 	}
+	s.recordListing(workers)
 	if err := s.publishProviderIDs(pool.ID, workers); err != nil {
 		// The list only shrinks as IBM reports workers deleted; an unreadable list stays as it is.
 		ctrl.LoggerFrom(ctx).Info("spec.providerIDList is left unchanged while the pool is deleted", "cause", err.Error())
@@ -377,7 +378,9 @@ func (r *poolRemoval) observation(ctx context.Context) (DisruptionObservation, e
 }
 
 // check is CheckDisruption for removing every ready worker of the pool. skipSettleDelay selects the pre-call gate,
-// which leaves out the settle delay.
+// which leaves out the settle delay. Both the gate and the pre-call gate get the controller's first-seen times
+// (MachinePoolScopeInput.TransitionalSince), so that a worker IBM has left transitional for longer than
+// WorkerStuckAfter, in any pool, no longer holds the deletion.
 func (r *poolRemoval) check(skipSettleDelay bool) (DisruptionCheckResult, error) {
 	ready := 0
 	for _, w := range r.workers {
@@ -386,13 +389,14 @@ func (r *poolRemoval) check(skipSettleDelay bool) (DisruptionCheckResult, error)
 		}
 	}
 	return CheckDisruption(DisruptionCheck{
-		Operation:       infrav1.WorkerDisruptionOperationDeletePool,
-		Distribution:    r.s.ControlPlane.Spec.Distribution,
-		Now:             r.s.params.Clock.Now(),
-		Workers:         r.workers,
-		Pools:           r.s.clusterPools,
-		RemovedReady:    ready,
-		SkipSettleDelay: skipSettleDelay,
+		Operation:         infrav1.WorkerDisruptionOperationDeletePool,
+		Distribution:      r.s.ControlPlane.Spec.Distribution,
+		Now:               r.s.params.Clock.Now(),
+		Workers:           r.workers,
+		TransitionalSince: r.s.firstSeen,
+		Pools:             r.s.clusterPools,
+		RemovedReady:      ready,
+		SkipSettleDelay:   skipSettleDelay,
 	})
 }
 
@@ -581,7 +585,7 @@ func (r *poolRemoval) record(phase infrav1.WorkerDisruptionPhase) {
 //   - to is the phase the step records.
 func (r *poolRemoval) drainEvents(from, to infrav1.WorkerDisruptionPhase) {
 	if r.drain != nil {
-		RecordDrainPhaseChange(r.s.params.Recorder, r.s.Pool, from, to, len(r.victimNodes))
+		RecordDrainPhaseChange(r.s.params.Recorder, r.s.Pool, from, to, len(r.victimNodes), r.knobs.ExcludeDraining)
 		return
 	}
 	// Without the workload cluster the drain leaves Draining only when it is excluded or timed out (drainFinished).

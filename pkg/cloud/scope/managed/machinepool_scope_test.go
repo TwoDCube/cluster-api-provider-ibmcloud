@@ -125,6 +125,8 @@ type poolFixture struct {
 	// persisted records status.disruption at every Persist call; persistErr is what Persist returns.
 	persisted  []infrav1.WorkerDisruptionStatus
 	persistErr error
+	// transitionalSince is the scope's MachinePoolScopeInput.TransitionalSince, the controller's first-seen times.
+	transitionalSince map[string]time.Time
 }
 
 // newPoolFixture returns the objects of a healthy IKS Cluster with two zones and a pool "workers" of 2 workers per
@@ -237,7 +239,7 @@ func (f *poolFixture) scope() *MachinePoolScope {
 			ClientBuilder: f.builder, Clock: f.clock, ClusterCache: f.clusterCache}
 	}
 	scope, err := NewMachinePoolScope(f.params, MachinePoolScopeInput{Cluster: f.cluster, MachinePool: f.machinePool,
-		Pool: f.pool, ProviderIDDropAfter: 30 * time.Second, Persist: f.persist})
+		Pool: f.pool, TransitionalSince: f.transitionalSince, ProviderIDDropAfter: 30 * time.Second, Persist: f.persist})
 	if err != nil {
 		f.t.Fatalf("NewMachinePoolScope: %v", err)
 	}

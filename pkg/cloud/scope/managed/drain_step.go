@@ -393,7 +393,10 @@ func (d *DrainStep) checkDetach(ctx context.Context, nodes []corev1.Node, result
 }
 
 // RecordDrainPhaseChange emits the Normal events of a drain phase change: DrainStarted when a removal enters Draining
-// from no recorded phase, DrainCompleted when it leaves Draining for the volume detach wait.
+// from no recorded phase, DrainCompleted when it leaves Draining for the volume detach wait. Under
+// exclude-node-draining nothing is cordoned and nothing is evicted, so the texts say that instead of "cordoning" and
+// "drained". The reasons stay the same, so that whoever follows the phase changes sees the same sequence of events
+// either way.
 //
 // Parameters:
 //   - recorder emits the event.
@@ -401,12 +404,23 @@ func (d *DrainStep) checkDetach(ctx context.Context, nodes []corev1.Node, result
 //   - from is status.disruption.phase before the step; "" when none was recorded.
 //   - to is the phase the step records.
 //   - nodes is the number of victim Nodes.
-func RecordDrainPhaseChange(recorder record.EventRecorder, pool *infrav1.IBMCloudManagedMachinePool, from, to infrav1.WorkerDisruptionPhase, nodes int) {
+//   - drainExcluded is DrainKnobs.ExcludeDraining as read in this reconcile.
+func RecordDrainPhaseChange(recorder record.EventRecorder, pool *infrav1.IBMCloudManagedMachinePool, from, to infrav1.WorkerDisruptionPhase,
+	nodes int, drainExcluded bool) {
+	started := from == "" && to == infrav1.WorkerDisruptionPhaseDraining
+	completed := from == infrav1.WorkerDisruptionPhaseDraining && to == infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach
 	switch {
-	case from == "" && to == infrav1.WorkerDisruptionPhaseDraining:
+	case started && drainExcluded:
+		recorder.Eventf(pool, corev1.EventTypeNormal, EventDrainStarted, "the drain of the %d Nodes of pool %s is excluded (%s): "+
+			"CAPIBM leaves them schedulable and evicts no pod", nodes, pool.Spec.PoolName, clusterv1.ExcludeNodeDrainingAnnotation)
+	case started:
 		recorder.Eventf(pool, corev1.EventTypeNormal, EventDrainStarted, "cordoning %d Nodes of pool %s, then evicting their pods",
 			nodes, pool.Spec.PoolName)
-	case from == infrav1.WorkerDisruptionPhaseDraining && to == infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach:
+	case completed && drainExcluded:
+		// The annotation may have been set mid-drain, after some evictions, so the text speaks of no more evictions.
+		recorder.Eventf(pool, corev1.EventTypeNormal, EventDrainCompleted, "the %d Nodes of pool %s are not drained: %s is set, "+
+			"so CAPIBM evicts no more pods", nodes, pool.Spec.PoolName, clusterv1.ExcludeNodeDrainingAnnotation)
+	case completed:
 		recorder.Eventf(pool, corev1.EventTypeNormal, EventDrainCompleted, "the %d Nodes of pool %s are drained", nodes, pool.Spec.PoolName)
 	}
 }

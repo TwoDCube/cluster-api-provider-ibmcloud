@@ -385,6 +385,13 @@ func TestMachinePoolScopeDeleteGates(t *testing.T) {
 			modify: func(f *deleteFixture) { f.clusterState = "unavailable" }},
 		{name: "a worker of the cluster is changing", wantReason: ReasonWaitingForSettledCluster,
 			modify: func(f *deleteFixture) { f.workers[5].ActualState = "provisioning" }},
+		{name: "a_provision_pending_worker_of_another_pool_first_seen_less_than_WorkerStuckAfter_ago_blocks",
+			wantReason: ReasonWaitingForSettledCluster, modify: func(f *deleteFixture) {
+				f.workers = append(f.workers, otherPoolWorker("provision_pending"))
+				f.transitionalSince = map[string]time.Time{"o2": poolTestNow.Add(-WorkerStuckAfter + time.Minute)}
+			}},
+		{name: "a_provision_pending_worker_the_controller_has_not_timed_blocks", wantReason: ReasonWaitingForSettledCluster,
+			modify: func(f *deleteFixture) { f.workers = append(f.workers, otherPoolWorker("provision_pending")) }},
 		{name: "another pool holds the token", wantReason: ReasonWaitingForDisruptionToken,
 			modify: func(f *deleteFixture) {
 				other := poolObject("other", "other")
@@ -408,6 +415,89 @@ func TestMachinePoolScopeDeleteGates(t *testing.T) {
 			g.Expect(f.cordoned()).To(BeEmpty())
 		})
 	}
+}
+
+// otherPoolWorker is the worker o2 of another pool in state; ready capacity elsewhere keeps IBM's minimum, so only the
+// settled-cluster rule can hold the deletion for it.
+func otherPoolWorker(state string) kubernetesservice.Worker {
+	return kubernetesservice.Worker{ID: "o2", PoolID: "other-pool", Zone: "us-south-1", ActualState: state}
+}
+
+// TestMachinePoolScopeDeleteStuckWorker checks that both disruption gates of a pool deletion read the controller's
+// first-seen times (MachinePoolScopeInput.TransitionalSince): a worker IBM has left transitional for longer than
+// WorkerStuckAfter no longer holds the deletion, and the condition names it.
+func TestMachinePoolScopeDeleteStuckWorker(t *testing.T) {
+	stuckSince := map[string]time.Time{"o2": poolTestNow.Add(-WorkerStuckAfter - time.Minute)}
+	t.Run("a_provision_pending_worker_of_another_pool_first_seen_more_than_WorkerStuckAfter_ago_no_longer_blocks", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newDeleteFixture(t, nil)
+		f.workers = append(f.workers, otherPoolWorker("provision_pending"))
+		f.transitionalSince = stuckSince
+		f.expectIBM(ourPool(""))
+		outcome, remove := f.scope().ReconcileDelete(context.Background())
+		g.Expect(remove).To(BeFalse())
+		g.Expect(outcome).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNodes))))
+		g.Expect(f.deleting().Reason).To(Equal(string(ReasonDrainingNodes)))
+		g.Expect(f.deleting().Message).To(Equal("cordoning every victim Node, then evicting their pods; WorkerOperationStuck: " +
+			"IBM has been changing worker o2 for more than 60 minutes; treated like a failed worker, it no longer blocks worker removals"))
+		g.Expect(f.cordoned()).To(HaveLen(4))
+	})
+	for _, tc := range []struct {
+		name      string
+		since     map[string]time.Time
+		wantCall  bool
+		wantPhase infrav1.WorkerDisruptionPhase
+	}{
+		{name: "the_pre_call_gate_lets_a_stuck_worker_pass", since: stuckSince, wantCall: true,
+			wantPhase: infrav1.WorkerDisruptionPhaseWaitingForRemoval},
+		{name: "the_pre_call_gate_holds_for_a_worker_changing_for_less_than_WorkerStuckAfter",
+			since: map[string]time.Time{"o2": poolTestNow.Add(-time.Minute)}, wantPhase: infrav1.WorkerDisruptionPhaseWaitingForIBM},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			f := newDeleteFixture(t, nil)
+			f.others = append(f.others, heldLease(DisruptionTokenHolder(f.pool)))
+			f.pool.Status.Disruption = infrav1.WorkerDisruptionStatus{Operation: infrav1.WorkerDisruptionOperationDeletePool,
+				Phase: infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach, WorkerIDs: []string{"w0", "w1", "w2", "w3"},
+				DrainStartTime: metav1.NewTime(poolTestNow.Add(-10 * time.Minute))}
+			drainedAll(t, f)
+			f.workers = append(f.workers, otherPoolWorker("provisioning"))
+			f.transitionalSince = tc.since
+			f.expectIBM(ourPool(""))
+			if tc.wantCall {
+				f.ibm.EXPECT().RemoveWorkerPool(gomock.Any(), poolTestClusterID, poolTestPoolID).Return(nil)
+			}
+			_, remove := f.scope().ReconcileDelete(context.Background())
+			g.Expect(remove).To(BeFalse())
+			g.Expect(f.pool.Status.Disruption.Phase).To(Equal(tc.wantPhase))
+			if !tc.wantCall {
+				g.Expect(f.deleting().Reason).To(Equal(string(ReasonWaitingForSettledCluster)))
+				g.Expect(f.deleting().Message).To(ContainSubstring("worker o2 is provisioning"))
+			}
+		})
+	}
+	t.Run("the_deletion_hands_its_listing_back_for_the_first_seen_map", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newDeleteFixture(t, nil)
+		f.workers = append(f.workers, otherPoolWorker("provision_pending"))
+		f.expectIBM(ourPool(""))
+		scope := f.scope()
+		scope.ReconcileDelete(context.Background())
+		listed, ok := scope.ListedWorkers()
+		g.Expect(ok).To(BeTrue())
+		g.Expect(listed).To(Equal(f.workers))
+	})
+	t.Run("the skip path of a Cluster deletion lists nothing", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newDeleteFixture(t, nil)
+		f.cluster.DeletionTimestamp = ptr.To(metav1.NewTime(poolTestNow))
+		f.cluster.Finalizers = []string{clusterv1.ClusterFinalizer}
+		scope := f.scope()
+		_, remove := scope.ReconcileDelete(context.Background())
+		g.Expect(remove).To(BeTrue())
+		_, ok := scope.ListedWorkers()
+		g.Expect(ok).To(BeFalse())
+	})
 }
 
 func TestMachinePoolScopeDeleteInFlight(t *testing.T) {
@@ -749,14 +839,24 @@ func TestMachinePoolScopeDeleteExcludedDrainDetachLimit(t *testing.T) {
 		return outcome
 	}
 
-	// Nothing is cordoned, so the detach limit counts from status.disruption.drainStartTime.
+	// Nothing is cordoned, so the detach limit counts from status.disruption.drainStartTime. Neither the conditions
+	// nor the events say "cordon"; they say that the drain is excluded.
 	f.expectIBM(ourPool(""))
 	reconcile()
 	g.Expect(f.pool.Status.Disruption.DrainStartTime.Time).To(Equal(poolTestNow))
+	g.Expect(f.cordoned()).To(BeEmpty())
+	excluded := "the drain is excluded (machine.cluster.x-k8s.io/exclude-node-draining): CAPIBM leaves the victim Nodes " +
+		"schedulable and evicts no pod"
+	g.Expect(f.deleting().Message).To(Equal(excluded))
+	g.Expect(condition(f.pool, infrav1.IBMCloudManagedMachinePoolDrainingCondition).Message).To(Equal(excluded))
+	g.Expect(f.events()).To(Equal([]string{"Normal DrainStarted the drain of the 4 Nodes of pool workers is excluded " +
+		"(machine.cluster.x-k8s.io/exclude-node-draining): CAPIBM leaves them schedulable and evicts no pod"}))
 	f.clock.Step(20 * time.Second)
 	f.expectIBM(ourPool(""))
 	reconcile()
 	g.Expect(f.pool.Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach))
+	g.Expect(f.events()).To(Equal([]string{"Normal DrainCompleted the 4 Nodes of pool workers are not drained: " +
+		"machine.cluster.x-k8s.io/exclude-node-draining is set, so CAPIBM evicts no more pods"}))
 
 	f.clock.Step(20 * time.Second)
 	f.expectIBM(ourPool(""))

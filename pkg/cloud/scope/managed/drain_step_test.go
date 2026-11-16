@@ -449,29 +449,42 @@ func TestDrainBlockedEventDue(t *testing.T) {
 	}
 }
 
+// TestRecordDrainPhaseChange locks the texts of the drain events (golden), with and without exclude-node-draining: an
+// excluded drain never says "cordon".
 func TestRecordDrainPhaseChange(t *testing.T) {
 	testCases := []struct {
 		name     string
 		from, to infrav1.WorkerDisruptionPhase
+		excluded bool
 		want     []string
 	}{
 		{name: "start", from: "", to: infrav1.WorkerDisruptionPhaseDraining, want: []string{"Normal DrainStarted cordoning 2 Nodes of pool workers, then evicting their pods"}},
 		{name: "completed", from: infrav1.WorkerDisruptionPhaseDraining, to: infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach,
 			want: []string{"Normal DrainCompleted the 2 Nodes of pool workers are drained"}},
+		{name: "start of an excluded drain", from: "", to: infrav1.WorkerDisruptionPhaseDraining, excluded: true,
+			want: []string{"Normal DrainStarted the drain of the 2 Nodes of pool workers is excluded " +
+				"(machine.cluster.x-k8s.io/exclude-node-draining): CAPIBM leaves them schedulable and evicts no pod"}},
+		{name: "end of an excluded drain", from: infrav1.WorkerDisruptionPhaseDraining, to: infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach,
+			excluded: true, want: []string{"Normal DrainCompleted the 2 Nodes of pool workers are not drained: " +
+				"machine.cluster.x-k8s.io/exclude-node-draining is set, so CAPIBM evicts no more pods"}},
 		{name: "back to draining", from: infrav1.WorkerDisruptionPhaseWaitingForIBM, to: infrav1.WorkerDisruptionPhaseDraining},
 		{name: "no change", from: infrav1.WorkerDisruptionPhaseDraining, to: infrav1.WorkerDisruptionPhaseDraining},
+		{name: "no change of an excluded drain", from: infrav1.WorkerDisruptionPhaseDraining, to: infrav1.WorkerDisruptionPhaseDraining, excluded: true},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 			recorder := record.NewFakeRecorder(10)
-			RecordDrainPhaseChange(recorder, poolObject("workers", "workers"), tc.from, tc.to, 2)
+			RecordDrainPhaseChange(recorder, poolObject("workers", "workers"), tc.from, tc.to, 2, tc.excluded)
 			close(recorder.Events)
 			var events []string
 			for e := range recorder.Events {
 				events = append(events, e)
 			}
 			g.Expect(events).To(Equal(tc.want))
+			if tc.excluded {
+				g.Expect(events).NotTo(ContainElement(ContainSubstring("cordon")), "the drain is excluded: nothing is cordoned")
+			}
 		})
 	}
 }

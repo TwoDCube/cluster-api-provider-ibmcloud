@@ -29,9 +29,12 @@ import (
 // reconcileDelete runs the pool deletion and removes the finalizer once the scope allows it: right away when the
 // Cluster, the control plane or a clusterctl move deletes the pool (no drain, no IBM call), otherwise once IBM no
 // longer lists the pool, after every Node of it was drained. The deferred patch persists the finalizer removal and
-// every condition. Until then it requeues at deletePoll or at the wait the step named. scope is this reconcile's scope.
+// every condition. Until then it requeues at deletePoll or at the wait the step named. The deletion's worker listing
+// refreshes the first-seen map like any other (recordWorkers), and the skip path of a Cluster deletion drops the
+// Cluster's entries. scope is this reconcile's scope.
 func (r *IBMCloudManagedMachinePoolReconciler) reconcileDelete(ctx context.Context, scope *managedscope.MachinePoolScope) (ctrl.Result, error) {
 	outcome, removeFinalizer := scope.ReconcileDelete(ctx)
+	r.recordWorkers(scope)
 	if removeFinalizer {
 		controllerutil.RemoveFinalizer(scope.Pool, infrav1.IBMCloudManagedMachinePoolFinalizer)
 		return ctrl.Result{}, nil

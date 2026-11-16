@@ -44,6 +44,7 @@ import (
 
 	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
 	infrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/v1alpha1"
+	managedscope "sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/scope/managed"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
 	ksmock "sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice/mock"
 
@@ -295,6 +296,161 @@ func testDeleteWaitsForTheWorkloadCluster(t *testing.T) {
 	g.Expect(deleting.Reason).To(Equal(infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForWorkloadClusterReason), "no RemoveWorkerPool")
 }
 
+// expectDeleteObservationWith expects the IBM reads of one delete reconcile of the steady pool, whose IBM cluster also
+// lists extra.
+func (f *machinePoolFixture) expectDeleteObservationWith(extra ...kubernetesservice.Worker) {
+	f.ibm.EXPECT().GetCluster(gomock.Any(), mpTestClusterID, testResourceGroupID).Return(&kubernetesservice.Cluster{State: "normal"}, nil)
+	f.ibm.EXPECT().ListWorkerPools(gomock.Any(), mpTestClusterID).Return([]kubernetesservice.WorkerPool{{
+		ID: mpTestPoolID, Name: "workers", Flavor: mpTestFlavor, SizePerZone: 2,
+	}}, nil)
+	f.ibm.EXPECT().ListWorkers(gomock.Any(), mpTestClusterID).Return(append(mpTestWorkers(), extra...), nil)
+}
+
+// deletingReason returns the reason and message of the stored pool's Deleting condition.
+func (f *machinePoolFixture) deletingReason() (string, string) {
+	f.t.Helper()
+	deleting := conditions.Get(f.stored(), infrav1.IBMCloudManagedMachinePoolDeletingCondition)
+	if deleting == nil {
+		return "", ""
+	}
+	return deleting.Reason, deleting.Message
+}
+
+// restarted returns a reconciler with r's dependencies and an empty first-seen map, as after a controller restart.
+func restarted(r *IBMCloudManagedMachinePoolReconciler) *IBMCloudManagedMachinePoolReconciler {
+	return &IBMCloudManagedMachinePoolReconciler{Client: r.Client, APIReader: r.APIReader, Recorder: r.Recorder,
+		Resolver: r.Resolver, ClientBuilder: r.ClientBuilder, ClusterCache: r.ClusterCache, Clock: r.Clock,
+		WatchFilterValue: r.WatchFilterValue}
+}
+
+// holdUntil reconciles the deleting pool every 10 minutes while o2 stays provision_pending, as the deletion's own
+// requeue (guardedPoll, 2 minutes) would, and expects every reconcile to hold at the settled-cluster gate; then it
+// sets the clock to at. The listings keep the reconciler's first-seen map current (transitionalObservationMaxGap).
+//
+// Parameters:
+//   - r is the reconciler.
+//   - at is the clock reading to stop at.
+func (f *machinePoolFixture) holdUntil(r *IBMCloudManagedMachinePoolReconciler, at time.Time) {
+	f.t.Helper()
+	g := NewWithT(f.t)
+	const every = 10 * time.Minute
+	for f.clock.Now().Add(every).Before(at) {
+		f.clock.Step(every)
+		f.expectDeleteObservationWith(mpTestOtherWorker("provision_pending"))
+		_, err := f.reconcile(r)
+		g.Expect(err).NotTo(HaveOccurred())
+		reason, _ := f.deletingReason()
+		g.Expect(reason).To(Equal(infrav1.IBMCloudManagedMachinePoolDeletingWaitingForSettledClusterReason), "held at %s", f.clock.Now())
+	}
+	f.clock.SetTime(at)
+}
+
+// TestIBMCloudManagedMachinePoolReconcileDeleteStuckWorker checks CheckDisruption rule 1 in the controller: the
+// reconciler's first-seen map, fed by its own listings and read through the fake clock, decides whether another
+// pool's provision_pending worker still holds a pool deletion's gates. The map lives in memory only, so after a
+// restart such a worker blocks again until WorkerStuckAfter has passed (fail closed).
+func TestIBMCloudManagedMachinePoolReconcileDeleteStuckWorker(t *testing.T) {
+	settled := infrav1.IBMCloudManagedMachinePoolDeletingWaitingForSettledClusterReason
+	draining := infrav1.IBMCloudManagedMachinePoolDeletingDrainingNodesReason
+	// firstReconcile reconciles the deleting pool once at mpTestNow, while o2 is provision_pending: the gate holds.
+	firstReconcile := func(t *testing.T, f *machinePoolFixture, r *IBMCloudManagedMachinePoolReconciler) {
+		t.Helper()
+		g := NewWithT(t)
+		f.expectDeleteObservationWith(mpTestOtherWorker("provision_pending"))
+		_, err := f.reconcile(r)
+		g.Expect(err).NotTo(HaveOccurred())
+		reason, message := f.deletingReason()
+		g.Expect(reason).To(Equal(settled))
+		g.Expect(message).To(ContainSubstring("worker o2 is provision_pending"))
+	}
+	// lastReconcile reconciles once more with o2 still provision_pending and returns the Deleting reason and message.
+	lastReconcile := func(t *testing.T, f *machinePoolFixture, r *IBMCloudManagedMachinePoolReconciler) (string, string) {
+		t.Helper()
+		f.expectDeleteObservationWith(mpTestOtherWorker("provision_pending"))
+		_, err := f.reconcile(r)
+		NewWithT(t).Expect(err).NotTo(HaveOccurred())
+		return f.deletingReason()
+	}
+	t.Run("first_seen_more_than_60m_ago_it_no_longer_blocks_and_is_named", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newMachinePoolFixture(t)
+		calls := f.deletingMachinePool(t)
+		r := f.reconciler()
+		firstReconcile(t, f, r)
+		f.holdUntil(r, mpTestNow.Add(managedscope.WorkerStuckAfter+time.Minute))
+		g.Expect(calls.all()).To(BeEmpty(), "nothing is cordoned while the gate holds")
+
+		reason, message := lastReconcile(t, f, r)
+		g.Expect(reason).To(Equal(draining), "the gates pass")
+		g.Expect(message).To(ContainSubstring("WorkerOperationStuck: IBM has been changing worker o2 for more than 60 minutes"))
+		g.Expect(calls.all()).To(ContainElement("cordon 10.0.0.1"))
+	})
+	t.Run("first_seen_less_than_60m_ago_it_still_blocks", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newMachinePoolFixture(t)
+		calls := f.deletingMachinePool(t)
+		r := f.reconciler()
+		firstReconcile(t, f, r)
+		f.holdUntil(r, mpTestNow.Add(managedscope.WorkerStuckAfter-time.Minute))
+		reason, _ := lastReconcile(t, f, r)
+		g.Expect(reason).To(Equal(settled))
+		g.Expect(calls.all()).To(BeEmpty())
+	})
+	t.Run("a_restart_blocks_again_until_WorkerStuckAfter_has_passed_since_the_restart", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newMachinePoolFixture(t)
+		calls := f.deletingMachinePool(t)
+		r := f.reconciler()
+		firstReconcile(t, f, r)
+		f.holdUntil(r, mpTestNow.Add(managedscope.WorkerStuckAfter+time.Minute))
+
+		// The controller restarts after the worker has been provision_pending for more than WorkerStuckAfter.
+		r = restarted(r)
+		restart := f.clock.Now()
+		reason, _ := lastReconcile(t, f, r)
+		g.Expect(reason).To(Equal(settled), "the empty map fails closed")
+		f.holdUntil(r, restart.Add(managedscope.WorkerStuckAfter-time.Minute))
+		reason, _ = lastReconcile(t, f, r)
+		g.Expect(reason).To(Equal(settled), "still within WorkerStuckAfter of the restart")
+		g.Expect(calls.all()).To(BeEmpty())
+
+		f.holdUntil(r, restart.Add(managedscope.WorkerStuckAfter+time.Minute))
+		reason, _ = lastReconcile(t, f, r)
+		g.Expect(reason).To(Equal(draining))
+	})
+	t.Run("a_gap_in_the_listings_longer_than_WorkerStuckAfter_counts_like_a_restart", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newMachinePoolFixture(t)
+		f.deletingMachinePool(t)
+		r := f.reconciler()
+		firstReconcile(t, f, r)
+		// No pool of the Cluster listed the workers in between (a paused Cluster, a stalled controller).
+		f.clock.Step(managedscope.WorkerStuckAfter + time.Minute)
+		reason, _ := lastReconcile(t, f, r)
+		g.Expect(reason).To(Equal(settled), "nothing shows that o2 stayed transitional in between")
+	})
+	t.Run("the entry is dropped once the worker is deployed", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newMachinePoolFixture(t)
+		f.deletingMachinePool(t)
+		r := f.reconciler()
+		f.expectDeleteObservationWith(mpTestOtherWorker("provision_pending"))
+		_, err := f.reconcile(r)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(r.transitional.snapshot("cluster-uid", f.clock.Now())).To(HaveKey("o2"), "the deletion's listing feeds the map")
+
+		f.clock.Step(10 * time.Minute)
+		deployed := mpTestOtherWorker("deployed")
+		deployed.HealthState = "normal"
+		f.expectDeleteObservationWith(deployed)
+		_, err = f.reconcile(r)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(r.transitional.snapshot("cluster-uid", f.clock.Now())).To(BeNil())
+		reason, _ := f.deletingReason()
+		g.Expect(reason).To(Equal(draining))
+	})
+}
+
 // envtestDeletablePool creates, in namespace, a managed Cluster named name with its IBMCloudManagedCluster, an
 // IBMCloudManagedControlPlane whose IBM cluster exists, a MachinePool and the IBMCloudManagedMachinePool "workers" it
 // owns.
@@ -398,9 +554,19 @@ func TestIBMCloudManagedMachinePoolFinalizerEnvtest(t *testing.T) {
 	})
 }
 
+// TestIBMCloudManagedMachinePoolConnectEventEnvtest runs the pool controller behind a real manager and a real
+// ClusterCache: a deletion that waits for the workload cluster is reconciled on the connect event, long before
+// guardedPoll. Test isolation: the manager's cache, and so its watches and the ClusterCache, see only this test's
+// namespace, so that objects other tests leave in the shared API server never reach this reconciler and its IBM mock;
+// and the Cluster is paused when the test ends, after the manager stopped, so that a manager of a later test leaves
+// the objects left behind alone.
 func TestIBMCloudManagedMachinePoolConnectEventEnvtest(t *testing.T) {
 	g := NewWithT(t)
-	mgr := newTestManager(t)
+	namespace := newTestNamespace(t, "pool-connect")
+	cluster, pool := envtestDeletablePool(t, namespace, "dev")
+	// Registered before the manager starts, so it runs after the manager has stopped (cleanups run last in, first out).
+	pauseAtCleanup(t, cluster, client.ObjectKeyFromObject(pool))
+	mgr := newNamespacedTestManager(t, namespace)
 	clusterCache, err := SetupClusterCache(ctx, mgr, ClusterCacheOptions{})
 	g.Expect(err).NotTo(HaveOccurred())
 	shutdownClusterCacheOnCleanup(t, clusterCache)
@@ -419,8 +585,6 @@ func TestIBMCloudManagedMachinePoolConnectEventEnvtest(t *testing.T) {
 	g.Expect(r.SetupWithManager(ctx, mgr)).To(Succeed())
 	startTestManager(t, mgr)
 
-	namespace := newTestNamespace(t, "pool-connect")
-	cluster, pool := envtestDeletablePool(t, namespace, "dev")
 	key := client.ObjectKeyFromObject(pool)
 	read := func() *infrav1.IBMCloudManagedMachinePool {
 		stored := &infrav1.IBMCloudManagedMachinePool{}
