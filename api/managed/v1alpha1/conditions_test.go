@@ -175,6 +175,8 @@ var managedMachinePoolConditionCatalogue = []conditionCatalogue{
 			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateAutoRebalanceDisabledReason,
 			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateReplacementNotCreatedReason,
 			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWorkerOperationStuckReason,
+			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateExternallyAutoscaledReason,
+			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateIBMAPIErrorReason,
 		},
 	},
 	{

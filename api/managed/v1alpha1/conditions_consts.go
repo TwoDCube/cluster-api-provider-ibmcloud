@@ -241,6 +241,18 @@ const (
 	// IBMCloudManagedMachinePoolWorkersUpToDateWorkerOperationStuckReason surfaces when a worker stays transitional for
 	// longer than an hour.
 	IBMCloudManagedMachinePoolWorkersUpToDateWorkerOperationStuckReason = "WorkerOperationStuck"
+
+	// IBMCloudManagedMachinePoolWorkersUpToDateExternallyAutoscaledReason surfaces while IBM's cluster autoscaler owns the
+	// pool: CAPIBM starts no worker replacement in it. It is the token WorkerPoolReady and Deleting use for the same
+	// cause.
+	IBMCloudManagedMachinePoolWorkersUpToDateExternallyAutoscaledReason = "ExternallyAutoscaled"
+
+	// IBMCloudManagedMachinePoolWorkersUpToDateIBMAPIErrorReason surfaces when IBM answered the replacement of a worker
+	// with an error that the pool's common error handling reports: a 401 (CAPIBM rebuilds the credentials), a 403 for a
+	// missing Kubernetes Service role, or a 400. The message names the call and, for a 403 or a 400, the HTTP status and
+	// IBM's error code; the replacement is requested again at most once every 3 minutes. It is the token WorkerPoolReady
+	// and Deleting use for a failed IBM call.
+	IBMCloudManagedMachinePoolWorkersUpToDateIBMAPIErrorReason = "IBMAPIError"
 )
 
 // Draining is an activity condition (v1beta2 style): True while CAPIBM drains Nodes of the pool.
