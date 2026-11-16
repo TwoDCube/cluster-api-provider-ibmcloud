@@ -1,0 +1,75 @@
+{
+  "id": "roksclusterid0000002",
+  "name": "example-test-cluster-probe-roks",
+  "region": "eu-de",
+  "resourceGroup": "0123456789abcdef0123456789abcdef",
+  "resourceGroupName": "example-test-cluster",
+  "podSubnet": "172.17.64.0/18",
+  "serviceSubnet": "172.21.0.0/16",
+  "createdDate": "2026-11-16T03:06:29+0000",
+  "masterKubeVersion": "4.21.35_1537_openshift",
+  "targetVersion": "4.21.35_1537_openshift",
+  "workerCount": 2,
+  "location": "Frankfurt",
+  "datacenter": "fra02",
+  "multiAzCapable": true,
+  "provider": "vpc-gen2",
+  "calicoIPAutodetectionConfig": "",
+  "state": "normal",
+  "status": "All Workers Normal",
+  "versionEOS": "",
+  "isPaid": true,
+  "entitlement": "default",
+  "type": "openshift",
+  "addons": null,
+  "etcdPort": "",
+  "masterURL": "https://c113-e.eu-de.containers.cloud.ibm.com:30102",
+  "ingress": {
+    "hostname": "",
+    "secretName": "",
+    "status": "critical",
+    "message": "Some Ingress components are in a critical state. To view the state of your Ingress components, run `ibmcloud ks ingress status-report get`."
+  },
+  "caCertRotationStatus": {
+    "status": "",
+    "actionTriggerDate": "",
+    "actionCompletedDate": ""
+  },
+  "imageSecurityEnabled": false,
+  "lifecycle": {
+    "masterStatus": "Ready",
+    "masterStatusModifiedDate": "2026-11-16T03:27:10+0000",
+    "masterHealth": "normal",
+    "masterState": "deployed",
+    "modifiedDate": "2026-11-16T03:07:38+0000"
+  },
+  "serviceEndpoints": {
+    "privateServiceEndpointEnabled": true,
+    "privateServiceEndpointURL": "https://c113.private.eu-de.containers.cloud.ibm.com:30102",
+    "publicServiceEndpointEnabled": true,
+    "publicServiceEndpointURL": "https://c113-e.eu-de.containers.cloud.ibm.com:30102"
+  },
+  "features": {
+    "keyProtectEnabled": false,
+    "pullSecretApplied": false
+  },
+  "offering": "openshift",
+  "disableAutoUpdate": false,
+  "crn": "crn:v1:bluemix:public:containers-kubernetes:eu-de:a/a1b2c3d4e5f60718293a4b5c6d7e8f90:roksclusterid0000002::",
+  "workerZones": [
+    "eu-de-1"
+  ],
+  "supportedOperatingSystems": [
+    "REDHAT_9_64",
+    "RHCOS"
+  ],
+  "ignitionServerURL": "https://c113-e.eu-de.containers.cloud.ibm.com:30103",
+  "konnectivityServerURL": "https://roksclusterid0000002.vpe.private.eu-de.containers.cloud.ibm.com:30105",
+  "networkPlugin": "Calico",
+  "outboundTrafficProtection": "enabled",
+  "secureByDefault": "enabled",
+  "vpcs": [
+    "r010-00000000-0000-4000-8000-000000000011"
+  ],
+  "virtualPrivateEndpointURL": "https://roksclusterid0000002.vpe.private.eu-de.containers.cloud.ibm.com:30102"
+}

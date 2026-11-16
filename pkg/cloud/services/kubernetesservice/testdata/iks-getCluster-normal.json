@@ -1,0 +1,73 @@
+{
+  "id": "iksclusterid00000001",
+  "name": "example-test-cluster-probe-iks",
+  "region": "eu-de",
+  "resourceGroup": "0123456789abcdef0123456789abcdef",
+  "resourceGroupName": "example-test-cluster",
+  "podSubnet": "172.17.0.0/18",
+  "serviceSubnet": "172.21.0.0/16",
+  "createdDate": "2026-11-16T03:05:33+0000",
+  "masterKubeVersion": "1.36.5_1537",
+  "targetVersion": "1.36.5_1537",
+  "workerCount": 1,
+  "location": "Frankfurt",
+  "datacenter": "fra02",
+  "multiAzCapable": true,
+  "provider": "vpc-gen2",
+  "calicoIPAutodetectionConfig": "",
+  "state": "normal",
+  "status": "All Workers Normal",
+  "versionEOS": "",
+  "isPaid": true,
+  "entitlement": "",
+  "type": "kubernetes",
+  "addons": null,
+  "etcdPort": "",
+  "masterURL": "https://c111.eu-de.containers.cloud.ibm.com:30101",
+  "ingress": {
+    "hostname": "",
+    "secretName": "",
+    "status": "warning",
+    "message": "Some Ingress components are in a warning state. To view the state of your Ingress components, run `ibmcloud ks ingress status-report get`."
+  },
+  "caCertRotationStatus": {
+    "status": "",
+    "actionTriggerDate": "",
+    "actionCompletedDate": ""
+  },
+  "imageSecurityEnabled": false,
+  "lifecycle": {
+    "masterStatus": "Ready",
+    "masterStatusModifiedDate": "2026-11-16T03:18:28+0000",
+    "masterHealth": "normal",
+    "masterState": "deployed",
+    "modifiedDate": "2026-11-16T03:05:56+0000"
+  },
+  "serviceEndpoints": {
+    "privateServiceEndpointEnabled": true,
+    "privateServiceEndpointURL": "https://c111.private.eu-de.containers.cloud.ibm.com:30101",
+    "publicServiceEndpointEnabled": true,
+    "publicServiceEndpointURL": "https://c111.eu-de.containers.cloud.ibm.com:30101"
+  },
+  "features": {
+    "keyProtectEnabled": false,
+    "pullSecretApplied": false
+  },
+  "offering": "kubernetes",
+  "disableAutoUpdate": false,
+  "crn": "crn:v1:bluemix:public:containers-kubernetes:eu-de:a/a1b2c3d4e5f60718293a4b5c6d7e8f90:iksclusterid00000001::",
+  "workerZones": [
+    "eu-de-1"
+  ],
+  "supportedOperatingSystems": [
+    "UBUNTU_24_64"
+  ],
+  "konnectivityServerURL": "https://iksclusterid00000001.vpe.private.eu-de.containers.cloud.ibm.com:30104",
+  "networkPlugin": "Calico",
+  "outboundTrafficProtection": "enabled",
+  "secureByDefault": "enabled",
+  "vpcs": [
+    "r010-00000000-0000-4000-8000-000000000011"
+  ],
+  "virtualPrivateEndpointURL": "https://iksclusterid00000001.vpe.private.eu-de.containers.cloud.ibm.com:30101"
+}

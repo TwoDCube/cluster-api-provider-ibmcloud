@@ -41,11 +41,15 @@ const (
 	RM serviceID = "rm"
 	// GlobalTagging used to identify the Global Tagging service.
 	GlobalTagging serviceID = "globaltagging"
+	// Containers identifies the IBM Cloud Kubernetes Service API (IKS and ROKS), for example
+	// "--service-endpoint=eu-de:containers=https://private.eu-de.containers.cloud.ibm.com/global". The managed
+	// Kubernetes client builder looks it up per region with FetchRegionalEndpoint and uses the global URL otherwise.
+	Containers serviceID = "containers"
 )
 
 type serviceID string
 
-var serviceIDs = []serviceID{VPC, PowerVS, RC, TransitGateway, COS, RM, GlobalTagging}
+var serviceIDs = []serviceID{VPC, PowerVS, RC, TransitGateway, COS, RM, GlobalTagging, Containers}
 
 // ServiceEndpoint holds the Service endpoint specific information.
 type ServiceEndpoint struct {
@@ -160,6 +164,27 @@ func FetchRCEndpoint(serviceEndpoint []ServiceEndpoint) string {
 func FetchEndpoints(serviceID string, serviceEndpoint []ServiceEndpoint) string {
 	for _, endpoint := range serviceEndpoint {
 		if endpoint.ID == serviceID {
+			return endpoint.URL
+		}
+	}
+	return ""
+}
+
+// FetchRegionalEndpoint returns the URL of the --service-endpoint entry whose service ID and region both match, or ""
+// when there is none. Unlike FetchEndpoints it never returns another region's entry: the IBM Cloud Kubernetes Service
+// has one global API and per-region private endpoints, so an entry configured for one region must not be used for a
+// cluster in another region.
+//
+// Parameters:
+//   - serviceID is the service ID of the entry, for example string(Containers).
+//   - region is the IBM Cloud region of the resource being reconciled, for example "eu-de".
+//   - serviceEndpoint is the parsed --service-endpoint flag (ParseServiceEndpointFlag); it may be empty.
+func FetchRegionalEndpoint(serviceID, region string, serviceEndpoint []ServiceEndpoint) string {
+	if serviceID == "" || region == "" {
+		return ""
+	}
+	for _, endpoint := range serviceEndpoint {
+		if endpoint.ID == serviceID && endpoint.Region == region {
 			return endpoint.URL
 		}
 	}

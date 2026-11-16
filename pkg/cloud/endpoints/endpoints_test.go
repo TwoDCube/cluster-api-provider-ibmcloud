@@ -20,14 +20,17 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	. "github.com/onsi/gomega"
 )
 
 const (
-	testVPCHost   = "https://vpchost:8080"
-	testRCHost    = "https://rchost:8080"
-	testRegionLon = "lon"
-	testRegionUS  = "us-south"
-	testPowerVSID = "powervs"
+	testContainersHost = "https://private.eu-de.containers.cloud.ibm.com/global"
+	testVPCHost        = "https://vpchost:8080"
+	testRCHost         = "https://rchost:8080"
+	testRegionLon      = "lon"
+	testRegionUS       = "us-south"
+	testPowerVSID      = "powervs"
 )
 
 func TestParseFlags(t *testing.T) {
@@ -156,6 +159,29 @@ func TestParseFlags(t *testing.T) {
 			flagToParse:    "eu-gb=localhost",
 			expectedOutput: nil,
 			expectedError:  errServiceEndpointRegion,
+		},
+		{
+			name:        "containers service per region",
+			flagToParse: "eu-de:containers=" + testContainersHost + ";" + testRegionUS + ":containers=https://private.us-south.containers.cloud.ibm.com/global",
+			expectedOutput: []ServiceEndpoint{
+				{
+					ID:     "containers",
+					URL:    testContainersHost,
+					Region: "eu-de",
+				},
+				{
+					ID:     "containers",
+					URL:    "https://private.us-south.containers.cloud.ibm.com/global",
+					Region: testRegionUS,
+				},
+			},
+			expectedError: nil,
+		},
+		{
+			name:           "containers service defined twice for one region",
+			flagToParse:    "eu-de:containers=" + testContainersHost + ",containers=https://other:8080/global",
+			expectedOutput: nil,
+			expectedError:  errServiceEndpointDuplicateID,
 		},
 	}
 
@@ -404,6 +430,79 @@ func TestCostructRegionFromZone(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			out := ConstructRegionFromZone(tc.zone)
 			require.Equal(t, tc.expectedRegion, out)
+		})
+	}
+}
+
+func TestFetchRegionalEndpoint(t *testing.T) {
+	configured := []ServiceEndpoint{
+		{ID: string(VPC), URL: testVPCHost, Region: "eu-de"},
+		{ID: string(Containers), URL: testContainersHost, Region: "eu-de"},
+		{ID: string(Containers), URL: "https://private.us-south.containers.cloud.ibm.com/global", Region: testRegionUS},
+		{ID: string(RC), URL: testRCHost},
+	}
+	testCases := []struct {
+		name            string
+		serviceID       string
+		region          string
+		serviceEndpoint []ServiceEndpoint
+		expectedOutput  string
+	}{
+		{
+			name:            "the entry of the region wins",
+			serviceID:       string(Containers),
+			region:          "eu-de",
+			serviceEndpoint: configured,
+			expectedOutput:  testContainersHost,
+		},
+		{
+			name:            "another region's entry is never used",
+			serviceID:       string(Containers),
+			region:          "jp-tok",
+			serviceEndpoint: configured,
+			expectedOutput:  "",
+		},
+		{
+			name:            "a regionless entry is not a regional entry",
+			serviceID:       string(RC),
+			region:          "eu-de",
+			serviceEndpoint: configured,
+			expectedOutput:  "",
+		},
+		{
+			name:            "another service of the same region is not returned",
+			serviceID:       string(Containers),
+			region:          testRegionUS,
+			serviceEndpoint: []ServiceEndpoint{{ID: string(VPC), URL: testVPCHost, Region: testRegionUS}},
+			expectedOutput:  "",
+		},
+		{
+			name:            "no entries",
+			serviceID:       string(Containers),
+			region:          "eu-de",
+			serviceEndpoint: nil,
+			expectedOutput:  "",
+		},
+		{
+			name:            "empty region",
+			serviceID:       string(Containers),
+			region:          "",
+			serviceEndpoint: []ServiceEndpoint{{ID: string(Containers), URL: testContainersHost}},
+			expectedOutput:  "",
+		},
+		{
+			name:            "empty service ID",
+			serviceID:       "",
+			region:          "eu-de",
+			serviceEndpoint: configured,
+			expectedOutput:  "",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(FetchRegionalEndpoint(tc.serviceID, tc.region, tc.serviceEndpoint)).To(Equal(tc.expectedOutput))
 		})
 	}
 }
