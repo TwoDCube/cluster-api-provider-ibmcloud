@@ -61,7 +61,9 @@ of service on IBM's schedule (in November 2026 IBM listed 2027-01-20 for IKS 1.3
   Unlike a refused `UpdateMaster`, a refused listing is tried again at every poll of the control plane (about every
   5 minutes), so a granted role takes effect within minutes. A 401, a 429 or a 5xx answer changes no condition: CAPIBM
   rebuilds the credentials, waits for IBM's `Retry-After`, or retries with a backoff. Once the listings succeed, the
-  update continues; a request already on record keeps its retry time.
+  update continues; a request already on record keeps its retry time. A refused `UpdateMaster` that the condition
+  showed before the listing failed is not shown again: the reason then reads `UpgradeFailed` ("... CAPIBM requests it
+  again at <retry time>"), with the same retry time, so no request is lost or added.
 * If IBM reports a master version that CAPIBM cannot parse, `MasterVersionUpToDate` is `Unknown` with the reason
   `UnparsableMasterVersion`, and the message quotes the value: "IBM reports master version "<value>" for IBM cluster
   <id>, which CAPIBM cannot parse, ...". CAPIBM cannot tell which minor the master runs, so it requests no master update

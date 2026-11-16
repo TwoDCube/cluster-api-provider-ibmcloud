@@ -44,7 +44,7 @@ CAPIBM makes no IBM call and writes nothing to the workload cluster.
 | | False | `UserProvidedSecretInvalid` | a user-provided Secret lacks the `cluster.x-k8s.io/cluster-name` label or a non-empty `value` key |
 | `MasterVersionUpToDate` | True | `UpToDate` | the master runs the minor of `spec.distributionVersion`, whatever patch; an end of support within 45 days is mentioned |
 | | False | `UpgradePending` | a requested minor update is in flight at IBM |
-| | False | `UpgradeFailed` | the requested update has not taken effect and IBM shows no update in progress; the message names the retry time |
+| | False | `UpgradeFailed` | the requested update has not taken effect and IBM shows no update in progress; the message names the retry time. Also after a refused `UpdateMaster` whose `PermissionDenied` a failed listing (below) replaced, with the same retry time |
 | | False | `VersionSkipNotAllowed` | `spec.distributionVersion` is more than one minor above the master |
 | | False | `DowngradeNotAllowed` | `spec.distributionVersion` is below the master minor |
 | | False | `VersionNotAvailable` | IBM does not offer the requested minor |

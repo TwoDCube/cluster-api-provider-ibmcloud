@@ -202,7 +202,8 @@ per zone ([Topology](./topology.md#smaller-topologies-are-not-ha)). CAPIBM ignor
   description in the controller log. CAPIBM tries the listing again at every poll, so a fix takes effect within minutes
   ([Upgrades](./upgrades.md#when-ibm-does-not-take-the-update)).
 * **`UpgradeFailed`**: the requested minor has not taken effect and IBM shows no update in progress; CAPIBM asks again
-  at the time in the message. Check the cluster in IBM Cloud.
+  at the time in the message. Check the cluster in IBM Cloud. It also follows a refused `UpdateMaster` whose
+  `PermissionDenied` a failed listing replaced, once the listing works again; the retry time stays the same.
 * **`UnparsableMasterVersion`** (`MasterVersionUpToDate=Unknown`): IBM reports a master version CAPIBM cannot parse,
   and the message quotes it; no master update is requested until IBM reports a version CAPIBM can parse. If it stays,
   report the quoted value ([Upgrades](./upgrades.md#when-ibm-does-not-take-the-update)).
