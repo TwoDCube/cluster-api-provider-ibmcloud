@@ -57,6 +57,7 @@ import (
 	powervscontroller "sigs.k8s.io/cluster-api-provider-ibmcloud/internal/controllers/powervs"
 	vpccontroller "sigs.k8s.io/cluster-api-provider-ibmcloud/internal/controllers/vpc"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/endpoints"
+	managedwebhooks "sigs.k8s.io/cluster-api-provider-ibmcloud/webhooks/managed/admission"
 	powervs "sigs.k8s.io/cluster-api-provider-ibmcloud/webhooks/powervs/admission"
 	vpc "sigs.k8s.io/cluster-api-provider-ibmcloud/webhooks/vpc/admission"
 
@@ -424,6 +425,22 @@ func setupWebhooks(mgr ctrl.Manager) {
 	}
 	if err := (&powervs.IBMPowerVSClusterTemplate{}).SetupWebhookWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create webhook", "webhook", "IBMPowerVSClusterTemplate")
+		os.Exit(1)
+	}
+	// The managed webhooks are always registered; with the ManagedKubernetes gate off they reject only create, so that
+	// a user gets a clear error instead of a failing webhook call, and existing objects can still be changed and
+	// deleted.
+	managedEnabled := feature.Gates.Enabled(feature.ManagedKubernetes)
+	if err := (&managedwebhooks.IBMCloudManagedCluster{ManagedKubernetesEnabled: managedEnabled, Reader: mgr.GetAPIReader()}).SetupWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "IBMCloudManagedCluster")
+		os.Exit(1)
+	}
+	if err := (&managedwebhooks.IBMCloudManagedMachinePool{ManagedKubernetesEnabled: managedEnabled}).SetupWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "IBMCloudManagedMachinePool")
+		os.Exit(1)
+	}
+	if err := (&managedwebhooks.IBMCloudManagedControlPlane{ManagedKubernetesEnabled: managedEnabled, Reader: mgr.GetAPIReader()}).SetupWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "IBMCloudManagedControlPlane")
 		os.Exit(1)
 	}
 }
