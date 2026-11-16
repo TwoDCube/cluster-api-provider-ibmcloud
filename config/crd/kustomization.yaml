@@ -31,10 +31,6 @@ resources:
 # the following config is for teaching kustomize how to do kustomization for CRDs.
 configurations:
 - kustomizeconfig.yaml
-labels:
-- includeSelectors: true
-  pairs:
-    cluster.x-k8s.io/v1beta1: v1beta2
 patches:
 - path: patches/webhook_in_ibmvpcclusters.yaml
 - path: patches/webhook_in_ibmvpcmachines.yaml
@@ -50,7 +46,36 @@ patches:
 - path: patches/cainjection_in_ibmpowervsmachinetemplates.yaml
 - path: patches/cainjection_in_ibmvpcmachinetemplates.yaml
 - path: patches/cainjection_in_ibmpowervsimages.yaml
-# Contract label patches - PowerVS v1beta3 implements Cluster API v1beta2 contract
+# Contract label patches, one per API family, so that every CRD claims only the Cluster API contract versions its own
+# API family implements. A global labels block would also stamp cluster.x-k8s.io/v1beta1: v1beta2 on CRDs of an API
+# family that has no version for the v1beta1 contract.
+# VPC v1beta2 implements the Cluster API v1beta1 contract
+- patch: |-
+    apiVersion: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    metadata:
+      name: vpc-contract-label
+      labels:
+        cluster.x-k8s.io/v1beta1: v1beta2
+  target:
+    group: apiextensions.k8s.io
+    version: v1
+    kind: CustomResourceDefinition
+    name: ibmvpc.*
+# PowerVS v1beta2 implements the Cluster API v1beta1 contract
+- patch: |-
+    apiVersion: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    metadata:
+      name: powervs-v1beta1-contract-label
+      labels:
+        cluster.x-k8s.io/v1beta1: v1beta2
+  target:
+    group: apiextensions.k8s.io
+    version: v1
+    kind: CustomResourceDefinition
+    name: ibmpowervs.*
+# PowerVS v1beta3 implements Cluster API v1beta2 contract
 - patch: |-
     apiVersion: apiextensions.k8s.io/v1
     kind: CustomResourceDefinition
