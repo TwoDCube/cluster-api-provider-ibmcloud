@@ -203,6 +203,18 @@ const (
 	// requested minor.
 	IBMCloudManagedControlPlaneMasterVersionUpToDateVersionNotAvailableReason = "VersionNotAvailable"
 
+	// IBMCloudManagedControlPlaneMasterVersionUpToDateIBMAPIErrorReason surfaces when, after a raise of
+	// spec.distributionVersion, IBM refused a call that the update needs before it can be requested (listing the offered
+	// versions or the workers) with an answer that a retry with backoff does not fix, such as HTTP 400 or 404 (HTTP 403
+	// is PermissionDenied). The message names the call and IBM's error code; the call is made again at the next poll of
+	// the control plane.
+	IBMCloudManagedControlPlaneMasterVersionUpToDateIBMAPIErrorReason = "IBMAPIError"
+
+	// IBMCloudManagedControlPlaneMasterVersionUpToDateUnparsableMasterVersionReason surfaces, with status Unknown, when
+	// IBM reports a master version that CAPIBM cannot parse: whether the master runs spec.distributionVersion is not
+	// known, and no master update is requested until IBM reports a version CAPIBM can parse.
+	IBMCloudManagedControlPlaneMasterVersionUpToDateUnparsableMasterVersionReason = "UnparsableMasterVersion"
+
 	// IBMCloudManagedControlPlaneMasterVersionUpToDateBlockedByCARotationReason surfaces while a CA rotation blocks the
 	// update.
 	IBMCloudManagedControlPlaneMasterVersionUpToDateBlockedByCARotationReason = "BlockedByCARotation"
