@@ -53,6 +53,8 @@ const (
 	OpListWorkers Operation = "ListWorkers"
 	// OpReplaceWorker is KubernetesService.ReplaceWorker.
 	OpReplaceWorker Operation = "ReplaceWorker"
+	// OpRemoveWorkerPool is KubernetesService.RemoveWorkerPool.
+	OpRemoveWorkerPool Operation = "RemoveWorkerPool"
 	// OpResizeWorkerPool is KubernetesService.ResizeWorkerPool.
 	OpResizeWorkerPool Operation = "ResizeWorkerPool"
 )
@@ -223,7 +225,7 @@ func classifyOperation(op Operation, apiErr *APIError) ErrorClass {
 		return classifyCreateCluster(apiErr)
 	case OpCreateWorkerPool:
 		return classifyCreateWorkerPool(apiErr)
-	case OpResizeWorkerPool:
+	case OpRemoveWorkerPool, OpResizeWorkerPool:
 		return classifyPoolSizeChange(apiErr)
 	default:
 		return ClassUnknown

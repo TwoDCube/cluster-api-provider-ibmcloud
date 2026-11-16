@@ -115,6 +115,13 @@ func limiterCalls(t *testing.T) []limiterCall {
 			},
 		},
 		{
+			name:   "RemoveWorkerPool",
+			answer: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) },
+			call: func(ctx context.Context, s *Service) error {
+				return s.RemoveWorkerPool(ctx, testIKSClusterID, testPoolID)
+			},
+		},
+		{
 			name:   "ListWorkers",
 			answer: reply(http.StatusOK, fixture(t, "iks-getWorkers-normal.json")),
 			call: func(ctx context.Context, s *Service) error {

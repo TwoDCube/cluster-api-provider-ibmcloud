@@ -950,6 +950,81 @@ const (
 	autoscaledForbiddenBody = `{"code":"","description":"Forbidden. The request will not be permitted."}`
 )
 
+func TestRemoveWorkerPool(t *testing.T) {
+	noContent := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }
+
+	t.Run("posts {cluster, workerpool}", func(t *testing.T) {
+		g := NewWithT(t)
+		fake := newFakeIKS(t, servePath("/global/v2/removeWorkerPool", http.StatusNoContent, nil))
+		service, _ := newTestService(t, fake)
+		g.Expect(service.RemoveWorkerPool(context.Background(), testIKSClusterID, testPoolID)).To(Succeed())
+		request := fake.last(t)
+		g.Expect(request.Method).To(Equal(http.MethodPost))
+		g.Expect(request.Header.Get("Authorization")).To(Equal("Bearer " + testToken))
+		g.Expect(string(request.Body)).To(MatchJSON(fmt.Sprintf(`{"cluster": %q, "workerpool": %q}`, testIKSClusterID, testPoolID)))
+	})
+
+	// Removing the only pool is refused with the same E1437 as a resize below the minimum, synchronously and
+	// without side effects (observed on IBM Cloud); the live fixtures are the resize answers.
+	errorCases := []struct {
+		name     string
+		status   int
+		body     []byte
+		expected ErrorClass
+	}{
+		{name: "live IKS E1437 is ClusterMinimum", status: http.StatusBadRequest, body: fixture(t, "error-E1437-iks-resize.json"), expected: ClassClusterMinimum},
+		{name: "live ROKS E1437 is ClusterMinimum", status: http.StatusBadRequest, body: fixture(t, "error-E1437-roks-resize.json"), expected: ClassClusterMinimum},
+		{name: "documented autoscaled 403 is Autoscaled", status: http.StatusForbidden, body: []byte(autoscaledForbiddenBody), expected: ClassAutoscaled},
+		{name: "other 403 is PermissionDenied", status: http.StatusForbidden, body: []byte(`{"description":"synthesized: missing Operator role"}`), expected: ClassPermissionDenied},
+		{name: "404 is NotFound", status: http.StatusNotFound, body: []byte(`{"code":"G0004"}`), expected: ClassNotFound},
+		{name: "500 is Transient", status: http.StatusInternalServerError, body: nil, expected: ClassTransient},
+	}
+	for _, tc := range errorCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeIKS(t, reply(tc.status, tc.body))
+			service, _ := newTestService(t, fake)
+			err := service.RemoveWorkerPool(context.Background(), testIKSClusterID, testPoolID)
+			g.Expect(Classify(OpRemoveWorkerPool, err)).To(Equal(tc.expected))
+			g.Expect(fake.received()).To(HaveLen(1))
+		})
+	}
+
+	t.Run("E1437 keeps IBM's incident", func(t *testing.T) {
+		g := NewWithT(t)
+		fake := newFakeIKS(t, reply(http.StatusBadRequest, fixture(t, "error-E1437-roks-resize.json")))
+		service, _ := newTestService(t, fake)
+		err := service.RemoveWorkerPool(context.Background(), testROKSClusterID, "p")
+		var apiErr *APIError
+		g.Expect(errors.As(err, &apiErr)).To(BeTrue())
+		g.Expect(apiErr.Code).To(Equal("E1437"))
+		g.Expect(apiErr.IncidentID).To(Equal("00000000-0000-4000-8000-0000000000e2"))
+		g.Expect(apiErr.Description).To(ContainSubstring("minimum requirement of 2 workers"))
+	})
+
+	refused := []struct {
+		name      string
+		clusterID string
+		poolID    string
+		message   string
+	}{
+		{name: "empty cluster ID", clusterID: "", poolID: testPoolID, message: "RemoveWorkerPool: the cluster ID is empty"},
+		{name: "empty pool ID", clusterID: testIKSClusterID, poolID: "", message: "RemoveWorkerPool: the pool ID is empty"},
+	}
+	for _, tc := range refused {
+		t.Run("refused before sending: "+tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeIKS(t, noContent)
+			service, limiter := newTestService(t, fake)
+			err := service.RemoveWorkerPool(context.Background(), tc.clusterID, tc.poolID)
+			g.Expect(err).To(MatchError(ErrInvalidRequest))
+			g.Expect(err.Error()).To(ContainSubstring(tc.message))
+			g.Expect(fake.received()).To(BeEmpty())
+			g.Expect(limiter.count()).To(BeZero())
+		})
+	}
+}
+
 func TestResizeWorkerPool(t *testing.T) {
 	noContent := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }
 

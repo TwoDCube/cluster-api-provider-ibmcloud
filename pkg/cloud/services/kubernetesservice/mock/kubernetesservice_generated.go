@@ -190,6 +190,20 @@ func (mr *MockKubernetesServiceMockRecorder) ListWorkers(ctx, clusterID any) *go
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListWorkers", reflect.TypeOf((*MockKubernetesService)(nil).ListWorkers), ctx, clusterID)
 }
 
+// RemoveWorkerPool mocks base method.
+func (m *MockKubernetesService) RemoveWorkerPool(ctx context.Context, clusterID, poolID string) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RemoveWorkerPool", ctx, clusterID, poolID)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// RemoveWorkerPool indicates an expected call of RemoveWorkerPool.
+func (mr *MockKubernetesServiceMockRecorder) RemoveWorkerPool(ctx, clusterID, poolID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RemoveWorkerPool", reflect.TypeOf((*MockKubernetesService)(nil).RemoveWorkerPool), ctx, clusterID, poolID)
+}
+
 // ReplaceWorker mocks base method.
 func (m *MockKubernetesService) ReplaceWorker(ctx context.Context, clusterID, workerID string, update bool) error {
 	m.ctrl.T.Helper()

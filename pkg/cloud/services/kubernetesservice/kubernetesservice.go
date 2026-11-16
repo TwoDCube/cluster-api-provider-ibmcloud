@@ -67,6 +67,9 @@ type KubernetesService interface {
 	// allowSingleOpenShiftWorker is never sent. IBM refuses a size below the cluster minimum with E1437 (observed on IBM
 	// Cloud). SDK V2ResizeWorkerPoolWithContext (POST /v2/resizeWorkerPool).
 	ResizeWorkerPool(ctx context.Context, clusterID, poolID string, sizePerZone int64) error
+	// RemoveWorkerPool removes a pool and its workers. IBM refuses to remove the only pool with E1437 (observed on IBM
+	// Cloud). SDK RemoveWorkerPool1WithContext (POST /v2/removeWorkerPool).
+	RemoveWorkerPool(ctx context.Context, clusterID, poolID string) error
 
 	// ListWorkers returns every worker of the cluster, including deleted ones (showDeleted=true), so that a worker
 	// leaves providerIDList on IBM's "deleted" record rather than on its absence from one listing: dropping a live

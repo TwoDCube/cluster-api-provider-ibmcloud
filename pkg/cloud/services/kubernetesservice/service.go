@@ -299,6 +299,25 @@ func (s *Service) ResizeWorkerPool(ctx context.Context, clusterID, poolID string
 	return nil
 }
 
+// RemoveWorkerPool implements KubernetesService.
+func (s *Service) RemoveWorkerPool(ctx context.Context, clusterID, poolID string) error {
+	switch {
+	case clusterID == "":
+		return invalidRequest(OpRemoveWorkerPool, "the cluster ID is empty; pass status.clusterID of the IBMCloudManagedControlPlane")
+	case poolID == "":
+		return invalidRequest(OpRemoveWorkerPool, "the pool ID is empty; pass the ID of a pool that ListWorkerPools returned")
+	}
+	ctx, tracker := trackCall(ctx)
+	response, err := s.sdk.RemoveWorkerPool1WithContext(ctx, &kubernetesserviceapiv1.RemoveWorkerPool1Options{
+		Cluster:    core.StringPtr(clusterID),
+		Workerpool: core.StringPtr(poolID),
+	})
+	if err != nil {
+		return callError(OpRemoveWorkerPool, tracker, response, err)
+	}
+	return nil
+}
+
 // ListWorkers implements KubernetesService.
 func (s *Service) ListWorkers(ctx context.Context, clusterID string) ([]Worker, error) {
 	if clusterID == "" {

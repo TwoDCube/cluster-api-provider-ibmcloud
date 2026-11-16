@@ -79,6 +79,20 @@ func TestClassify(t *testing.T) {
 		{name: "404 on ListWorkers", op: OpListWorkers, err: apiError(OpListWorkers, http.StatusNotFound, ""), expected: ClassNotFound},
 		{name: "409 on ReplaceWorker has no specific meaning", op: OpReplaceWorker, err: apiError(OpReplaceWorker, http.StatusConflict, ""), expected: ClassUnknown},
 
+		{name: "400 E1437 on RemoveWorkerPool", op: OpRemoveWorkerPool, err: apiError(OpRemoveWorkerPool, http.StatusBadRequest, "E1437"), expected: ClassClusterMinimum},
+		{
+			name:     "documented autoscaled 403 on RemoveWorkerPool",
+			op:       OpRemoveWorkerPool,
+			err:      &APIError{Operation: OpRemoveWorkerPool, StatusCode: http.StatusForbidden, Description: "Forbidden. The request will not be permitted."},
+			expected: ClassAutoscaled,
+		},
+		{name: "other 403 on RemoveWorkerPool", op: OpRemoveWorkerPool, err: apiError(OpRemoveWorkerPool, http.StatusForbidden, ""), expected: ClassPermissionDenied},
+		{
+			name:     "the autoscaled text with another status is not Autoscaled",
+			op:       OpRemoveWorkerPool,
+			err:      &APIError{Operation: OpRemoveWorkerPool, StatusCode: http.StatusBadRequest, Description: "Forbidden. The request will not be permitted."},
+			expected: ClassBadRequest,
+		},
 		{
 			name:     "the autoscaled text on another operation is PermissionDenied",
 			op:       OpCreateWorkerPool,
