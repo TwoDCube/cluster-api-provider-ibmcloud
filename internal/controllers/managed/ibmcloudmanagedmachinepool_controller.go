@@ -97,6 +97,13 @@ type IBMCloudManagedMachinePoolReconciler struct {
 	Clock clock.PassiveClock
 	// WatchFilterValue is the --watch-filter label value; objects without it are ignored.
 	WatchFilterValue string
+
+	// transitional is the first-seen map behind MachinePoolScopeInput.TransitionalSince: IBM reports no time for a
+	// worker's transition, so CheckDisruption measures how long a worker has been transitional from the first time a
+	// reconcile listed it so. In memory, shared by the reconciles of every pool, empty after a restart (a stuck worker
+	// then blocks again for up to WorkerStuckAfter: the rule fails closed). Its zero value is ready, so cmd/main.go and
+	// the tests need not set it.
+	transitional transitionalWorkers
 }
 
 // The controller writes the pool's spec.providerIDList and status, reads its owners and lists the pools of a Cluster.
@@ -171,6 +178,7 @@ func (r *IBMCloudManagedMachinePoolReconciler) Reconcile(ctx context.Context, re
 		Cluster:             cluster,
 		MachinePool:         machinePool,
 		Pool:                pool,
+		TransitionalSince:   r.transitional.snapshot(cluster.UID, r.Clock.Now()),
 		ProviderIDDropAfter: dropAfter,
 		Persist:             patcher.Patch,
 	})
@@ -232,8 +240,25 @@ func (r *IBMCloudManagedMachinePoolReconciler) scopeParams() *managedscope.Scope
 // up in status. scope is this reconcile's scope.
 func (r *IBMCloudManagedMachinePoolReconciler) reconcileNormal(ctx context.Context, scope *managedscope.MachinePoolScope) (ctrl.Result, error) {
 	outcome := scope.ReconcileNormal(ctx)
+	r.recordWorkers(scope)
 	logMachinePoolTerminal(ctx, "The IBMCloudManagedMachinePool needs attention", outcome)
 	return resultFor(outcome, managedscope.IntervalSteadyState)
+}
+
+// recordWorkers updates the first-seen map from this reconcile's worker listing, whatever the outcome: every listing
+// any pool of the Cluster makes refreshes the Cluster's entries, so CheckDisruption knows how long another pool's
+// worker has been transitional. A Cluster being deleted loses its entries instead, because IBM removes every worker
+// with the cluster and no pool of it lists the workers again (pools make no IBM call while their Cluster is deleted).
+// scope is this reconcile's scope, after its step ran.
+func (r *IBMCloudManagedMachinePoolReconciler) recordWorkers(scope *managedscope.MachinePoolScope) {
+	cluster := scope.Cluster
+	if !cluster.DeletionTimestamp.IsZero() {
+		r.transitional.forget(cluster.UID)
+		return
+	}
+	if workers, listed := scope.ListedWorkers(); listed {
+		r.transitional.observe(cluster.UID, workers, r.Clock.Now())
+	}
 }
 
 // logMachinePoolTerminal logs a Terminal outcome next to the reconcile: a human must act, and the condition says what.

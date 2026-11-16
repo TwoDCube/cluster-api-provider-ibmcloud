@@ -84,6 +84,15 @@ type MachinePoolScopeInput struct {
 	// conditions, and the controller's deferred patch persists them. Required.
 	Pool *infrav1.IBMCloudManagedMachinePool
 
+	// TransitionalSince maps the ID of a worker of the Cluster's IBM cluster to the time the pool controller first saw
+	// it transitional; the disruption gates pass it to CheckDisruption (DisruptionCheck.TransitionalSince), so that a
+	// worker IBM leaves transitional for longer than WorkerStuckAfter stops blocking worker removals. IBM reports no
+	// time for a worker's state, so the controller keeps the times in memory, from every listing of the Cluster's pools
+	// (ListedWorkers). After a controller restart they are gone, and a stuck worker blocks again for up to
+	// WorkerStuckAfter: the rule fails closed. The scope only reads the map; the controller passes a copy. Optional: nil
+	// treats no worker as stuck.
+	TransitionalSince map[string]time.Time
+
 	// ProviderIDDropAfter is poolTransitionPoll: a worker that IBM's listing omits leaves spec.providerIDList only
 	// when a listing at least this long after the first omission still omits it (BuildProviderIDList), because CAPI
 	// deletes the Node of every provider ID that leaves the list. It is an input because the requeue intervals belong
@@ -125,6 +134,12 @@ type MachinePoolScope struct {
 	notes []string
 	// clients are the IBM clients of this reconcile, built by ibm on first use.
 	clients *poolClients
+	// firstSeen is MachinePoolScopeInput.TransitionalSince.
+	firstSeen map[string]time.Time
+	// listedWorkers are every worker of the cluster from this reconcile's successful ListWorkers call, and
+	// workersListed tells whether one succeeded (an empty list is an answer too); see ListedWorkers.
+	listedWorkers []kubernetesservice.Worker
+	workersListed bool
 }
 
 // poolClients are one reconcile's IBM clients for the Cluster's identity.
@@ -173,6 +188,7 @@ func NewMachinePoolScope(params *ScopeParams, in MachinePoolScopeInput) (*Machin
 		Cluster:     in.Cluster,
 		MachinePool: in.MachinePool,
 		Pool:        in.Pool,
+		firstSeen:   in.TransitionalSince,
 		dropAfter:   in.ProviderIDDropAfter,
 		persist:     in.Persist,
 	}, nil
@@ -570,6 +586,7 @@ func (s *MachinePoolScope) observe(ctx context.Context, clients *poolClients, po
 	if err != nil {
 		return nil, s.ibmProblem(clients, kubernetesservice.OpListWorkers, fmt.Sprintf("listing the workers of IBM cluster %s", clusterID), err), true
 	}
+	s.recordListing(workers)
 	if err := s.publishPool(pool, workers); err != nil {
 		return nil, Transient(err), true
 	}
@@ -581,6 +598,20 @@ func (s *MachinePoolScope) observe(ctx context.Context, clients *poolClients, po
 		return nil, Transient(fmt.Errorf("building spec.providerIDList of %s: %w", s.objectName(), err)), true
 	}
 	return workers, Outcome{}, false
+}
+
+// ListedWorkers returns every worker of the cluster from this reconcile's successful ListWorkers call, and true; nil
+// and false when no listing succeeded. The pool controller refreshes its first-seen map (TransitionalSince) from it
+// after each reconcile, so that every listing a pool of the Cluster makes keeps the map current without another IBM
+// call. Call it after ReconcileNormal or ReconcileDelete.
+func (s *MachinePoolScope) ListedWorkers() ([]kubernetesservice.Worker, bool) {
+	return s.listedWorkers, s.workersListed
+}
+
+// recordListing keeps the answer of a successful ListWorkers call for ListedWorkers. workers are every worker of the
+// cluster, as IBM listed them.
+func (s *MachinePoolScope) recordListing(workers []kubernetesservice.Worker) {
+	s.listedWorkers, s.workersListed = workers, true
 }
 
 // publishPool writes the pool facts and the worker versions into status and sets the sticky ready and provisioned

@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -459,6 +460,133 @@ func TestIBMCloudManagedMachinePoolReconcilePublishes(t *testing.T) {
 		_, err := f.reconcile(f.reconciler())
 		g.Expect(err).To(MatchError(ContainSubstring("status patch refused")))
 	})
+}
+
+// mpTestOtherWorker is a worker of another IBM pool of the test cluster in state; it is not this pool's, but every
+// pool's reconcile lists it, and while it is transitional it holds every worker removal of the cluster, because
+// CheckDisruption removes workers only from a settled cluster.
+func mpTestOtherWorker(state string) kubernetesservice.Worker {
+	return kubernetesservice.Worker{ID: "o2", PoolID: "other-pool", Zone: "us-south-1", ActualState: state,
+		KubeVersionActual: "1.36.5_1540", KubeVersionTarget: "1.36.5_1540"}
+}
+
+// expectListing expects the observation of the ready test pool "workers" whose IBM cluster also lists extra.
+func (f *machinePoolFixture) expectListing(extra ...kubernetesservice.Worker) {
+	pool := kubernetesservice.WorkerPool{ID: mpTestPoolID, Name: "workers", Flavor: mpTestFlavor, SizePerZone: 2,
+		Zones: []kubernetesservice.WorkerPoolZone{{ID: "us-south-1", WorkerCount: 2}, {ID: "us-south-2", WorkerCount: 2}}}
+	workers := make([]kubernetesservice.Worker, 0, 4+len(extra))
+	for i, zone := range []string{"us-south-1", "us-south-2", "us-south-1", "us-south-2"} {
+		workers = append(workers, kubernetesservice.Worker{ID: "w" + string(rune('0'+i)), PoolID: mpTestPoolID, Zone: zone,
+			ActualState: "deployed", HealthState: "normal", KubeVersionActual: "1.36.5_1540", KubeVersionTarget: "1.36.5_1540"})
+	}
+	f.ibm.EXPECT().ListWorkerPools(gomock.Any(), mpTestClusterID).Return([]kubernetesservice.WorkerPool{pool}, nil)
+	f.ibm.EXPECT().ListWorkers(gomock.Any(), mpTestClusterID).Return(append(workers, extra...), nil)
+}
+
+// TestIBMCloudManagedMachinePoolFirstSeenTimes checks that the reconciler keeps its first-seen map behind
+// MachinePoolScopeInput.TransitionalSince current from the listings of the normal flow, so that a worker of another
+// pool that stays transitional stops blocking removals once WorkerStuckAfter has passed since it was first seen; the
+// pool deletion's use of it is tested with the deletion.
+func TestIBMCloudManagedMachinePoolFirstSeenTimes(t *testing.T) {
+	const clusterUID = "cluster-uid"
+	t.Run("another pool's provision_pending worker keeps its first-seen time until it is deployed", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newMachinePoolFixture(t)
+		r := f.reconciler()
+
+		f.expectListing(mpTestOtherWorker("provision_pending"))
+		_, err := f.reconcile(r)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(r.transitional.snapshot(clusterUID, f.clock.Now())).To(Equal(map[string]time.Time{"o2": mpTestNow}))
+
+		f.clock.Step(30 * time.Minute)
+		f.expectListing(mpTestOtherWorker("provisioning"))
+		_, err = f.reconcile(r)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(r.transitional.snapshot(clusterUID, f.clock.Now())).To(Equal(map[string]time.Time{"o2": mpTestNow}),
+			"the first time is kept while the worker stays transitional")
+
+		f.clock.Step(time.Minute)
+		f.expectListing(mpTestOtherWorker("deployed"))
+		_, err = f.reconcile(r)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(r.transitional.snapshot(clusterUID, f.clock.Now())).To(BeNil(), "the entry is dropped once the worker is deployed")
+	})
+	t.Run("a failed listing keeps the entries", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newMachinePoolFixture(t)
+		r := f.reconciler()
+		r.transitional.observe(clusterUID, []kubernetesservice.Worker{mpTestOtherWorker("provisioning")}, mpTestNow)
+		f.ibm.EXPECT().ListWorkerPools(gomock.Any(), mpTestClusterID).Return([]kubernetesservice.WorkerPool{{
+			ID: mpTestPoolID, Name: "workers", Flavor: mpTestFlavor, SizePerZone: 2,
+		}}, nil)
+		f.ibm.EXPECT().ListWorkers(gomock.Any(), mpTestClusterID).Return(nil,
+			&kubernetesservice.APIError{Operation: kubernetesservice.OpListWorkers, StatusCode: http.StatusInternalServerError})
+		_, err := f.reconcile(r)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(r.transitional.snapshot(clusterUID, f.clock.Now())).To(Equal(map[string]time.Time{"o2": mpTestNow}))
+	})
+	t.Run("a deleting Cluster drops its entries without an IBM call", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newMachinePoolFixture(t)
+		f.cluster.DeletionTimestamp = ptr.To(metav1.NewTime(mpTestNow))
+		f.cluster.Finalizers = []string{clusterv1.ClusterFinalizer}
+		r := f.reconciler()
+		r.Resolver, r.ClientBuilder = failIfCalledResolver{t: t}, failIfCalledBuilder{t: t}
+		r.transitional.observe(clusterUID, []kubernetesservice.Worker{mpTestOtherWorker("provisioning")}, mpTestNow)
+		r.transitional.observe("another-cluster", []kubernetesservice.Worker{mpTestOtherWorker("provisioning")}, mpTestNow)
+		_, err := f.reconcile(r)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(r.transitional.snapshot(clusterUID, f.clock.Now())).To(BeNil())
+		g.Expect(r.transitional.snapshot("another-cluster", f.clock.Now())).To(HaveKey("o2"), "other Clusters keep theirs")
+	})
+	t.Run("concurrent reconciles of two pools of one Cluster share the map", testFirstSeenConcurrentPools)
+}
+
+// testFirstSeenConcurrentPools reconciles two pools of one Cluster in parallel with one reconciler, as a controller with
+// several workers does; `go test -race` reports any unsynchronized access to the first-seen map.
+func testFirstSeenConcurrentPools(t *testing.T) {
+	g := NewWithT(t)
+	f := newMachinePoolFixture(t)
+	f.pool.Status.PoolID = mpTestPoolID
+	r := f.reconciler()
+	spareMachinePool := f.machinePool.DeepCopy()
+	spareMachinePool.Name, spareMachinePool.UID, spareMachinePool.ResourceVersion = "spare", "spare-mp-uid", ""
+	spareMachinePool.Spec.Template.Spec.InfrastructureRef.Name = "spare"
+	g.Expect(f.mgmt.Create(context.Background(), spareMachinePool)).To(Succeed())
+	spare := f.pool.DeepCopy()
+	spare.Name, spare.UID, spare.ResourceVersion, spare.Spec.PoolName = "spare", "spare-uid", "", "spare"
+	spare.OwnerReferences = []metav1.OwnerReference{{APIVersion: clusterv1.GroupVersion.String(), Kind: "MachinePool", Name: "spare", UID: "spare-mp-uid"}}
+	spare.Status.PoolID = mpTestPoolID + "-spare"
+	g.Expect(f.mgmt.Create(context.Background(), spare)).To(Succeed())
+
+	pools := []kubernetesservice.WorkerPool{
+		{ID: mpTestPoolID, Name: "workers", Flavor: mpTestFlavor, SizePerZone: 2},
+		{ID: mpTestPoolID + "-spare", Name: "spare", Flavor: mpTestFlavor, SizePerZone: 2},
+	}
+	workers := []kubernetesservice.Worker{mpTestOtherWorker("provision_pending")}
+	f.ibm.EXPECT().ListWorkerPools(gomock.Any(), mpTestClusterID).Return(pools, nil).AnyTimes()
+	f.ibm.EXPECT().ListWorkers(gomock.Any(), mpTestClusterID).Return(workers, nil).AnyTimes()
+
+	const reconcilesPerPool = 10
+	errs := make(chan error, 2*reconcilesPerPool)
+	var wg sync.WaitGroup
+	for _, name := range []string{"workers", "spare"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range reconcilesPerPool {
+				_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Namespace: mpTestNamespace, Name: name}})
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		g.Expect(err).NotTo(HaveOccurred())
+	}
+	g.Expect(r.transitional.snapshot("cluster-uid", f.clock.Now())).To(Equal(map[string]time.Time{"o2": mpTestNow}))
 }
 
 func TestIBMCloudManagedMachinePoolReconcileHasNoFailureFields(t *testing.T) {

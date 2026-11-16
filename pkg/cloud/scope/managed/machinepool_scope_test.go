@@ -975,6 +975,68 @@ func TestMachinePoolScopeObserves(t *testing.T) {
 	})
 }
 
+// TestMachinePoolScopeListedWorkers checks what the scope hands back for the pool controller's first-seen map of
+// transitional workers (TransitionalSince): the workers of a successful listing, whatever the reconcile does next,
+// and nothing when no listing succeeded, so that a failure never drops the map's entries.
+func TestMachinePoolScopeListedWorkers(t *testing.T) {
+	pools := []kubernetesservice.WorkerPool{ibmPool("workers", 2, "us-south-1", "us-south-2")}
+	t.Run("the_listing_of_every_pool_of_the_cluster_is_handed_back", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newPoolFixture(t)
+		workers := append(readyWorkers(4),
+			kubernetesservice.Worker{ID: "o2", PoolID: "other-pool", Zone: "us-south-1", ActualState: "provision_pending"})
+		f.expectObservation(pools, workers)
+		scope := f.scope()
+		listed, ok := scope.ListedWorkers()
+		g.Expect(ok).To(BeFalse(), "nothing is listed before the reconcile")
+		g.Expect(listed).To(BeNil())
+		scope.ReconcileNormal(context.Background())
+		listed, ok = scope.ListedWorkers()
+		g.Expect(ok).To(BeTrue())
+		g.Expect(listed).To(Equal(workers), "another pool's provision_pending worker included")
+	})
+	t.Run("an empty listing is an answer", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newPoolFixture(t)
+		f.expectObservation(pools, nil)
+		scope := f.scope()
+		scope.ReconcileNormal(context.Background())
+		listed, ok := scope.ListedWorkers()
+		g.Expect(ok).To(BeTrue())
+		g.Expect(listed).To(BeEmpty())
+	})
+	t.Run("a listing the reconcile cannot publish is still handed back", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newPoolFixture(t)
+		f.cp.Status.ClusterCRN = ""
+		f.expectObservation(pools, readyWorkers(4))
+		scope := f.scope()
+		g.Expect(scope.ReconcileNormal(context.Background()).Kind).To(Equal(OutcomeNotDone))
+		_, ok := scope.ListedWorkers()
+		g.Expect(ok).To(BeTrue())
+	})
+	t.Run("a failed listing hands back nothing", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newPoolFixture(t)
+		f.ibm.EXPECT().ListWorkerPools(gomock.Any(), poolTestClusterID).Return(pools, nil)
+		f.ibm.EXPECT().ListWorkers(gomock.Any(), poolTestClusterID).Return(nil, apiError(kubernetesservice.OpListWorkers, http.StatusInternalServerError, ""))
+		scope := f.scope()
+		scope.ReconcileNormal(context.Background())
+		listed, ok := scope.ListedWorkers()
+		g.Expect(ok).To(BeFalse())
+		g.Expect(listed).To(BeNil())
+	})
+	t.Run("a reconcile without IBM calls hands back nothing", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newPoolFixture(t)
+		f.cp.Status.ClusterID = ""
+		scope := f.scope()
+		scope.ReconcileNormal(context.Background())
+		_, ok := scope.ListedWorkers()
+		g.Expect(ok).To(BeFalse())
+	})
+}
+
 func TestMachinePoolScopeSize(t *testing.T) {
 	t.Run("grow_is_requested_at_once", func(t *testing.T) {
 		g := NewWithT(t)
