@@ -230,7 +230,7 @@ main(){
         # Check out the resource from Boskos and store the produced environment
         # variables in a temporary file.
          account_env_var_file="$(mktemp)"
-         checkout_account ${RESOURCE_TYPE} 1> "${account_env_var_file}"
+         checkout_account "${RESOURCE_TYPE}" 1> "${account_env_var_file}"
          checkout_account_status="${?}"
 
         # If the checkout process was a success then load the
