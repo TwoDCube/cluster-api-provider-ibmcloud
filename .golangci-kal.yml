@@ -92,6 +92,12 @@ linters:
     - text: "IBMCloudManagedClusterInitializationStatus.Provisioned pointer should not use a bool"
       linters:
         - kubeapilinter
+    - text: "IBMCloudManagedControlPlaneInitializationStatus.ControlPlaneInitialized pointer should not use a bool"
+      linters:
+        - kubeapilinter
+    - text: "IBMCloudManagedControlPlaneStatus.ExternalManagedControlPlane pointer should not use a bool"
+      linters:
+        - kubeapilinter
 
 issues:
   max-same-issues: 0
