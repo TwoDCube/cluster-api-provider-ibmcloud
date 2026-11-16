@@ -58,7 +58,8 @@ import (
 type IBMCloudManagedControlPlaneReconciler struct {
 	// Client is the manager's client.
 	Client client.Client
-	// APIReader reads uncached, for the kubeconfig Secret (CAPIBM runs no cluster-wide Secret informer).
+	// APIReader reads uncached: the reconciled control plane itself (Reconcile says why) and the kubeconfig Secret
+	// (CAPIBM runs no cluster-wide Secret informer).
 	APIReader client.Reader
 	// Recorder emits the control plane's events.
 	Recorder record.EventRecorder
@@ -96,8 +97,13 @@ type IBMCloudManagedControlPlaneReconciler struct {
 func (r *IBMCloudManagedControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, reterr error) {
 	log := ctrl.LoggerFrom(ctx)
 
+	// The control plane is read uncached. Its own writes (the create intent before a POST, then the answer) re-trigger
+	// this reconcile, and the cache can still hold the version before the last write: a reconcile on that version would
+	// act on an attempt that has already been answered and overwrite the answer's condition, which would void the hold
+	// after a create refusal (cpCreateHold) and send the next create at once. One GET per reconcile is the price; the
+	// other objects stay cached.
 	cp := &controlplanev1.IBMCloudManagedControlPlane{}
-	if err := r.Client.Get(ctx, req.NamespacedName, cp); err != nil {
+	if err := r.APIReader.Get(ctx, req.NamespacedName, cp); err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
@@ -141,7 +147,7 @@ func (r *IBMCloudManagedControlPlaneReconciler) Reconcile(ctx context.Context, r
 		}
 	}()
 
-	scope, err := managedscope.NewControlPlaneScope(r.scopeParams(), cluster, cp)
+	scope, err := managedscope.NewControlPlaneScope(r.scopeParams(), cluster, cp, patcher.persist)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("creating the scope of IBMCloudManagedControlPlane %s: %w", req.NamespacedName, err)
 	}

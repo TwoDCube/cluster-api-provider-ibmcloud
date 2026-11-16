@@ -19,6 +19,7 @@ package managed
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -80,15 +81,24 @@ func (b *cpScopeBuilder) InvalidateAuthenticator(key credentials.IdentityKey) {
 // newCPScopeParams returns complete ScopeParams for a control plane scope test.
 func newCPScopeParams(builder ClientBuilder) *ScopeParams {
 	c := fake.NewClientBuilder().Build()
+	clk := clocktesting.NewFakePassiveClock(time.Date(2026, 11, 16, 3, 5, 30, 0, time.UTC))
+	versions, err := NewVersionsCache(clk, time.Hour)
+	if err != nil {
+		panic(err)
+	}
 	return &ScopeParams{
 		Client:        c,
 		APIReader:     c,
 		Recorder:      record.NewFakeRecorder(10),
 		Resolver:      credentials.ControllerOnly{},
 		ClientBuilder: builder,
-		Clock:         clocktesting.NewFakePassiveClock(time.Date(2026, 11, 16, 3, 5, 30, 0, time.UTC)),
+		Clock:         clk,
+		VersionsCache: versions,
 	}
 }
+
+// cpNoPersist is a PersistFunc for scope tests that never write.
+func cpNoPersist(context.Context) error { return nil }
 
 func TestNewControlPlaneScopeValidation(t *testing.T) {
 	cluster := &clusterv1.Cluster{}
@@ -98,23 +108,27 @@ func TestNewControlPlaneScopeValidation(t *testing.T) {
 		params  func() *ScopeParams
 		cluster *clusterv1.Cluster
 		cp      *controlplanev1.IBMCloudManagedControlPlane
+		persist PersistFunc
 		wantErr string
 	}{
 		{name: "nil params", params: func() *ScopeParams { return nil }, cluster: cluster, cp: cp,
 			wantErr: "ControlPlaneScope needs ScopeParams, got nil"},
 		{name: "every missing dependency is named", params: func() *ScopeParams { return &ScopeParams{} }, cluster: cluster, cp: cp,
 			wantErr: "ControlPlaneScope needs ScopeParams.Client, ScopeParams.APIReader, ScopeParams.Recorder, ScopeParams.Resolver, " +
-				"ScopeParams.ClientBuilder, ScopeParams.Clock"},
+				"ScopeParams.ClientBuilder, ScopeParams.Clock, ScopeParams.VersionsCache"},
 		{name: "nil Cluster", params: func() *ScopeParams { return newCPScopeParams(&cpScopeBuilder{}) }, cp: cp,
 			wantErr: "ControlPlaneScope needs the owning Cluster"},
 		{name: "nil control plane", params: func() *ScopeParams { return newCPScopeParams(&cpScopeBuilder{}) }, cluster: cluster,
 			wantErr: "ControlPlaneScope needs the IBMCloudManagedControlPlane"},
-		{name: "complete", params: func() *ScopeParams { return newCPScopeParams(&cpScopeBuilder{}) }, cluster: cluster, cp: cp},
+		{name: "nil persist", params: func() *ScopeParams { return newCPScopeParams(&cpScopeBuilder{}) }, cluster: cluster, cp: cp,
+			wantErr: "ControlPlaneScope needs a PersistFunc"},
+		{name: "complete", params: func() *ScopeParams { return newCPScopeParams(&cpScopeBuilder{}) }, cluster: cluster, cp: cp,
+			persist: cpNoPersist},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
-			scope, err := NewControlPlaneScope(tc.params(), tc.cluster, tc.cp)
+			scope, err := NewControlPlaneScope(tc.params(), tc.cluster, tc.cp, tc.persist)
 			if tc.wantErr != "" {
 				g.Expect(err).To(MatchError(ContainSubstring(tc.wantErr)))
 				g.Expect(scope).To(BeNil())
@@ -153,7 +167,7 @@ func TestNoIBMClusterCanExist(t *testing.T) {
 
 func TestControlPlaneScopeIBMNeedsTheInfraCluster(t *testing.T) {
 	g := NewWithT(t)
-	scope, err := NewControlPlaneScope(newCPScopeParams(&cpScopeBuilder{}), &clusterv1.Cluster{}, &controlplanev1.IBMCloudManagedControlPlane{})
+	scope, err := NewControlPlaneScope(newCPScopeParams(&cpScopeBuilder{}), &clusterv1.Cluster{}, &controlplanev1.IBMCloudManagedControlPlane{}, cpNoPersist)
 	g.Expect(err).NotTo(HaveOccurred())
 	_, err = scope.ibm(context.Background())
 	g.Expect(err).To(MatchError(ContainSubstring("before the IBMCloudManagedCluster was loaded")))
@@ -247,7 +261,7 @@ func TestControlPlaneScopeLoadsTheInfraClusterOnce(t *testing.T) {
 			APIGroup: infrav1.GroupVersion.Group, Kind: "IBMCloudManagedCluster", Name: "dev",
 		}},
 	}
-	scope, err := NewControlPlaneScope(params, cluster, &controlplanev1.IBMCloudManagedControlPlane{})
+	scope, err := NewControlPlaneScope(params, cluster, &controlplanev1.IBMCloudManagedControlPlane{}, cpNoPersist)
 	g.Expect(err).NotTo(HaveOccurred())
 
 	loaded, err := scope.loadInfraCluster(context.Background())
@@ -286,4 +300,266 @@ func TestControlPlaneErrorTypes(t *testing.T) {
 	g.Expect(cpIBMStatus(callErr)).To(Equal(http.StatusBadGateway))
 	g.Expect(cpIBMStatus(errors.New("no answer"))).To(BeZero())
 	g.Expect((&controlPlaneConfigError{message: "fix spec.x"}).Error()).To(Equal("fix spec.x"))
+}
+
+func TestControlPlaneCreateIntentModel(t *testing.T) {
+	at := func(minute int) metav1.Time {
+		return metav1.NewTime(time.Date(2026, 11, 16, 3, minute, 0, 0, time.UTC))
+	}
+	testCases := []struct {
+		name      string
+		previous  controlplanev1.CreateIntent
+		wantNext  controlplanev1.CreateIntent
+		wantFold  controlplanev1.CreateIntent
+		wantClear controlplanev1.CreateIntent
+	}{
+		{
+			name:      "first attempt",
+			wantNext:  controlplanev1.CreateIntent{ClusterName: "dev", InFlightAttemptTime: at(10)},
+			wantFold:  controlplanev1.CreateIntent{},
+			wantClear: controlplanev1.CreateIntent{},
+		},
+		{
+			name:      "a leftover in-flight attempt is folded into the unknown bounds first",
+			previous:  controlplanev1.CreateIntent{ClusterName: "dev", InFlightAttemptTime: at(2)},
+			wantNext:  controlplanev1.CreateIntent{ClusterName: "dev", InFlightAttemptTime: at(10), FirstUnknownOutcomeTime: at(2), LastUnknownOutcomeTime: at(2)},
+			wantFold:  controlplanev1.CreateIntent{ClusterName: "dev", FirstUnknownOutcomeTime: at(2), LastUnknownOutcomeTime: at(2)},
+			wantClear: controlplanev1.CreateIntent{},
+		},
+		{
+			name: "earlier unknown attempts widen the bounds",
+			previous: controlplanev1.CreateIntent{ClusterName: "dev", InFlightAttemptTime: at(5), FirstUnknownOutcomeTime: at(1),
+				LastUnknownOutcomeTime: at(3)},
+			wantNext: controlplanev1.CreateIntent{ClusterName: "dev", InFlightAttemptTime: at(10), FirstUnknownOutcomeTime: at(1),
+				LastUnknownOutcomeTime: at(5)},
+			wantFold: controlplanev1.CreateIntent{ClusterName: "dev", FirstUnknownOutcomeTime: at(1), LastUnknownOutcomeTime: at(5)},
+			wantClear: controlplanev1.CreateIntent{ClusterName: "dev", FirstUnknownOutcomeTime: at(1),
+				LastUnknownOutcomeTime: at(3)},
+		},
+		{
+			name:      "an intent of another name is replaced",
+			previous:  controlplanev1.CreateIntent{ClusterName: "old", FirstUnknownOutcomeTime: at(1), LastUnknownOutcomeTime: at(1)},
+			wantNext:  controlplanev1.CreateIntent{ClusterName: "dev", InFlightAttemptTime: at(10)},
+			wantFold:  controlplanev1.CreateIntent{ClusterName: "old", FirstUnknownOutcomeTime: at(1), LastUnknownOutcomeTime: at(1)},
+			wantClear: controlplanev1.CreateIntent{ClusterName: "old", FirstUnknownOutcomeTime: at(1), LastUnknownOutcomeTime: at(1)},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(cpIntentForAttempt(tc.previous, "dev", at(10))).To(Equal(tc.wantNext))
+			g.Expect(cpFoldInFlight(tc.previous)).To(Equal(tc.wantFold))
+			g.Expect(cpClearAttempt(tc.previous)).To(Equal(tc.wantClear))
+		})
+	}
+}
+
+func TestCPCreatedNothing(t *testing.T) {
+	apiError := func(status int, code string) error {
+		return &kubernetesservice.APIError{Operation: kubernetesservice.OpCreateCluster, StatusCode: status, Code: code}
+	}
+	testCases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "E0007 any status", err: apiError(http.StatusConflict, "E0007"), want: true},
+		{name: "A0656 any status", err: apiError(http.StatusInternalServerError, "A0656"), want: true},
+		{name: "400 P4102 subnet not found", err: apiError(http.StatusBadRequest, "P4102"), want: true},
+		{name: "400 E7278 ROKS without a COS instance", err: apiError(http.StatusBadRequest, "E7278"), want: true},
+		{name: "401", err: apiError(http.StatusUnauthorized, ""), want: true},
+		{name: "403", err: apiError(http.StatusForbidden, ""), want: true},
+		{name: "422", err: apiError(http.StatusUnprocessableEntity, ""), want: true},
+		{name: "never sent: invalid request", err: kubernetesservice.ErrInvalidRequest, want: true},
+		{name: "never sent: IAM refused", err: kubernetesservice.ErrCredentialsRejected, want: true},
+		{name: "409 without a code", err: apiError(http.StatusConflict, "")},
+		{name: "429", err: apiError(http.StatusTooManyRequests, "")},
+		{name: "500", err: apiError(http.StatusInternalServerError, "E0004")},
+		{name: "timeout", err: context.DeadlineExceeded},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			NewWithT(t).Expect(cpCreatedNothing(tc.err)).To(Equal(tc.want))
+		})
+	}
+}
+
+func TestCPNonCriticalCodes(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(cpNonCriticalCodes(nil)).To(BeNil(), "no codes omit the field")
+	items := []kubernetesservice.IBMMessage{{Code: "E49df"}, {Code: "A1234"}, {Code: "E49df"}, {Code: ""}, {Code: "TOO-LONG-FOR-STATUS"}}
+	g.Expect(cpNonCriticalCodes(items)).To(Equal([]string{"A1234", "E49df"}))
+	many := make([]kubernetesservice.IBMMessage, 0, 20)
+	for i := range 20 {
+		many = append(many, kubernetesservice.IBMMessage{Code: "E" + string(rune('a'+i))})
+	}
+	g.Expect(cpNonCriticalCodes(many)).To(HaveLen(cpNonCriticalCodesMaxItems))
+	g.Expect(cpNonCriticalNote(nil)).To(BeEmpty())
+	g.Expect(cpNonCriticalNote([]string{"E49df"})).To(Equal("; IBM created the cluster with non-critical errors E49df (see the IBMCreateWarnings events)"))
+	g.Expect(cpNonCriticalEventMessage("dev", "iksclusterid00000001", "inc-1", kubernetesservice.IBMMessage{
+		Code: "E49df", Type: "Provisioning", Description: "Your cluster cannot pull images.", RecoveryCLI: "Ask for the role.",
+	})).To(Equal("IBM created cluster dev (ID iksclusterid00000001) with the non-critical error E49df (Provisioning): Your " +
+		"cluster cannot pull images. Recovery: Ask for the role. [incident inc-1]"))
+	g.Expect(cpNonCriticalEventMessage("dev", "id", "", kubernetesservice.IBMMessage{Code: "E1"})).
+		To(Equal("IBM created cluster dev (ID id) with the non-critical error E1"))
+}
+
+func TestInfrastructureKeyNotCreatableMessage(t *testing.T) {
+	g := NewWithT(t)
+	message := InfrastructureKeyNotCreatableMessage("us-south", "0123456789abcdef0123456789abcdef", credentials.ControllerDescription,
+		" (IBM code A0656)")
+	g.Expect(message).To(Equal("IBM cannot create the infrastructure API key for region us-south and resource group " +
+		"0123456789abcdef0123456789abcdef with the credentials of the CAPIBM controller identity (IBM code A0656); a service " +
+		"ID needs the IAM Identity Service roles (Service ID creator, User API key creator, Viewer and Operator), or an " +
+		"account administrator pre-sets the key with `ibmcloud ks api-key reset --region us-south`; the IAM page of the " +
+		"managed Kubernetes book lists every role"))
+}
+
+func TestControlPlaneCreateRefusedMessage(t *testing.T) {
+	scope := &ControlPlaneScope{InfraCluster: &infrav1.IBMCloudManagedCluster{ObjectMeta: metav1.ObjectMeta{Name: "dev"}}}
+	testCases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "CAPIBM refused to send", err: fmt.Errorf("%w: CreateCluster: Name is empty", kubernetesservice.ErrInvalidRequest),
+			want: "CAPIBM did not send the create request of IBM cluster dev: kubernetesservice: invalid request, nothing was sent " +
+				"to IBM Cloud: CreateCluster: Name is empty"},
+		{name: "another 400", err: &kubernetesservice.APIError{Operation: kubernetesservice.OpCreateCluster, StatusCode: http.StatusBadRequest,
+			Code: "E9999", Description: "IBM free text", IncidentID: "inc-2"},
+			want: "IBM Cloud refused to create cluster dev with HTTP 400 (IBM code E9999); the controller log has " +
+				"IBM's description of the configuration to fix"},
+		{name: "not an IBM answer", err: errors.New("unexpected"),
+			want: "IBM Cloud refused to create cluster dev; the controller log has the cause"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			message := scope.createRefusedMessage("dev", tc.err)
+			g.Expect(message).To(Equal(tc.want))
+			g.Expect(message).NotTo(ContainSubstring("IBM free text"), "IBM's description stays in the controller log")
+			g.Expect(message).NotTo(ContainSubstring("inc-2"), "IBM's per-answer incident ID never reaches status")
+		})
+	}
+}
+
+func TestCPCreateHold(t *testing.T) {
+	now := time.Date(2026, 11, 16, 3, 10, 0, 0, time.UTC)
+	refused := func(mutate func(cp *controlplanev1.IBMCloudManagedControlPlane)) *controlplanev1.IBMCloudManagedControlPlane {
+		cp := &controlplanev1.IBMCloudManagedControlPlane{
+			ObjectMeta: metav1.ObjectMeta{Generation: 3, Annotations: map[string]string{
+				CreateHoldAnnotation: now.Add(10 * time.Minute).Format(time.RFC3339),
+			}},
+			Status: controlplanev1.IBMCloudManagedControlPlaneStatus{Conditions: []metav1.Condition{{
+				Type:               controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition,
+				Status:             metav1.ConditionFalse,
+				Reason:             controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason,
+				ObservedGeneration: 3,
+			}}},
+		}
+		if mutate != nil {
+			mutate(cp)
+		}
+		return cp
+	}
+	setReason := func(reason string) func(cp *controlplanev1.IBMCloudManagedControlPlane) {
+		return func(cp *controlplanev1.IBMCloudManagedControlPlane) { cp.Status.Conditions[0].Reason = reason }
+	}
+	testCases := []struct {
+		name string
+		cp   *controlplanev1.IBMCloudManagedControlPlane
+		want bool
+	}{
+		{name: "a fresh refusal holds", cp: refused(nil), want: true},
+		{name: "an InvalidConfiguration refusal holds",
+			cp: refused(setReason(controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason)), want: true},
+		{name: "a ClusterNameConflict refusal holds",
+			cp: refused(setReason(controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedClusterNameConflictReason)), want: true},
+		{name: "a hold up to CreateRefusalHold ahead holds", cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) {
+			cp.Annotations[CreateHoldAnnotation] = now.Add(CreateRefusalHold).Format(time.RFC3339)
+		}), want: true},
+		{name: "nil", cp: nil},
+		{name: "no annotation", cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) { cp.Annotations = nil })},
+		{name: "an annotation that is not a time", cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) {
+			cp.Annotations[CreateHoldAnnotation] = "soon"
+		})},
+		{name: "a hold that has ended", cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) {
+			cp.Annotations[CreateHoldAnnotation] = now.Format(time.RFC3339)
+		})},
+		{name: "a time beyond CreateRefusalHold was not written by CAPIBM", cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) {
+			cp.Annotations[CreateHoldAnnotation] = now.Add(CreateRefusalHold + time.Second).Format(time.RFC3339)
+		})},
+		{name: "a spec change ends the hold", cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) { cp.Generation = 4 })},
+		{name: "another report replaced the refusal",
+			cp: refused(setReason(controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason))},
+		{name: "a condition that is not False", cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) {
+			cp.Status.Conditions[0].Status = metav1.ConditionUnknown
+		})},
+		{name: "no condition", cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) { cp.Status.Conditions = nil })},
+		{name: "a bound control plane is never held", cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) {
+			cp.Status.ClusterID = "iksclusterid00000001"
+		})},
+		{name: "an attempt of unknown outcome is left to the binding", cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) {
+			cp.Status.CreateIntent = controlplanev1.CreateIntent{ClusterName: "dev", LastUnknownOutcomeTime: metav1.NewTime(now)}
+		})},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			until, held := cpCreateHold(tc.cp, now)
+			g.Expect(held).To(Equal(tc.want))
+			if tc.want {
+				g.Expect(until).To(BeTemporally("==", mustParseRFC3339(t, tc.cp.Annotations[CreateHoldAnnotation])))
+			} else {
+				g.Expect(until.IsZero()).To(BeTrue())
+			}
+		})
+	}
+}
+
+// mustParseRFC3339 parses an RFC 3339 time of a test.
+func mustParseRFC3339(t *testing.T, value string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339, value)
+	NewWithT(t).Expect(err).NotTo(HaveOccurred())
+	return parsed
+}
+
+func TestCPCreateHoldFor(t *testing.T) {
+	testCases := []struct {
+		class    kubernetesservice.ErrorClass
+		wantHold time.Duration
+		wantOK   bool
+	}{
+		{class: kubernetesservice.ClassUnauthorized, wantHold: CreateUnauthorizedHold, wantOK: true},
+		{class: kubernetesservice.ClassInfrastructureKeyNotCreatable, wantHold: CreateRefusalHold, wantOK: true},
+		{class: kubernetesservice.ClassInfrastructureKeyDenied, wantHold: CreateRefusalHold, wantOK: true},
+		{class: kubernetesservice.ClassPermissionDenied, wantHold: CreateRefusalHold, wantOK: true},
+		{class: kubernetesservice.ClassBadRequest, wantHold: CreateRefusalHold, wantOK: true},
+		// E0007 is held only after a lookup that finds nothing (afterNameExists); unknown outcomes are never held.
+		{class: kubernetesservice.ClassClusterNameExists},
+		{class: kubernetesservice.ClassRateLimited},
+		{class: kubernetesservice.ClassTransient},
+		{class: kubernetesservice.ClassUnknown},
+	}
+	for _, tc := range testCases {
+		t.Run(string(tc.class), func(t *testing.T) {
+			g := NewWithT(t)
+			hold, ok := cpCreateHoldFor(tc.class)
+			g.Expect(ok).To(Equal(tc.wantOK))
+			g.Expect(hold).To(Equal(tc.wantHold))
+		})
+	}
+}
+
+func TestControlPlaneHoldCreates(t *testing.T) {
+	g := NewWithT(t)
+	cp := &controlplanev1.IBMCloudManagedControlPlane{}
+	scope, err := NewControlPlaneScope(newCPScopeParams(&cpScopeBuilder{}), &clusterv1.Cluster{}, cp, cpNoPersist)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	scope.holdCreates(CreateRefusalHold)
+
+	// The fake clock of newCPScopeParams starts at 03:05:30 UTC; the annotation is UTC at second precision.
+	g.Expect(cp.Annotations).To(HaveKeyWithValue(CreateHoldAnnotation, "2026-11-16T03:17:30Z"))
 }

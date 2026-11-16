@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -686,11 +687,15 @@ func TestControlPlaneReconcileCredentials(t *testing.T) {
 
 	t.Run("the scope constructor resolves no identity and builds no client", func(t *testing.T) {
 		g := NewWithT(t)
+		versions, err := managedscope.NewVersionsCache(clocktesting.NewFakePassiveClock(cpTestStart), time.Hour)
+		g.Expect(err).NotTo(HaveOccurred())
 		params := &managedscope.ScopeParams{
 			Client: fake.NewClientBuilder().Build(), APIReader: fake.NewClientBuilder().Build(), Recorder: record.NewFakeRecorder(1),
 			Resolver: failIfCalledResolver{t: t}, ClientBuilder: failIfCalledBuilder{t: t}, Clock: clocktesting.NewFakePassiveClock(cpTestStart),
+			VersionsCache: versions,
 		}
-		scope, err := managedscope.NewControlPlaneScope(params, &clusterv1.Cluster{}, &controlplanev1.IBMCloudManagedControlPlane{})
+		persist := func(context.Context) error { t.Error("the constructor must not persist"); return nil }
+		scope, err := managedscope.NewControlPlaneScope(params, &clusterv1.Cluster{}, &controlplanev1.IBMCloudManagedControlPlane{}, persist)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(scope).NotTo(BeNil())
 	})
@@ -979,6 +984,16 @@ func TestControlPlaneConditionsIgnoreTheIncident(t *testing.T) {
 			},
 			wantCondition: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition,
 			wantReason:    controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason,
+		},
+		{
+			name:  "403_on_ListVersions",
+			setup: withInitialPool,
+			expect: func(f *cpFixture, incident string) {
+				gomock.InOrder(f.expectLookupByName(nil), f.kube.EXPECT().ListVersions(gomock.Any()).
+					Return(nil, ibmErrorWithIncident(kubernetesservice.OpListVersions, http.StatusForbidden, "", incident)))
+			},
+			wantCondition: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition,
+			wantReason:    controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason,
 		},
 	}
 	for _, tc := range testCases {
@@ -1311,4 +1326,895 @@ func TestControlPlaneReconcilerSetupWithManager(t *testing.T) {
 			return getEnvtestControlPlane(t, client.ObjectKeyFromObject(cp))
 		}, 30*time.Second, 200*time.Millisecond).Should(BeNil())
 	})
+}
+
+// Create and observe: the create intent before the POST, a lost response, create refusals and warnings, and the
+// readiness of the master.
+
+// cpTestPoolName names the initial pool and its MachinePool in the create tests.
+const cpTestPoolName = "dev-default"
+
+// withInitialPool adds the initial IBMCloudManagedMachinePool (two zones) and its MachinePool (replicas 2) to objs, linked
+// by the owner reference CAPI sets.
+func withInitialPool(objs *cpObjects) {
+	mp := &clusterv1.MachinePool{
+		ObjectMeta: metav1.ObjectMeta{Namespace: cpTestNamespace, Name: cpTestPoolName, UID: "machinepool-uid",
+			Labels: map[string]string{clusterv1.ClusterNameLabel: cpTestName}},
+		Spec: clusterv1.MachinePoolSpec{ClusterName: cpTestName, Replicas: ptr.To[int32](2)},
+	}
+	pool := &infrav1.IBMCloudManagedMachinePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: cpTestNamespace, Name: cpTestPoolName,
+			Labels: map[string]string{clusterv1.ClusterNameLabel: cpTestName},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: clusterv1.GroupVersion.String(), Kind: "MachinePool", Name: mp.Name, UID: mp.UID,
+			}},
+		},
+		Spec: infrav1.IBMCloudManagedMachinePoolSpec{
+			PoolName: managedscope.InitialWorkerPoolName,
+			Flavor:   "bx2.4x16",
+			Zones:    []infrav1.WorkerPoolZone{{Name: "us-south-1"}, {Name: "us-south-2"}},
+		},
+	}
+	objs.extra = append(objs.extra, mp, pool)
+}
+
+// cpOfferedVersions are the versions IBM offers in the create tests.
+func cpOfferedVersions() *kubernetesservice.Versions {
+	return &kubernetesservice.Versions{
+		Kubernetes: []kubernetesservice.ReleaseVersion{{Major: 1, Minor: 35, Patch: 9}, {Major: 1, Minor: 36, Patch: 5, Default: true}},
+		OpenShift:  []kubernetesservice.ReleaseVersion{{Major: 4, Minor: 21, Patch: 35}},
+	}
+}
+
+// expectLookupByName expects one GetCluster by the effective name in the resource group, answering c (nil: 404).
+func (f *cpFixture) expectLookupByName(c *kubernetesservice.Cluster) *gomock.Call {
+	call := f.kube.EXPECT().GetCluster(gomock.Any(), cpTestName, testResourceGroupID)
+	if c == nil {
+		return call.Return(nil, ibmError(kubernetesservice.OpGetCluster, http.StatusNotFound, ""))
+	}
+	return call.Return(c, nil)
+}
+
+// expectCreate expects one CreateCluster; before it answers, it checks that the create intent is already on record in
+// the API server: the intent is persisted before the POST, so that a lost response can be told from a foreign cluster.
+func (f *cpFixture) expectCreate(result *kubernetesservice.CreateClusterResult, err error) *gomock.Call {
+	return f.kube.EXPECT().CreateCluster(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, req kubernetesservice.CreateClusterRequest) (*kubernetesservice.CreateClusterResult, error) {
+			persisted := f.controlPlane()
+			if persisted.Status.CreateIntent.ClusterName != req.Name || persisted.Status.CreateIntent.InFlightAttemptTime.IsZero() {
+				f.t.Errorf("CreateCluster was called before the create intent was persisted: %+v", persisted.Status.CreateIntent)
+			}
+			return result, err
+		})
+}
+
+// createTimeoutErr is a create request whose answer never arrived: its outcome is unknown.
+var createTimeoutErr = context.DeadlineExceeded
+
+// liveNonCriticalResult returns the result of the createCluster fixture with non-critical errors, recorded on IBM Cloud
+// (IKS and ROKS creates can succeed with them), read from the scrubbed copy of kubernetesservice/testdata.
+func liveNonCriticalResult(t *testing.T) *kubernetesservice.CreateClusterResult {
+	t.Helper()
+	g := NewWithT(t)
+	data, err := os.ReadFile("../../../pkg/cloud/services/kubernetesservice/testdata/createCluster-201-non-critical-errors.json")
+	g.Expect(err).NotTo(HaveOccurred())
+	var fixture struct {
+		ClusterID         string `json:"clusterID"`
+		NonCriticalErrors struct {
+			IncidentID string `json:"incidentID"`
+			Items      []struct {
+				Code        string `json:"code"`
+				Type        string `json:"type"`
+				Description string `json:"description"`
+				RecoveryCLI string `json:"recoveryCLI"`
+			} `json:"items"`
+		} `json:"non_critical_errors"`
+	}
+	g.Expect(json.Unmarshal(data, &fixture)).To(Succeed())
+	result := &kubernetesservice.CreateClusterResult{ClusterID: fixture.ClusterID, IncidentID: fixture.NonCriticalErrors.IncidentID}
+	for _, item := range fixture.NonCriticalErrors.Items {
+		result.NonCriticalErrors = append(result.NonCriticalErrors, kubernetesservice.IBMMessage{
+			Code: item.Code, Type: item.Type, Description: item.Description, RecoveryCLI: item.RecoveryCLI,
+		})
+	}
+	return result
+}
+
+func TestControlPlaneCreate(t *testing.T) {
+	t.Run("the identity holder is the IBMCloudManagedCluster on create and the intent is persisted before the POST", func(t *testing.T) {
+		g := NewWithT(t)
+		objs := newCPObjects()
+		withInitialPool(objs)
+		f := newCPFixture(t, objs)
+		var sent kubernetesservice.CreateClusterRequest
+		gomock.InOrder(
+			f.expectLookupByName(nil),
+			f.kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil),
+			f.expectCreate(&kubernetesservice.CreateClusterResult{ClusterID: cpIKSClusterID}, nil).
+				Do(func(_ context.Context, req kubernetesservice.CreateClusterRequest) { sent = req }),
+		)
+
+		result, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		expectRequeue(g, result, time.Minute)
+		g.Expect(sent.Name).To(Equal(cpTestName))
+		g.Expect(sent.ResourceGroupID).To(Equal(testResourceGroupID))
+		g.Expect(sent.KubeVersion).To(Equal("1.36"))
+		g.Expect(sent.WorkerPool.WorkerCountPerZone).To(Equal(int64(1)), "2 replicas over 2 zones")
+		g.Expect(sent.WorkerPool.Zones).To(Equal([]kubernetesservice.ZoneSubnet{{Zone: "us-south-1", SubnetID: "sn-1"}, {Zone: "us-south-2", SubnetID: "sn-2"}}))
+		cp := f.controlPlane()
+		g.Expect(cp.Status.ClusterID).To(Equal(cpIKSClusterID))
+		g.Expect(cp.Status.CreateIntent.InFlightAttemptTime.Time).To(BeTemporally("==", cpTestStart), "the intent stays until row 1 observes the cluster")
+		expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, metav1.ConditionFalse,
+			controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCreatingReason)
+		g.Expect(f.events()).To(Equal([]string{"Normal SuccessfulCreateIBMCluster Created IBM cluster dev (ID iksclusterid00000001)"}))
+		expectHolderIsInfraCluster(g, f)
+		for _, body := range f.patches() {
+			g.Expect(emptyStatusStrings(t, body)).To(BeEmpty(), "no status patch writes an empty string: %s", body)
+		}
+
+		// The next reconcile observes the cluster by ID (row 1), which clears the intent.
+		f.kube.EXPECT().GetCluster(gomock.Any(), cpIKSClusterID, "").Return(cpCluster("deploying"), nil)
+		_, err = f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(f.controlPlane().Status.CreateIntent).To(BeZero())
+	})
+
+	t.Run("non-critical create errors are warnings, never failures", func(t *testing.T) {
+		g := NewWithT(t)
+		objs := newCPObjects()
+		withInitialPool(objs)
+		f := newCPFixture(t, objs)
+		live := liveNonCriticalResult(t)
+		gomock.InOrder(
+			f.expectLookupByName(nil),
+			f.kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil),
+			f.expectCreate(live, nil),
+		)
+
+		_, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		cp := f.controlPlane()
+		g.Expect(cp.Status.ClusterID).To(Equal(live.ClusterID))
+		g.Expect(cp.Status.NonCriticalCreateErrorCodes).To(Equal([]string{"E49df"}))
+		condition := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, metav1.ConditionFalse,
+			controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCreatingReason)
+		g.Expect(condition.Message).To(HaveSuffix("IBM created the cluster with non-critical errors E49df (see the IBMCreateWarnings events)"))
+		g.Expect(condition.Message).NotTo(ContainSubstring("icr.io"), "IBM's text stays in the event")
+		events := f.events()
+		g.Expect(events).To(HaveLen(1 + len(live.NonCriticalErrors)))
+		g.Expect(events[1]).To(HavePrefix("Warning IBMCreateWarnings IBM created cluster dev (ID " + live.ClusterID +
+			") with the non-critical error E49df (Provisioning): Your cluster cannot pull images"))
+
+		// Once the cluster exists, Provisioned is True and still names the codes.
+		observed := cpCluster("normal")
+		observed.ID = live.ClusterID
+		f.kube.EXPECT().GetCluster(gomock.Any(), live.ClusterID, "").Return(observed, nil)
+		_, err = f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+		condition = expectCondition(g, f.controlPlane(), controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition,
+			metav1.ConditionTrue, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedReason)
+		g.Expect(condition.Message).To(Equal("IBM created the cluster with non-critical errors E49df (see the IBMCreateWarnings events)"))
+	})
+
+	t.Run("a lost status patch after a successful POST is adopted by name on the next reconcile", func(t *testing.T) {
+		g := NewWithT(t)
+		objs := newCPObjects()
+		withInitialPool(objs)
+		f := newCPFixture(t, objs)
+		f.failStatusPatch = func(body string) bool { return strings.Contains(body, `"clusterID"`) }
+		gomock.InOrder(
+			f.expectLookupByName(nil),
+			f.kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil),
+			f.expectCreate(&kubernetesservice.CreateClusterResult{ClusterID: cpIKSClusterID}, nil).Times(1),
+		)
+
+		_, err := f.reconcile()
+
+		g.Expect(err).To(MatchError(ContainSubstring("injected status patch failure")))
+		persisted := f.controlPlane()
+		g.Expect(persisted.Status.ClusterID).To(BeEmpty(), "the cluster ID was lost with the patch")
+		g.Expect(persisted.Status.CreateIntent.InFlightAttemptTime.IsZero()).To(BeFalse(), "the intent was on record before the POST")
+
+		// Next reconcile: the lookup by name finds the cluster our lost response created, inside the window (row 6).
+		f.failStatusPatch = nil
+		f.clock.SetTime(cpTestStart.Add(time.Minute))
+		f.expectLookupByName(cpCluster("deploying"))
+		_, err = f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(f.controlPlane().Status.ClusterID).To(Equal(cpIKSClusterID))
+	})
+
+	t.Run("a failed intent patch sends no POST", func(t *testing.T) {
+		g := NewWithT(t)
+		objs := newCPObjects()
+		withInitialPool(objs)
+		f := newCPFixture(t, objs)
+		f.failStatusPatch = func(body string) bool { return strings.Contains(body, `"createIntent"`) }
+		f.expectLookupByName(nil)
+		f.kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil)
+		// No CreateCluster expectation: gomock fails the test if it is called.
+
+		_, err := f.reconcile()
+
+		g.Expect(err).To(MatchError(ContainSubstring("recording the create intent")))
+		g.Expect(f.controlPlane().Status.CreateIntent).To(BeZero(), "no attempt is recorded that was never sent")
+	})
+
+	createFailureCases := []struct {
+		name string
+		// err is CreateCluster's answer.
+		err error
+		// relookup is the answer of the lookup after an E0007 (nil: 404); unused otherwise.
+		relookup   func() *kubernetesservice.Cluster
+		wantReason string
+		// wantIntent is the persisted intent after the reconcile.
+		wantIntent  controlplanev1.CreateIntent
+		wantErr     bool
+		wantRequeue time.Duration
+		wantMessage string
+	}{
+		{
+			name: "a 400 P4102 clears the intent", err: ibmError(kubernetesservice.OpCreateCluster, http.StatusBadRequest, "P4102"),
+			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason,
+			wantRequeue: 15 * time.Minute,
+			wantMessage: "IBM Cloud refused to create cluster dev because a subnet of the request does not exist (IBM code P4102); " +
+				"check the subnets of IBMCloudManagedCluster dev (status.zones)",
+		},
+		{
+			name: "a 400 E7278 clears the intent", err: ibmError(kubernetesservice.OpCreateCluster, http.StatusBadRequest, "E7278"),
+			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason,
+			wantRequeue: 15 * time.Minute,
+			wantMessage: "IBM Cloud refused to create cluster dev because an OpenShift cluster on VPC needs a standard Cloud Object " +
+				"Storage instance for its registry (IBM code E7278); set spec.openShift.imageRegistry.cos.instanceCRN",
+		},
+		{
+			name: "a 500 moves the attempt into the unknown-outcome bounds", err: ibmError(kubernetesservice.OpCreateCluster, http.StatusInternalServerError, ""),
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason,
+			wantIntent: controlplanev1.CreateIntent{ClusterName: cpTestName, FirstUnknownOutcomeTime: metav1.NewTime(cpTestStart),
+				LastUnknownOutcomeTime: metav1.NewTime(cpTestStart)},
+			wantErr: true,
+		},
+		{
+			name: "a 429 makes the outcome unknown and backs off", err: ibmError(kubernetesservice.OpCreateCluster, http.StatusTooManyRequests, ""),
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason,
+			wantIntent: controlplanev1.CreateIntent{ClusterName: cpTestName, FirstUnknownOutcomeTime: metav1.NewTime(cpTestStart),
+				LastUnknownOutcomeTime: metav1.NewTime(cpTestStart)},
+			wantRequeue: 31 * time.Second,
+		},
+		{
+			name: "E0007 with a lookup answered with 404 is a name conflict", err: ibmError(kubernetesservice.OpCreateCluster, http.StatusConflict, "E0007"),
+			relookup:    func() *kubernetesservice.Cluster { return nil },
+			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedClusterNameConflictReason,
+			wantRequeue: 15 * time.Minute,
+		},
+		{
+			name: "E0007 with a cluster created 30s earlier is a name conflict", err: ibmError(kubernetesservice.OpCreateCluster, http.StatusConflict, "E0007"),
+			relookup: func() *kubernetesservice.Cluster {
+				c := cpCluster("deploying")
+				c.CreatedDate = cpTestStart.Add(-30 * time.Second).Format("2006-01-02T15:04:05-0700")
+				return c
+			},
+			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedClusterNameConflictReason,
+			wantRequeue: 15 * time.Minute,
+		},
+		{
+			name: "A0656 is permission denied with the remedy", err: ibmError(kubernetesservice.OpCreateCluster, http.StatusUnauthorized, "A0656"),
+			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason,
+			wantRequeue: 15 * time.Minute,
+			wantMessage: "IBM cannot create the infrastructure API key for region us-south and resource group " +
+				"0123456789abcdef0123456789abcdef with the credentials of the CAPIBM controller identity (IBM code A0656); " +
+				"a service ID needs the IAM Identity Service roles (Service ID creator, User API key creator, Viewer " +
+				"and Operator), or an account administrator pre-sets the key with `ibmcloud ks api-key reset --region us-south`; " +
+				"the IAM page of the managed Kubernetes book lists every role",
+		},
+		{
+			name: "a create 403 names the stored infrastructure key and the identity", err: ibmError(kubernetesservice.OpCreateCluster, http.StatusForbidden, ""),
+			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason,
+			wantRequeue: 15 * time.Minute,
+			wantMessage: "IBM Cloud refused to create cluster dev with HTTP 403: the infrastructure API key IBM " +
+				"stores for region us-south and resource group 0123456789abcdef0123456789abcdef, or the credentials of the CAPIBM " +
+				"controller identity, lack permissions; the credentials need the Administrator platform role and the Manager service " +
+				"role of Kubernetes Service, and `ibmcloud ks api-key info --cluster <a cluster of that region and resource group>` " +
+				"shows whose key IBM stores, which `ibmcloud ks api-key reset --region us-south` replaces; the IAM page of the " +
+				"managed Kubernetes book lists every role",
+		},
+		{
+			name: "a create 401 clears the intent and rebuilds the credentials", err: ibmError(kubernetesservice.OpCreateCluster, http.StatusUnauthorized, ""),
+			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason,
+			wantRequeue: 5 * time.Minute,
+		},
+	}
+	for _, tc := range createFailureCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			objs := newCPObjects()
+			withInitialPool(objs)
+			f := newCPFixture(t, objs)
+			calls := []any{
+				f.expectLookupByName(nil),
+				f.kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil),
+				f.expectCreate(nil, tc.err).Times(1),
+			}
+			if tc.relookup != nil {
+				calls = append(calls, f.expectLookupByName(tc.relookup()))
+			}
+			gomock.InOrder(calls...)
+
+			result, err := f.reconcile()
+
+			if tc.wantErr {
+				g.Expect(err).To(HaveOccurred())
+			} else {
+				g.Expect(err).NotTo(HaveOccurred())
+				expectRequeue(g, result, tc.wantRequeue)
+			}
+			cp := f.controlPlane()
+			g.Expect(cpUTCIntent(cp.Status.CreateIntent)).To(Equal(tc.wantIntent))
+			g.Expect(cp.Status.ClusterID).To(BeEmpty())
+			condition := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition,
+				metav1.ConditionFalse, tc.wantReason)
+			if tc.wantMessage != "" {
+				g.Expect(condition.Message).To(Equal(tc.wantMessage))
+			}
+			expectNoIdentityDetails(g, condition.Message)
+			for _, body := range f.patches() {
+				g.Expect(emptyStatusStrings(t, body)).To(BeEmpty(), "no status patch writes an empty string: %s", body)
+			}
+		})
+	}
+
+	t.Run("a timed-out attempt 1 is bound after attempt 2 gets E0007", func(t *testing.T) {
+		g := NewWithT(t)
+		objs := newCPObjects()
+		withInitialPool(objs)
+		f := newCPFixture(t, objs)
+		gomock.InOrder(
+			f.expectLookupByName(nil),
+			f.kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil),
+			f.expectCreate(nil, createTimeoutErr),
+		)
+		_, err := f.reconcile()
+		g.Expect(err).To(HaveOccurred(), "attempt 1 timed out")
+
+		// Attempt 2, after the read-after-create window of attempt 1: IBM still lists nothing (lag), the create answers
+		// E0007, and the lookup then finds the cluster attempt 1 created. Row 6 binds it over attempt 1 only.
+		f.clock.SetTime(cpTestStart.Add(6 * time.Minute))
+		gomock.InOrder(
+			f.expectLookupByName(nil),
+			f.expectCreate(nil, ibmError(kubernetesservice.OpCreateCluster, http.StatusConflict, "E0007")),
+			f.expectLookupByName(cpCluster("deploying")),
+		)
+		_, err = f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		cp := f.controlPlane()
+		g.Expect(cp.Status.ClusterID).To(Equal(cpIKSClusterID), "row 6: our own attempt 1 created it")
+		g.Expect(cp.Status.CreateIntent.InFlightAttemptTime.IsZero()).To(BeTrue(), "attempt 2 created nothing and left the intent")
+		g.Expect(cp.Status.CreateIntent.FirstUnknownOutcomeTime.Time).To(BeTemporally("==", cpTestStart))
+	})
+
+	t.Run("the next create goes out only after the terminal recheck", func(t *testing.T) {
+		g := NewWithT(t)
+		objs := newCPObjects()
+		withInitialPool(objs)
+		f := newCPFixture(t, objs)
+		gomock.InOrder(
+			f.expectLookupByName(nil),
+			f.kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil),
+			f.expectCreate(nil, ibmError(kubernetesservice.OpCreateCluster, http.StatusUnauthorized, "A0656")).Times(1),
+		)
+
+		result, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		expectRequeue(g, result, 15*time.Minute)
+		g.Expect(f.builder.invalidated).To(BeEmpty(), "A0656 is a missing role, not rejected credentials")
+		cp := f.controlPlane()
+		g.Expect(cp.Status.CreateIntent).To(BeZero())
+		g.Expect(cp.Annotations).To(HaveKeyWithValue(managedscope.CreateHoldAnnotation,
+			cpTestStart.Add(managedscope.CreateRefusalHold).Format(time.RFC3339)))
+
+		// The refusal's own status patch brings the control plane straight back (no predicate on For): that reconcile makes
+		// no IBM call (gomock has no expectation left) and writes nothing, so nothing re-triggers it.
+		patches := len(f.patches())
+		result, err = f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+		expectRequeue(g, result, 5*time.Minute)
+		g.Expect(f.patches()).To(HaveLen(patches), "a held reconcile writes no status")
+	})
+}
+
+// cpRefusalCase is one definitive create refusal of the hold tests.
+type cpRefusalCase struct {
+	name string
+	// err is CreateCluster's answer.
+	err error
+	// relookup is true for E0007: decideBinding looks the name up again, and IBM still finds nothing (the name is taken
+	// by a cluster that the lookup in the resource group does not see).
+	relookup   bool
+	wantReason string
+	wantHold   time.Duration
+}
+
+// cpRefusalCases are the definitive create refusals that hold the next create request, so that the reconcile the
+// refusal's own status patch triggers sends none.
+func cpRefusalCases() []cpRefusalCase {
+	return []cpRefusalCase{
+		{name: "A0656", err: ibmError(kubernetesservice.OpCreateCluster, http.StatusUnauthorized, "A0656"),
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason, wantHold: managedscope.CreateRefusalHold},
+		{name: "400_P4102", err: ibmError(kubernetesservice.OpCreateCluster, http.StatusBadRequest, "P4102"),
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason, wantHold: managedscope.CreateRefusalHold},
+		{name: "403", err: ibmError(kubernetesservice.OpCreateCluster, http.StatusForbidden, ""),
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason, wantHold: managedscope.CreateRefusalHold},
+		{name: "401", err: ibmError(kubernetesservice.OpCreateCluster, http.StatusUnauthorized, ""),
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason, wantHold: managedscope.CreateUnauthorizedHold},
+		{name: "E0007_then_404", err: ibmError(kubernetesservice.OpCreateCluster, http.StatusConflict, "E0007"), relookup: true,
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedClusterNameConflictReason, wantHold: managedscope.CreateRefusalHold},
+	}
+}
+
+// expectRefusedCreate expects the IBM calls of one create that tc refuses: the lookup by name (404), the version list
+// when withVersions (the VersionsCache keeps it afterwards), the create and, for E0007, the second lookup. creates
+// counts the create requests.
+func (f *cpFixture) expectRefusedCreate(tc cpRefusalCase, withVersions bool, creates *int) {
+	calls := []any{f.expectLookupByName(nil)}
+	if withVersions {
+		calls = append(calls, f.kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil))
+	}
+	calls = append(calls, f.expectCreate(nil, tc.err).Do(func(context.Context, kubernetesservice.CreateClusterRequest) { *creates++ }))
+	if tc.relookup {
+		calls = append(calls, f.expectLookupByName(nil))
+	}
+	gomock.InOrder(calls...)
+}
+
+func TestControlPlaneCreateHold(t *testing.T) {
+	for _, tc := range cpRefusalCases() {
+		t.Run(tc.name+"_holds_the_next_create_until_its_recheck", func(t *testing.T) {
+			g := NewWithT(t)
+			objs := newCPObjects()
+			withInitialPool(objs)
+			f := newCPFixture(t, objs)
+			creates := 0
+			f.expectRefusedCreate(tc, true, &creates)
+
+			_, err := f.reconcile()
+
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(creates).To(Equal(1))
+			g.Expect(f.controlPlane().Annotations).To(HaveKeyWithValue(managedscope.CreateHoldAnnotation,
+				cpTestStart.Add(tc.wantHold).Format(time.RFC3339)))
+			patches, invalidated := len(f.patches()), len(f.builder.invalidated)
+
+			// The own-patch reconcile, one a minute later and one just before the hold ends: no IBM call (gomock has
+			// no expectation), no write, and for a 401 no second authenticator rebuild.
+			for _, at := range []time.Duration{0, time.Minute, tc.wantHold - time.Second} {
+				f.clock.SetTime(cpTestStart.Add(at))
+				result, err := f.reconcile()
+				g.Expect(err).NotTo(HaveOccurred())
+				expectRequeue(g, result, 5*time.Minute)
+			}
+			g.Expect(f.patches()).To(HaveLen(patches))
+			g.Expect(f.builder.invalidated).To(HaveLen(invalidated))
+			expectCondition(g, f.controlPlane(), controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition,
+				metav1.ConditionFalse, tc.wantReason)
+
+			// The hold is over: the next reconcile sends the create again, and IBM's second refusal holds it again.
+			f.clock.SetTime(cpTestStart.Add(tc.wantHold))
+			f.expectRefusedCreate(tc, false, &creates)
+			_, err = f.reconcile()
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(creates).To(Equal(2))
+			g.Expect(f.controlPlane().Annotations).To(HaveKeyWithValue(managedscope.CreateHoldAnnotation,
+				cpTestStart.Add(2*tc.wantHold).Format(time.RFC3339)))
+		})
+	}
+
+	t.Run("a spec change sends the next create at once and a created cluster ends the hold", func(t *testing.T) {
+		g := NewWithT(t)
+		objs := newCPObjects()
+		withInitialPool(objs)
+		f := newCPFixture(t, objs)
+		creates := 0
+		f.expectRefusedCreate(cpRefusalCases()[0], true, &creates)
+		_, err := f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+
+		// A spec change raises metadata.generation (the fake client does not, so the test does): the refusal was
+		// observed for the old generation and holds nothing any more (Terminal: "spec edits re-trigger").
+		cp := f.controlPlane()
+		cp.Generation++
+		g.Expect(f.client.Update(ctx, cp)).To(Succeed())
+		f.clock.SetTime(cpTestStart.Add(time.Minute))
+		gomock.InOrder(f.expectLookupByName(nil), f.expectCreate(&kubernetesservice.CreateClusterResult{ClusterID: cpIKSClusterID}, nil))
+		_, err = f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		cp = f.controlPlane()
+		g.Expect(cp.Status.ClusterID).To(Equal(cpIKSClusterID))
+		g.Expect(cp.Annotations).NotTo(HaveKey(managedscope.CreateHoldAnnotation), "the hold went with the intent's write")
+	})
+
+	t.Run("a hold annotation far in the future is not CAPIBM's and holds nothing", func(t *testing.T) {
+		g := NewWithT(t)
+		objs := newCPObjects()
+		withInitialPool(objs)
+		objs.cp.Annotations = map[string]string{managedscope.CreateHoldAnnotation: "2099-01-01T00:00:00Z"}
+		objs.cp.Status.Conditions = append(objs.cp.Status.Conditions, metav1.Condition{
+			Type: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, Status: metav1.ConditionFalse,
+			Reason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason, LastTransitionTime: metav1.NewTime(cpTestStart),
+		})
+		f := newCPFixture(t, objs)
+		creates := 0
+		f.expectRefusedCreate(cpRefusalCases()[0], true, &creates)
+
+		_, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(creates).To(Equal(1))
+	})
+}
+
+// TestCreateHoldsEndBeforeTheirRecheck pins the hold durations of the scope to the controller's cadence: each ends
+// before the smallest jittered requeue of the outcome its refusal returns, so that recheck sends the next create
+// (about 15 minutes after a Terminal refusal, about 5 after a 401).
+func TestCreateHoldsEndBeforeTheirRecheck(t *testing.T) {
+	g := NewWithT(t)
+	terminal, err := requeueInterval(managedscope.IntervalTerminalRecheck)
+	g.Expect(err).NotTo(HaveOccurred())
+	steady, err := requeueInterval(managedscope.IntervalSteadyState)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(managedscope.CreateRefusalHold).To(BeNumerically("<", terminal*9/10))
+	g.Expect(managedscope.CreateUnauthorizedHold).To(BeNumerically("<", steady*9/10))
+	g.Expect(managedscope.CreateRefusalHold).To(BeNumerically(">", managedscope.CreateUnauthorizedHold))
+}
+
+func TestControlPlaneCreateWaitsAndGuards(t *testing.T) {
+	testCases := []struct {
+		name        string
+		setup       func(objs *cpObjects)
+		expect      func(f *cpFixture)
+		wantReason  string
+		wantRequeue time.Duration
+		wantMessage string
+	}{
+		{
+			name:        "no initial pool waits",
+			expect:      func(f *cpFixture) { f.expectLookupByName(nil) },
+			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInitialWorkerPoolReason,
+			wantRequeue: time.Minute,
+			wantMessage: `No IBMCloudManagedMachinePool with spec.poolName "default" belongs to Cluster dev; the first pool is created with the cluster`,
+		},
+		{
+			name: "a pool CAPI has not linked yet waits",
+			setup: func(objs *cpObjects) {
+				withInitialPool(objs)
+				objs.extra[1].SetOwnerReferences(nil)
+			},
+			expect:      func(f *cpFixture) { f.expectLookupByName(nil) },
+			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInitialWorkerPoolReason,
+			wantRequeue: time.Minute,
+		},
+		{
+			name: "two initial pools are InvalidConfiguration",
+			setup: func(objs *cpObjects) {
+				withInitialPool(objs)
+				second := objs.extra[1].DeepCopyObject().(*infrav1.IBMCloudManagedMachinePool)
+				second.Name = "dev-other"
+				objs.extra = append(objs.extra, second)
+			},
+			expect:      func(f *cpFixture) { f.expectLookupByName(nil) },
+			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason,
+			wantRequeue: 15 * time.Minute,
+			wantMessage: `IBMCloudManagedMachinePools dev-default, dev-other of Cluster dev all have spec.poolName "default"; IBM creates ` +
+				"the cluster with one initial pool, so keep only one of them",
+		},
+		{
+			name: "a configuration IBM would refuse is caught without an IBM mutation",
+			setup: func(objs *cpObjects) {
+				withInitialPool(objs)
+				objs.extra[0].(*clusterv1.MachinePool).Spec.Replicas = ptr.To[int32](3)
+			},
+			expect:      func(f *cpFixture) { f.expectLookupByName(nil) },
+			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason,
+			wantRequeue: 15 * time.Minute,
+		},
+		{
+			name: "an unresolved zone of the IBMCloudManagedCluster waits",
+			setup: func(objs *cpObjects) {
+				withInitialPool(objs)
+				objs.infra.Status.Zones = objs.infra.Status.Zones[:1]
+			},
+			expect:      func(f *cpFixture) { f.expectLookupByName(nil) },
+			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInfrastructureReason,
+			wantRequeue: time.Minute,
+		},
+		{
+			name: "a version IBM does not offer is VersionNotAvailable",
+			setup: func(objs *cpObjects) {
+				withInitialPool(objs)
+				objs.cp.Spec.DistributionVersion = "1.33"
+			},
+			expect: func(f *cpFixture) {
+				f.expectLookupByName(nil)
+				f.kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil)
+			},
+			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedVersionNotAvailableReason,
+			wantRequeue: 15 * time.Minute,
+			wantMessage: "IBM Cloud does not offer Kubernetes 1.33 (offered: 1.35, 1.36)",
+		},
+		{
+			name: "a failed version listing is retried",
+			setup: func(objs *cpObjects) {
+				withInitialPool(objs)
+			},
+			expect: func(f *cpFixture) {
+				f.expectLookupByName(nil)
+				f.kube.EXPECT().ListVersions(gomock.Any()).Return(nil, ibmError(kubernetesservice.OpListVersions, http.StatusTooManyRequests, ""))
+			},
+			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason,
+			wantRequeue: 31 * time.Second,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			objs := newCPObjects()
+			if tc.setup != nil {
+				tc.setup(objs)
+			}
+			f := newCPFixture(t, objs)
+			tc.expect(f) // no CreateCluster expectation: gomock fails the test if it is called
+
+			result, err := f.reconcile()
+
+			g.Expect(err).NotTo(HaveOccurred())
+			expectRequeue(g, result, tc.wantRequeue)
+			cp := f.controlPlane()
+			g.Expect(cp.Status.CreateIntent).To(BeZero(), "nothing is recorded before the configuration is complete")
+			condition := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition,
+				metav1.ConditionFalse, tc.wantReason)
+			if tc.wantMessage != "" {
+				g.Expect(condition.Message).To(Equal(tc.wantMessage))
+			}
+		})
+	}
+}
+
+func TestControlPlaneObserve(t *testing.T) {
+	testCases := []struct {
+		name string
+		// cluster returns IBM's answer.
+		cluster     func() *kubernetesservice.Cluster
+		want        func(g Gomega, cp *controlplanev1.IBMCloudManagedControlPlane)
+		wantRequeue time.Duration
+	}{
+		{
+			name: "pending_marker_never_reaches_status",
+			cluster: func() *kubernetesservice.Cluster {
+				c := cpCluster("updating")
+				c.MasterKubeVersion = "1.36.5_1537 (pending)"
+				c.TargetVersion = "1.37.1_1550"
+				c.MasterHealth = "normal"
+				return c
+			},
+			want: func(g Gomega, cp *controlplanev1.IBMCloudManagedControlPlane) {
+				g.Expect(cp.Status.DistributionVersion).To(Equal("1.36.5_1537"))
+				g.Expect(cp.Status.TargetDistributionVersion).To(Equal("1.37.1_1550"))
+				g.Expect(cp.Status.State).To(Equal("updating"))
+				g.Expect(cp.Status.Master).To(Equal(controlplanev1.MasterStatus{State: "deployed", Health: "normal"}))
+				g.Expect(cp.Status.ClusterCRN).To(Equal(cpTestCRN))
+			},
+			wantRequeue: 5 * time.Minute,
+		},
+		{
+			name:    "the deployed fixture's master is ready with an empty health",
+			cluster: func() *kubernetesservice.Cluster { return cpCluster("deployed") },
+			want: func(g Gomega, cp *controlplanev1.IBMCloudManagedControlPlane) {
+				expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, metav1.ConditionTrue,
+					controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedReason)
+				condition := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionFalse,
+					controlplanev1.IBMCloudManagedControlPlaneAvailableWaitingForIBMClusterReason)
+				g.Expect(condition.Message).To(HavePrefix("The master of IBM cluster iksclusterid00000001 is ready"))
+				g.Expect(cp.Status.Master).To(Equal(controlplanev1.MasterStatus{State: "deployed"}), "an empty health is omitted, never written as an empty string")
+			},
+			wantRequeue: 5 * time.Minute,
+		},
+		{
+			name: "a master that is not ready is polled at the provisioning cadence",
+			cluster: func() *kubernetesservice.Cluster {
+				c := cpCluster("pending")
+				c.MasterState, c.MasterStatus = "deploying", "Deploy in progress."
+				return c
+			},
+			want: func(g Gomega, cp *controlplanev1.IBMCloudManagedControlPlane) {
+				condition := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionFalse,
+					controlplanev1.IBMCloudManagedControlPlaneAvailableMasterNotReadyReason)
+				g.Expect(condition.Message).To(Equal("The master of IBM cluster iksclusterid00000001 is not ready yet (masterState deploying)"))
+				g.Expect(condition.Message).NotTo(ContainSubstring("progress"), "masterStatus is IBM free text")
+			},
+			wantRequeue: time.Minute,
+		},
+		{
+			name: "an unhealthy master is not available; ingress is never consulted",
+			cluster: func() *kubernetesservice.Cluster {
+				c := cpCluster("critical")
+				c.MasterHealth = "error"
+				return c
+			},
+			want: func(g Gomega, cp *controlplanev1.IBMCloudManagedControlPlane) {
+				condition := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionFalse,
+					controlplanev1.IBMCloudManagedControlPlaneAvailableMasterNotReadyReason)
+				g.Expect(condition.Message).To(Equal("IBM reports the master health of cluster iksclusterid00000001 as error"))
+				expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, metav1.ConditionTrue,
+					controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedReason)
+			},
+			wantRequeue: 5 * time.Minute,
+		},
+		{
+			name: "an unparseable IBM version is left out, the rest is recorded",
+			cluster: func() *kubernetesservice.Cluster {
+				c := cpCluster("normal")
+				c.MasterKubeVersion = "not-a-version"
+				return c
+			},
+			want: func(g Gomega, cp *controlplanev1.IBMCloudManagedControlPlane) {
+				g.Expect(cp.Status.DistributionVersion).To(BeEmpty())
+				g.Expect(cp.Status.State).To(Equal("normal"))
+			},
+			wantRequeue: 5 * time.Minute,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			objs := newCPObjects()
+			objs.cp.Status.ClusterID = cpIKSClusterID
+			f := newCPFixture(t, objs)
+			f.kube.EXPECT().GetCluster(gomock.Any(), cpIKSClusterID, "").Return(tc.cluster(), nil)
+
+			result, err := f.reconcile()
+
+			g.Expect(err).NotTo(HaveOccurred())
+			expectRequeue(g, result, tc.wantRequeue)
+			cp := f.controlPlane()
+			tc.want(g, cp)
+			for _, body := range f.patches() {
+				g.Expect(emptyStatusStrings(t, body)).To(BeEmpty(), "no status patch writes an empty string: %s", body)
+			}
+		})
+	}
+}
+
+// cpUTCIntent returns intent with its times in UTC: the API returns them in the local zone, the tests write UTC.
+func cpUTCIntent(intent controlplanev1.CreateIntent) controlplanev1.CreateIntent {
+	utc := func(t metav1.Time) metav1.Time {
+		if t.IsZero() {
+			return t
+		}
+		return metav1.NewTime(t.UTC())
+	}
+	intent.InFlightAttemptTime = utc(intent.InFlightAttemptTime)
+	intent.FirstUnknownOutcomeTime = utc(intent.FirstUnknownOutcomeTime)
+	intent.LastUnknownOutcomeTime = utc(intent.LastUnknownOutcomeTime)
+	return intent
+}
+
+// createEnvtestCreateInputs creates in namespace what a create needs: the Cluster "dev" with its infrastructure
+// provisioned, its IBMCloudManagedCluster with the resolved zones, and the initial pool with its MachinePool, linked by
+// the owner reference CAPI sets.
+func createEnvtestCreateInputs(t *testing.T, namespace string) (*clusterv1.Cluster, *infrav1.IBMCloudManagedCluster) {
+	t.Helper()
+	g := NewWithT(t)
+	cluster := createTestCluster(t, namespace, "dev", managedControlPlaneRef("dev"))
+	cluster.Status.Initialization.InfrastructureProvisioned = ptr.To(true)
+	g.Expect(testEnv.Status().Update(ctx, cluster)).To(Succeed())
+	infra := createTestInfra(t, namespace, "dev", cluster)
+	infra.Status = newCPObjects().infra.Status
+	g.Expect(testEnv.Status().Update(ctx, infra)).To(Succeed())
+	pools := &cpObjects{}
+	withInitialPool(pools)
+	for _, obj := range pools.extra {
+		obj.SetNamespace(namespace)
+		obj.SetUID("")
+		if obj.GetOwnerReferences() != nil {
+			obj.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: clusterv1.GroupVersion.String(), Kind: "MachinePool",
+				Name: pools.extra[0].GetName(), UID: pools.extra[0].GetUID()}})
+		}
+		g.Expect(testEnv.Create(ctx, obj)).To(Succeed())
+	}
+	return cluster, infra
+}
+
+func TestControlPlaneEnvtestCreate(t *testing.T) {
+	g := NewWithT(t)
+	namespace := newTestNamespace(t, "cp-create")
+	cluster, infra := createEnvtestCreateInputs(t, namespace)
+	cp := createEnvtestControlPlane(t, namespace, "dev", cluster)
+	key := client.ObjectKeyFromObject(cp)
+
+	kube := ksmock.NewMockKubernetesService(gomock.NewController(t))
+	resolver := &recordingResolver{}
+	r := newEnvtestControlPlaneReconciler(t)
+	r.Resolver, r.ClientBuilder = resolver, &stubClientBuilder{kubernetes: kube}
+	live := liveNonCriticalResult(t)
+	gomock.InOrder(
+		kube.EXPECT().GetCluster(gomock.Any(), "dev", testResourceGroupID).Return(nil, ibmError(kubernetesservice.OpGetCluster, http.StatusNotFound, "")),
+		kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil),
+		kube.EXPECT().CreateCluster(gomock.Any(), gomock.Any()).Return(live, nil),
+	)
+
+	// Finalizer, then the Paused condition, then the create; every status write passes the CRD validation.
+	g.Eventually(func(g Gomega) {
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(getEnvtestControlPlane(t, key).Status.ClusterID).To(Equal(live.ClusterID))
+	}, 10*time.Second, 100*time.Millisecond).Should(Succeed())
+
+	persisted := getEnvtestControlPlane(t, key)
+	g.Expect(persisted.Status.NonCriticalCreateErrorCodes).To(Equal([]string{"E49df"}))
+	g.Expect(persisted.Status.CreateIntent.ClusterName).To(Equal("dev"))
+	g.Expect(persisted.Status.CreateIntent.InFlightAttemptTime.IsZero()).To(BeFalse())
+	expectCondition(g, persisted, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, metav1.ConditionFalse,
+		controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCreatingReason)
+	holders := resolver.Holders()
+	g.Expect(holders).NotTo(BeEmpty())
+	g.Expect(holders[0]).To(BeAssignableToTypeOf(&infrav1.IBMCloudManagedCluster{}))
+	g.Expect(holders[0].GetName()).To(Equal(infra.Name), "the identity holder is the Cluster's IBMCloudManagedCluster")
+}
+
+func TestControlPlaneEnvtestCreateRefusalSendsOneCreate(t *testing.T) {
+	for _, tc := range cpRefusalCases() {
+		t.Run(tc.name+"_manager_sends_one_create", func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			namespace := newTestNamespace(t, "cp-hold")
+			cluster, _ := createEnvtestCreateInputs(t, namespace)
+			// Registered before the manager starts, so it runs after the manager has stopped.
+			t.Cleanup(func() { pauseTestCluster(t, cluster) })
+
+			var gets, creates atomic.Int64
+			kube := ksmock.NewMockKubernetesService(gomock.NewController(t))
+			kube.EXPECT().GetCluster(gomock.Any(), "dev", testResourceGroupID).DoAndReturn(
+				func(context.Context, string, string) (*kubernetesservice.Cluster, error) {
+					gets.Add(1)
+					return nil, ibmError(kubernetesservice.OpGetCluster, http.StatusNotFound, "")
+				}).AnyTimes()
+			kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil).AnyTimes()
+			kube.EXPECT().CreateCluster(gomock.Any(), gomock.Any()).DoAndReturn(
+				func(context.Context, kubernetesservice.CreateClusterRequest) (*kubernetesservice.CreateClusterResult, error) {
+					creates.Add(1)
+					return nil, tc.err
+				}).AnyTimes()
+			builder := startControlPlaneManager(t, namespace, kube)
+			key := client.ObjectKeyFromObject(createEnvtestControlPlane(t, namespace, "dev", cluster))
+
+			g.Eventually(func(g Gomega) {
+				g.Expect(creates.Load()).To(BeNumerically(">=", 1))
+				persisted := getEnvtestControlPlane(t, key)
+				expectCondition(g, persisted, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition,
+					metav1.ConditionFalse, tc.wantReason)
+				g.Expect(persisted.Annotations).To(HaveKey(managedscope.CreateHoldAnnotation))
+			}, 30*time.Second, 100*time.Millisecond).Should(Succeed())
+
+			// One lookup and one create (E0007: a second lookup). The control plane is created after the manager
+			// started, so every reconcile before the create makes no IBM call, and every one after it is held.
+			wantGets := int64(1)
+			if tc.relookup {
+				wantGets = 2
+			}
+			g.Consistently(func(g Gomega) {
+				g.Expect(creates.Load()).To(Equal(int64(1)), "CreateCluster calls")
+				g.Expect(gets.Load()).To(Equal(wantGets), "GetCluster calls")
+			}, noHotLoopWindow, 100*time.Millisecond).Should(Succeed())
+			builder.mu.Lock()
+			invalidated := len(builder.invalidated)
+			builder.mu.Unlock()
+			g.Expect(invalidated).To(BeNumerically("<=", 1), "a 401 rebuilds the authenticator once, not on every pass")
+		})
+	}
 }

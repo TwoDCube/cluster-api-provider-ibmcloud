@@ -20,6 +20,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -30,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/secret"
 
@@ -37,12 +41,14 @@ import (
 	infrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/v1alpha1"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/credentials"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/ibmversion"
 )
 
 // This file is the control plane scope: it finds the Cluster's IBMCloudManagedCluster, decides which IBM cluster the
-// IBMCloudManagedControlPlane stands for (the binding, DecideBinding), and reports what IBM says about that cluster.
-// The decisions themselves are pure functions of this package (binding.go, cluster_state.go); the scope only gathers
-// their inputs, makes the IBM calls they name and writes their results into status and conditions.
+// IBMCloudManagedControlPlane stands for (the binding, DecideBinding), creates that cluster when none exists
+// (BuildCreateClusterRequest), and reports what IBM says about it (ClassifyClusterState, ObserveCluster).
+// The decisions themselves are pure functions of this package (binding.go, cluster_state.go, create_request.go); the
+// scope only gathers their inputs, makes the IBM calls they name and writes their results into status and conditions.
 //
 // Credentials: every IBM call of a Cluster is made with the identity resolved from the Cluster's
 // IBMCloudManagedCluster, the identity holder. The control plane never carries an identity of its own. The scope
@@ -75,9 +81,20 @@ type ControlPlaneScope struct {
 	// is the identity holder of every IBM call and gives the region and the resource group.
 	InfraCluster *infrav1.IBMCloudManagedCluster
 
+	// persist writes the control plane to the API server at once, before an IBM call whose effect must be recorded
+	// first (PersistFunc).
+	persist PersistFunc
+
 	// clients are the IBM clients of this reconcile, built by ibm on first use.
 	clients *controlPlaneClients
 }
+
+// PersistFunc writes the control plane's in-memory changes to the API server at once. The scope calls it before an IBM
+// call whose effect must be on record first: the create intent before CreateCluster and the deletion request time
+// before DeleteCluster. When it fails, the IBM call is not made. The controller passes its patcher, which then takes
+// the written object as its baseline, so that a field cleared later in the same reconcile (an intent that a definitive
+// answer clears) is cleared on the API server as well. ctx is the reconcile context.
+type PersistFunc func(ctx context.Context) error
 
 // controlPlaneClients are one reconcile's IBM clients for the Cluster's identity.
 type controlPlaneClients struct {
@@ -93,11 +110,15 @@ type controlPlaneClients struct {
 // after the controller's patch helper exists.
 //
 // Parameters:
-//   - params are the shared dependencies; the scope needs Client, APIReader, Recorder, Resolver, ClientBuilder and Clock.
+//   - params are the shared dependencies; the scope needs Client, APIReader, Recorder, Resolver, ClientBuilder, Clock
+//     and VersionsCache.
 //   - cluster is the owning CAPI Cluster.
 //   - cp is the IBMCloudManagedControlPlane being reconciled.
-func NewControlPlaneScope(params *ScopeParams, cluster *clusterv1.Cluster, cp *controlplanev1.IBMCloudManagedControlPlane) (*ControlPlaneScope, error) {
-	if err := params.validate("ControlPlaneScope", depClient, depAPIReader, depRecorder, depResolver, depClientBuilder, depClock); err != nil {
+//   - persist writes cp to the API server at once (PersistFunc); the controller passes its patcher.
+func NewControlPlaneScope(params *ScopeParams, cluster *clusterv1.Cluster, cp *controlplanev1.IBMCloudManagedControlPlane,
+	persist PersistFunc) (*ControlPlaneScope, error) {
+	if err := params.validate("ControlPlaneScope", depClient, depAPIReader, depRecorder, depResolver, depClientBuilder, depClock,
+		depVersionsCache); err != nil {
 		return nil, err
 	}
 	if cluster == nil {
@@ -106,7 +127,10 @@ func NewControlPlaneScope(params *ScopeParams, cluster *clusterv1.Cluster, cp *c
 	if cp == nil {
 		return nil, errors.New("managed: ControlPlaneScope needs the IBMCloudManagedControlPlane, got nil")
 	}
-	return &ControlPlaneScope{params: params, Cluster: cluster, ControlPlane: cp}, nil
+	if persist == nil {
+		return nil, errors.New("managed: ControlPlaneScope needs a PersistFunc that writes the control plane before an IBM mutation, got nil")
+	}
+	return &ControlPlaneScope{params: params, Cluster: cluster, ControlPlane: cp, persist: persist}, nil
 }
 
 // ibm resolves the Cluster's identity with the IBMCloudManagedCluster as the holder and builds its Kubernetes Service
@@ -165,6 +189,9 @@ func (s *ControlPlaneScope) ReconcileNormal(ctx context.Context) Outcome {
 	if err != nil {
 		return s.notProvisioned(controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason, err.Error())
 	}
+	if outcome, held := s.createHeld(ctx); held {
+		return outcome
+	}
 	clients, err := s.ibm(ctx)
 	if err != nil {
 		return s.clientsProblem(err)
@@ -176,6 +203,25 @@ func (s *ControlPlaneScope) ReconcileNormal(ctx context.Context) Outcome {
 	return s.actOnBinding(ctx, decision, name)
 }
 
+// createHeld applies the hold after a definitive create refusal, so that a refused create is sent again only at the
+// recheck its outcome scheduled (about 15 minutes later, 5 after a 401), never in a hot loop. IBM's refusal changes
+// status (the cleared intent, the refusal condition), and the For() watch has no predicate, so this controller's own
+// patch brings the control plane straight back; without the hold that reconcile would decide binding row 10 again
+// and send the next create at once. While cpCreateHold holds, the reconcile makes no IBM call and writes nothing, so
+// the refusal condition stays as IBM's last answer and nothing re-triggers. held is false when no hold applies. ctx
+// carries the reconcile's logger.
+func (s *ControlPlaneScope) createHeld(ctx context.Context) (Outcome, bool) {
+	until, held := cpCreateHold(s.ControlPlane, s.params.Clock.Now())
+	if !held {
+		return Outcome{}, false
+	}
+	ctrl.LoggerFrom(ctx).V(4).Info("IBM refused the last create request; no IBM call before the hold ends", "until", bindingTime(until))
+	// The steady interval is shorter than CreateRefusalHold, so a long hold is looked at a few times without an IBM
+	// call; CreateRefusalHold and CreateUnauthorizedHold end before the recheck the refusal itself scheduled.
+	reason := conditions.GetReason(s.ControlPlane, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition)
+	return NotDone(IntervalSteadyState, reason), true
+}
+
 // actOnBinding carries out a binding decision of the normal flow: it observes a bound cluster, waits for one CAPIBM
 // may have created, acts on a Create decision, or reports a decision that needs a human.
 //
@@ -183,19 +229,17 @@ func (s *ControlPlaneScope) ReconcileNormal(ctx context.Context) Outcome {
 //   - ctx is the reconcile context.
 //   - decision is DecideBinding's answer.
 //   - name is the effective IBM cluster name.
-func (s *ControlPlaneScope) actOnBinding(_ context.Context, decision BindingDecision, name string) Outcome {
+func (s *ControlPlaneScope) actOnBinding(ctx context.Context, decision BindingDecision, name string) Outcome {
 	switch decision.Action {
 	case BindingKnown:
-		return s.observe(decision)
+		return s.observe(ctx, decision)
 	case BindingWait:
 		// Rows 3 and 9: a create of CAPIBM's may still show up; no mutation until the window ends.
 		s.setProvisioned(metav1.ConditionFalse, decision.Reason, decision.Message)
 		s.setAvailableWaiting()
 		return NotDone(IntervalClusterProvisioning, decision.Reason)
 	case BindingCreate:
-		message := fmt.Sprintf("IBM Cloud lists no cluster named %s in resource group %s; this CAPIBM build does not create IBM clusters",
-			name, s.InfraCluster.Spec.ResourceGroup.ID)
-		return s.notProvisioned(controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCreatingReason, message)
+		return s.createCluster(ctx, name)
 	case BindingTerminal:
 		return s.notProvisioned(decision.Reason, decision.Message)
 	default:
@@ -208,21 +252,34 @@ func (s *ControlPlaneScope) actOnBinding(_ context.Context, decision BindingDeci
 // every Known row; the create intent is cleared only when status.clusterID itself found the cluster (row 1), because
 // until then the intent is the only record of an attempt whose response may have been lost.
 //
+// Status receives IBM's stable tokens through ObserveCluster, which strips the " (pending)" marker from every version
+// and omits a value it cannot record rather than writing "", which the API's MinLength=1 rejects.
+//
 // Parameters:
+//   - ctx carries the reconcile's logger.
 //   - decision is a BindingKnown decision; its Cluster is the cluster GetCluster returned.
-func (s *ControlPlaneScope) observe(decision BindingDecision) Outcome {
+func (s *ControlPlaneScope) observe(ctx context.Context, decision BindingDecision) Outcome {
 	cp := s.ControlPlane
 	c := decision.Cluster
 	cp.Status.ClusterID = decision.ClusterID
+	// A bound control plane sends no create request, so a leftover hold (cpCreateHold) has nothing left to hold.
+	delete(cp.Annotations, CreateHoldAnnotation)
 	if decision.Row == "1" {
 		cp.Status.CreateIntent = controlplanev1.CreateIntent{}
+	}
+	observed, err := ObserveCluster(c)
+	observed.ApplyTo(&cp.Status)
+	if err != nil {
+		// The other fields are valid; the value that was left out is named, because the forms IBM reports during a
+		// master update are not yet verified against IBM Cloud and the parser may need to learn one.
+		ctrl.LoggerFrom(ctx).Info("IBM reported a cluster value that CAPIBM does not record", "problem", err.Error())
 	}
 
 	label := fmt.Sprintf("IBM cluster %s (ID %s)", c.Name, c.ID)
 	switch ClassifyClusterState(c.State) {
 	case ClusterStateProvisioning:
 		s.setProvisioned(metav1.ConditionFalse, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCreatingReason,
-			fmt.Sprintf("IBM is creating %s (state %s)", label, c.State))
+			fmt.Sprintf("IBM is creating %s (state %s)%s", label, c.State, cpNonCriticalNote(cp.Status.NonCriticalCreateErrorCodes)))
 		s.setAvailableWaiting()
 		return NotDone(IntervalClusterProvisioning, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCreatingReason)
 	case ClusterStateFailed:
@@ -233,14 +290,63 @@ func (s *ControlPlaneScope) observe(decision BindingDecision) Outcome {
 			fmt.Sprintf("IBM reports %s in state %s although this Cluster is not being deleted; CAPIBM never recreates it: "+
 				"delete this Cluster", label, c.State))
 	default:
-		message := ""
+		var notes []string
 		if !KnownClusterState(c.State) {
 			// Forward compatible: a new IBM state never stops a working cluster, but it is named.
-			message = fmt.Sprintf("unknown IBM state %s", c.State)
+			notes = append(notes, fmt.Sprintf("unknown IBM state %s", c.State))
 		}
-		s.setProvisioned(metav1.ConditionTrue, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedReason, message)
+		if codes := cp.Status.NonCriticalCreateErrorCodes; len(codes) > 0 {
+			notes = append(notes, cpNonCriticalSentence(codes))
+		}
+		s.setProvisioned(metav1.ConditionTrue, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedReason, strings.Join(notes, "; "))
+		return s.reportMaster(c)
+	}
+}
+
+// reportMaster reports the master of an existing cluster in Available: it is usable once masterState is deployed,
+// masterStatus is Ready and masterURL is set (IsMasterReady); masterHealth stays "" for minutes after that and does
+// not count, and only error or unavailable health makes it unusable again (IsMasterUnhealthy), as observed on IBM
+// Cloud. The cluster's ingress status is never consulted: IBM reports it as warning or critical without a public
+// gateway or with fewer than two workers per zone. The control plane itself becomes Available only once it is
+// initialized with a verified kubeconfig. c is the cluster GetCluster returned.
+func (s *ControlPlaneScope) reportMaster(c *kubernetesservice.Cluster) Outcome {
+	reason := controlplanev1.IBMCloudManagedControlPlaneAvailableMasterNotReadyReason
+	switch {
+	case !IsMasterReady(c):
+		s.setAvailable(reason, fmt.Sprintf("The master of IBM cluster %s is not ready yet (masterState %s)", c.ID, cpToken(c.MasterState)))
+		// IBM Cloud showed a usable master 16-25 minutes after the create; poll at the provisioning cadence until then.
+		return NotDone(IntervalClusterProvisioning, reason)
+	case IsMasterUnhealthy(c):
+		s.setAvailable(reason, fmt.Sprintf("IBM reports the master health of cluster %s as %s", c.ID, c.MasterHealth))
+		return Done()
+	default:
+		s.setAvailable(controlplanev1.IBMCloudManagedControlPlaneAvailableWaitingForIBMClusterReason,
+			fmt.Sprintf("The master of IBM cluster %s is ready; the control plane becomes available once CAPIBM has verified its "+
+				"kubeconfig and initialized it", c.ID))
 		return Done()
 	}
+}
+
+// setAvailable sets Available to False with reason and message.
+//
+// Parameters:
+//   - reason is the Available reason.
+//   - message says what is awaited.
+func (s *ControlPlaneScope) setAvailable(reason, message string) {
+	conditions.Set(s.ControlPlane, metav1.Condition{
+		Type:    controlplanev1.IBMCloudManagedControlPlaneAvailableCondition,
+		Status:  metav1.ConditionFalse,
+		Reason:  reason,
+		Message: message,
+	})
+}
+
+// cpToken returns an IBM token for a message, or "not reported" when IBM sent none. token is the IBM value.
+func cpToken(token string) string {
+	if token == "" {
+		return "not reported"
+	}
+	return token
 }
 
 // decideBinding gathers the inputs of DecideBinding, makes the one GetCluster call it names and returns its decision
@@ -495,31 +601,6 @@ func (s *ControlPlaneScope) infraClusterProblem(err error) Outcome {
 		transient: true})
 }
 
-// report writes problem into IBMClusterProvisioned, unless it is transient and the condition is already True, and
-// returns its outcome. problem is the failure to report.
-func (s *ControlPlaneScope) report(problem cpProblem) Outcome {
-	if problem.transient && conditions.IsTrue(s.ControlPlane, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition) {
-		return problem.outcome
-	}
-	s.setProvisioned(metav1.ConditionFalse, problem.reason, problem.message)
-	if !conditions.IsTrue(s.ControlPlane, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition) {
-		s.setAvailableWaiting()
-	}
-	return problem.outcome
-}
-
-// waitForInfrastructure reports that the Cluster's infrastructure is not ready yet; the Cluster watch brings the
-// control plane back when it is. message names what is awaited.
-func (s *ControlPlaneScope) waitForInfrastructure(message string) Outcome {
-	reason := controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInfrastructureReason
-	s.setProvisioned(metav1.ConditionFalse, reason, message)
-	s.setAvailableWaiting()
-	return NotDone(IntervalClusterProvisioning, reason)
-}
-
-// notProvisioned reports a condition that needs a human: IBMClusterProvisioned False with reason and message, and a
-// Terminal outcome, rechecked at terminalRecheck.
-//
 // reportCall reports a failed IBM call of the normal flow through classifyCall. A failure that is not retried with
 // its error (a Terminal or a rechecked condition) is logged with IBM's whole answer, because the condition carries
 // only IBM's code, so that it does not change with every answer.
@@ -545,6 +626,29 @@ func logIBMRefusal(ctx context.Context, callErr *controlPlaneCallError) {
 	ctrl.LoggerFrom(ctx).Info("IBM Cloud did not complete a call", "call", callErr.action, "error", callErr.err.Error())
 }
 
+// report writes problem into IBMClusterProvisioned, unless it is transient and the condition is already True, and
+// returns its outcome. problem is the failure to report.
+func (s *ControlPlaneScope) report(problem cpProblem) Outcome {
+	if problem.transient && conditions.IsTrue(s.ControlPlane, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition) {
+		return problem.outcome
+	}
+	s.setProvisioned(metav1.ConditionFalse, problem.reason, problem.message)
+	s.setAvailableWaiting()
+	return problem.outcome
+}
+
+// waitForInfrastructure reports that the Cluster's infrastructure is not ready yet; the Cluster watch brings the
+// control plane back when it is. message names what is awaited.
+func (s *ControlPlaneScope) waitForInfrastructure(message string) Outcome {
+	reason := controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInfrastructureReason
+	s.setProvisioned(metav1.ConditionFalse, reason, message)
+	s.setAvailableWaiting()
+	return NotDone(IntervalClusterProvisioning, reason)
+}
+
+// notProvisioned reports a condition that needs a human: IBMClusterProvisioned False with reason and message, and a
+// Terminal outcome, rechecked at terminalRecheck.
+//
 // Parameters:
 //   - reason is the IBMClusterProvisioned reason.
 //   - message says what to fix.
@@ -571,12 +675,8 @@ func (s *ControlPlaneScope) setProvisioned(status metav1.ConditionStatus, reason
 // setAvailableWaiting sets Available False with WaitingForIBMCluster: no IBM cluster is bound or it is still being
 // created.
 func (s *ControlPlaneScope) setAvailableWaiting() {
-	conditions.Set(s.ControlPlane, metav1.Condition{
-		Type:    controlplanev1.IBMCloudManagedControlPlaneAvailableCondition,
-		Status:  metav1.ConditionFalse,
-		Reason:  controlplanev1.IBMCloudManagedControlPlaneAvailableWaitingForIBMClusterReason,
-		Message: "No IBM cluster is provisioned for this control plane yet; see IBMClusterProvisioned",
-	})
+	s.setAvailable(controlplanev1.IBMCloudManagedControlPlaneAvailableWaitingForIBMClusterReason,
+		"No IBM cluster is provisioned for this control plane yet; see IBMClusterProvisioned")
 }
 
 // objectName names the reconciled object in messages, for example IBMCloudManagedControlPlane/dev.
@@ -632,4 +732,550 @@ func cpIBMCode(err error) string {
 		return " (IBM code " + apiErr.Code + ")"
 	}
 	return ""
+}
+
+// Create (only after DecideBinding decided Create: row 10, no IBM cluster of this control plane exists).
+
+// The events of the create flow.
+const (
+	// EventReasonSuccessfulCreateIBMCluster is the Normal event of a create request IBM accepted.
+	EventReasonSuccessfulCreateIBMCluster = "SuccessfulCreateIBMCluster"
+	// EventReasonIBMCreateWarnings is the Warning event of one non-critical error of an accepted create request (IBM
+	// answers 201 with non_critical_errors, observed on IBM Cloud for IKS and ROKS). It carries IBM's description and
+	// recovery text, which never go into status.
+	EventReasonIBMCreateWarnings = "IBMCreateWarnings"
+)
+
+// The IBM error codes whose create refusal gets a specific message (both observed on IBM Cloud). kubernetesservice
+// keeps its copies unexported; these only select the message, Classify decides the class.
+const (
+	// cpCodeSubnetNotFound is IBM's "subnet cannot be found" (HTTP 400; it creates nothing).
+	cpCodeSubnetNotFound = "P4102"
+	// cpCodeCOSInstanceRequired is IBM's "ROKS on VPC needs a COS instance CRN" (HTTP 400; it creates nothing).
+	cpCodeCOSInstanceRequired = "E7278"
+)
+
+// The bounds of status.nonCriticalCreateErrorCodes (api/managed/controlplane/v1alpha1): a longer list or code would make
+// the API server reject the whole status patch, so such values stay in the events only.
+const (
+	cpNonCriticalCodesMaxItems  = 16
+	cpNonCriticalCodesMaxLength = 16
+)
+
+// createCluster creates the IBM cluster of the control plane. The configuration is checked first (the initial pool,
+// BuildCreateClusterRequest, the offered versions), so a configuration IBM would refuse records nothing and sends no
+// create. Then the attempt is persisted in status.createIntent, and only after that write succeeded is the request
+// sent: a lost response can then be told apart from a foreign same-named cluster (DecideBinding rows 3, 6, 9).
+//
+// Parameters:
+//   - ctx is the reconcile context.
+//   - name is the effective IBM cluster name.
+func (s *ControlPlaneScope) createCluster(ctx context.Context, name string) Outcome {
+	pool, mp, outcome, ok := s.initialPool(ctx)
+	if !ok {
+		return outcome
+	}
+	request, err := BuildCreateClusterRequest(s.ControlPlane, s.Cluster, s.InfraCluster, pool, mp)
+	if err != nil {
+		return s.createRequestProblem(err)
+	}
+	clients, err := s.ibm(ctx)
+	if err != nil {
+		return s.clientsProblem(err)
+	}
+	if outcome, ok := s.checkVersionOffered(ctx, clients); !ok {
+		return outcome
+	}
+
+	cp := s.ControlPlane
+	previous := cp.Status.CreateIntent
+	cp.Status.CreateIntent = cpIntentForAttempt(previous, name, s.now())
+	// A hold that reaches this point is over (ReconcileNormal returned while it held); it goes with the intent's write.
+	delete(cp.Annotations, CreateHoldAnnotation)
+	s.setProvisioned(metav1.ConditionFalse, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCreatingReason,
+		fmt.Sprintf("CAPIBM creates IBM cluster %s in resource group %s", name, s.InfraCluster.Spec.ResourceGroup.ID))
+	s.setAvailableWaiting()
+	if err := s.persist(ctx); err != nil {
+		// No POST without the intent on record, so that a create whose answer is lost is still recognised by the
+		// binding. The intent is taken back, so that the deferred patch does not record an attempt that was never sent.
+		cp.Status.CreateIntent = previous
+		return Transient(fmt.Errorf("recording the create intent of IBM cluster %s before the create request: %w", name, err))
+	}
+
+	result, err := clients.kubernetes.CreateCluster(ctx, request)
+	if err != nil {
+		return s.createFailed(ctx, clients, name, err)
+	}
+	return s.created(name, result)
+}
+
+// initialPool returns the IBMCloudManagedMachinePool of the Cluster whose spec.poolName is InitialWorkerPoolName and the
+// MachinePool that owns it; IBM creates that pool with the cluster. ok is false when the outcome says to
+// wait (no such pool, or CAPI has not linked it to its MachinePool yet; the pool watch brings the control plane back)
+// or to stop (more than one). ctx is the reconcile context.
+func (s *ControlPlaneScope) initialPool(ctx context.Context) (*infrav1.IBMCloudManagedMachinePool, *clusterv1.MachinePool, Outcome, bool) {
+	pools := &infrav1.IBMCloudManagedMachinePoolList{}
+	if err := s.params.Client.List(ctx, pools, client.InNamespace(s.Cluster.Namespace),
+		client.MatchingLabels{clusterv1.ClusterNameLabel: s.Cluster.Name}); err != nil {
+		return nil, nil, Transient(fmt.Errorf("listing the IBMCloudManagedMachinePools of Cluster %s: %w", s.Cluster.Name, err)), false
+	}
+	var initial []*infrav1.IBMCloudManagedMachinePool
+	for i := range pools.Items {
+		if pools.Items[i].Spec.PoolName == InitialWorkerPoolName && pools.Items[i].DeletionTimestamp.IsZero() {
+			initial = append(initial, &pools.Items[i])
+		}
+	}
+	waiting := controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInitialWorkerPoolReason
+	switch len(initial) {
+	case 0:
+		return nil, nil, s.wait(waiting, fmt.Sprintf("No IBMCloudManagedMachinePool with spec.poolName %q belongs to Cluster %s; "+
+			"the first pool is created with the cluster", InitialWorkerPoolName, s.Cluster.Name)), false
+	case 1:
+	default:
+		names := make([]string, 0, len(initial))
+		for _, pool := range initial {
+			names = append(names, pool.Name)
+		}
+		slices.Sort(names)
+		return nil, nil, s.notProvisioned(controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason,
+			fmt.Sprintf("IBMCloudManagedMachinePools %s of Cluster %s all have spec.poolName %q; IBM creates the cluster with one "+
+				"initial pool, so keep only one of them", strings.Join(names, ", "), s.Cluster.Name, InitialWorkerPoolName)), false
+	}
+	pool := initial[0]
+	mp, err := util.GetOwnerMachinePool(ctx, s.params.Client, pool.ObjectMeta)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return nil, nil, Transient(fmt.Errorf("reading the MachinePool that owns IBMCloudManagedMachinePool %s: %w", pool.Name, err)), false
+	}
+	if mp == nil {
+		return nil, nil, s.wait(waiting, fmt.Sprintf("IBMCloudManagedMachinePool %s is not linked to its MachinePool yet; CAPI sets "+
+			"the owner reference, and the MachinePool's spec.replicas sizes the first pool", pool.Name)), false
+	}
+	return pool, mp, Outcome{}, true
+}
+
+// createRequestProblem reports a failure of BuildCreateClusterRequest: a *ConfigurationError needs a spec change
+// (Terminal InvalidConfiguration, nothing recorded, no IBM call); any other error means an input is not resolved yet,
+// for example a zone of the IBMCloudManagedCluster, and is waited for. err is the error of BuildCreateClusterRequest.
+func (s *ControlPlaneScope) createRequestProblem(err error) Outcome {
+	var configErr *ConfigurationError
+	if errors.As(err, &configErr) {
+		return s.notProvisioned(controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason, configErr.Error())
+	}
+	return s.wait(controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInfrastructureReason,
+		fmt.Sprintf("CAPIBM cannot build the create request yet: %v", err))
+}
+
+// checkVersionOffered confirms that IBM offers spec.distributionVersion for new clusters, from the VersionsCache of the
+// identity and region, so that a create is not refused for a minor IBM dropped. ok is false when the outcome stops
+// the create.
+//
+// Parameters:
+//   - ctx is the reconcile context.
+//   - clients are this reconcile's IBM clients.
+func (s *ControlPlaneScope) checkVersionOffered(ctx context.Context, clients *controlPlaneClients) (Outcome, bool) {
+	cp := s.ControlPlane
+	minor, err := ibmversion.ParseMinor(cp.Spec.DistributionVersion)
+	if err != nil {
+		// BuildCreateClusterRequest has already refused such a value; this keeps the step safe on its own.
+		return s.notProvisioned(controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason,
+			fmt.Sprintf("spec.distributionVersion: %v", err)), false
+	}
+	region := s.InfraCluster.Spec.Region
+	versions, err := s.params.VersionsCache.Get(ctx, clients.identity.Key, region, clients.kubernetes.ListVersions)
+	if err != nil {
+		return s.reportCall(ctx, &controlPlaneCallError{identity: clients.identity, op: kubernetesservice.OpListVersions,
+			action: "listing the versions IBM Cloud offers in region " + region, err: err}), false
+	}
+	offered := MasterVersionInput{Distribution: cp.Spec.Distribution, Offered: versions}
+	if !offered.offers(minor) {
+		return s.notProvisioned(controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedVersionNotAvailableReason,
+			fmt.Sprintf("IBM Cloud does not offer %s %s (offered: %s)", masterProduct(cp.Spec.Distribution), minor,
+				offered.offeredMinors())), false
+	}
+	return Outcome{}, true
+}
+
+// created records a create request IBM accepted (201): status.clusterID, the codes of IBM's non-critical errors
+// (non_critical_errors of the answer) and the events. The intent stays until DecideBinding row 1 observes the cluster
+// by ID, which clears it; until then it is the reference of the read-after-create wait (row 3).
+//
+// Parameters:
+//   - name is the effective IBM cluster name.
+//   - result is CreateCluster's answer.
+func (s *ControlPlaneScope) created(name string, result *kubernetesservice.CreateClusterResult) Outcome {
+	cp := s.ControlPlane
+	cp.Status.ClusterID = result.ClusterID
+	cp.Status.NonCriticalCreateErrorCodes = cpNonCriticalCodes(result.NonCriticalErrors)
+	s.params.Recorder.Eventf(cp, corev1.EventTypeNormal, EventReasonSuccessfulCreateIBMCluster,
+		"Created IBM cluster %s (ID %s)", name, result.ClusterID)
+	for _, item := range result.NonCriticalErrors {
+		// A non-critical error is never a failure: IBM created the cluster but could not finish something, for example
+		// the registry access policy (E49df). Its text goes into the event only.
+		s.params.Recorder.Event(cp, corev1.EventTypeWarning, EventReasonIBMCreateWarnings,
+			cpNonCriticalEventMessage(name, result.ClusterID, result.IncidentID, item))
+	}
+	s.setProvisioned(metav1.ConditionFalse, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCreatingReason,
+		fmt.Sprintf("IBM accepted the create request of cluster %s (ID %s)%s", name, result.ClusterID,
+			cpNonCriticalNote(cp.Status.NonCriticalCreateErrorCodes)))
+	s.setAvailableWaiting()
+	return NotDone(IntervalClusterProvisioning, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCreatingReason)
+}
+
+// createFailed handles a create request IBM did not accept. An answer that proves nothing was created
+// (ClearIntentErrorCodes, ClearIntentStatusCodes, or a request that was never sent) takes the attempt out of the intent
+// and, unless it is E0007, holds the next create request (holdCreates); any other answer (429, 5xx, timeout) makes its
+// outcome unknown, and DecideBinding rows 3, 6 and 9 resolve it. IBM's description and incident ID go to the
+// controller log; status keeps CAPIBM's text with IBM's code only, so that it does not change with every answer.
+//
+// Parameters:
+//   - ctx is the reconcile context.
+//   - clients are this reconcile's IBM clients.
+//   - name is the effective IBM cluster name.
+//   - err is CreateCluster's error.
+func (s *ControlPlaneScope) createFailed(ctx context.Context, clients *controlPlaneClients, name string, err error) Outcome {
+	cp := s.ControlPlane
+	createdNothing := cpCreatedNothing(err)
+	if createdNothing {
+		cp.Status.CreateIntent = cpClearAttempt(cp.Status.CreateIntent)
+	} else {
+		cp.Status.CreateIntent = cpFoldInFlight(cp.Status.CreateIntent)
+	}
+	ctrl.LoggerFrom(ctx).Info("IBM Cloud did not accept the create request", "ibmCluster", name, "error", err.Error())
+
+	class := kubernetesservice.Classify(kubernetesservice.OpCreateCluster, err)
+	if hold, ok := cpCreateHoldFor(class); ok && createdNothing {
+		// A definitive refusal: the same request would be refused again, so the next one waits for the recheck that the
+		// outcome below schedules (about 15 minutes later, 5 after a 401), never in a hot loop.
+		s.holdCreates(hold)
+	}
+	rg := s.InfraCluster.Spec.ResourceGroup.ID
+	region := s.InfraCluster.Spec.Region
+	reference := cpIBMCode(err)
+	permissionDenied := controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason
+	switch class {
+	case kubernetesservice.ClassClusterNameExists:
+		return s.afterNameExists(ctx, clients, name)
+	case kubernetesservice.ClassInfrastructureKeyNotCreatable:
+		return s.notProvisioned(permissionDenied, InfrastructureKeyNotCreatableMessage(region, rg, clients.identity.Description, reference))
+	case kubernetesservice.ClassInfrastructureKeyDenied:
+		return s.notProvisioned(permissionDenied, cpInfrastructureKeyDeniedMessage(name, region, rg, clients.identity.Description, reference))
+	case kubernetesservice.ClassBadRequest:
+		return s.notProvisioned(controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason,
+			s.createRefusedMessage(name, err))
+	default:
+		// createFailed has logged IBM's whole answer already, so classifyCall is reported without reportCall's log.
+		return s.report(s.classifyCall(&controlPlaneCallError{identity: clients.identity, op: kubernetesservice.OpCreateCluster,
+			action: "creating IBM cluster " + name, err: err}, rg))
+	}
+}
+
+// afterNameExists decides again after IBM answered E0007 (a cluster with the name exists): this attempt created
+// nothing and has left the intent, so DecideBinding tests a found cluster against the earlier attempts of unknown
+// outcome only; without one it is ClusterNameConflict (row 7), even when another namespace or management cluster
+// created it seconds ago. A lookup that still finds nothing is ClusterNameConflict as well: IBM cluster names are
+// unique in the account, and the lookup, scoped to the resource group, may not see a cluster of another resource
+// group that holds the name (not yet verified against IBM Cloud). A new create would only be refused again, so the
+// next one is held like any other definitive refusal (holdCreates).
+//
+// Parameters:
+//   - ctx is the reconcile context.
+//   - clients are this reconcile's IBM clients.
+//   - name is the effective IBM cluster name.
+func (s *ControlPlaneScope) afterNameExists(ctx context.Context, clients *controlPlaneClients, name string) Outcome {
+	decision, err := s.decideBinding(ctx, clients, name, false)
+	if err != nil {
+		return s.callProblem(ctx, err)
+	}
+	if decision.Action == BindingCreate {
+		s.holdCreates(CreateRefusalHold)
+		return s.notProvisioned(controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedClusterNameConflictReason,
+			fmt.Sprintf("IBM Cloud refused to create cluster %s because a cluster with that name already exists (E0007), but "+
+				"CAPIBM finds none in resource group %s, so it may be in another resource group of the account and CAPIBM cannot "+
+				"prove it created it for this Cluster. If it does not belong to this Cluster, delete this Cluster and create it "+
+				"again with a different spec.ibmCloudClusterName (the field cannot be changed in place; nothing was created for "+
+				"this Cluster)", name, s.InfraCluster.Spec.ResourceGroup.ID))
+	}
+	return s.actOnBinding(ctx, decision, name)
+}
+
+// createRefusedMessage is the InvalidConfiguration message of a create request that IBM refused with 400 or 422, or
+// that CAPIBM refused to send. It names what to fix for the codes observed on IBM Cloud (P4102, E7278) and IBM's code
+// (cpIBMCode), never IBM's description, which the controller log has.
+//
+// Parameters:
+//   - name is the effective IBM cluster name.
+//   - err is CreateCluster's error.
+func (s *ControlPlaneScope) createRefusedMessage(name string, err error) string {
+	if errors.Is(err, kubernetesservice.ErrInvalidRequest) {
+		// CAPIBM's own text: the request validation names the field and the accepted form.
+		return fmt.Sprintf("CAPIBM did not send the create request of IBM cluster %s: %v", name, err)
+	}
+	reference := cpIBMCode(err)
+	var apiErr *kubernetesservice.APIError
+	if !errors.As(err, &apiErr) {
+		return fmt.Sprintf("IBM Cloud refused to create cluster %s; the controller log has the cause", name)
+	}
+	switch apiErr.Code {
+	case cpCodeSubnetNotFound:
+		return fmt.Sprintf("IBM Cloud refused to create cluster %s because a subnet of the request does not exist%s; check the "+
+			"subnets of IBMCloudManagedCluster %s (status.zones)", name, reference, s.InfraCluster.Name)
+	case cpCodeCOSInstanceRequired:
+		return fmt.Sprintf("IBM Cloud refused to create cluster %s because an OpenShift cluster on VPC needs a standard Cloud "+
+			"Object Storage instance for its registry%s; set spec.openShift.imageRegistry.cos.instanceCRN", name, reference)
+	default:
+		return fmt.Sprintf("IBM Cloud refused to create cluster %s with HTTP %d%s; the controller log has IBM's description of "+
+			"the configuration to fix", name, apiErr.StatusCode, reference)
+	}
+}
+
+// InfrastructureKeyNotCreatableMessage is the PermissionDenied message of a create that IBM answered with A0656: IBM
+// could not create the per-region and resource-group infrastructure API key with the caller's credentials (observed on
+// IBM Cloud; IBM checks this before it validates the request). It names the identity only by its Description.
+//
+// Parameters:
+//   - region is the IBM Cloud region of the cluster.
+//   - resourceGroupID is the resource group of the cluster.
+//   - identity is the Description of the credentials.Identity the request used.
+//   - reference is IBM's code (cpIBMCode); "" when IBM sent none.
+func InfrastructureKeyNotCreatableMessage(region, resourceGroupID, identity, reference string) string {
+	return fmt.Sprintf("IBM cannot create the infrastructure API key for region %s and resource group %s with the credentials "+
+		"of %s%s; a service ID needs the IAM Identity Service roles (Service ID creator, User API key creator, Viewer and "+
+		"Operator), or an account administrator pre-sets the key with `ibmcloud ks api-key reset --region %s`; %s",
+		region, resourceGroupID, identity, reference, region, cpIAMPageHint)
+}
+
+// cpInfrastructureKeyDeniedMessage is the PermissionDenied message of a create that IBM answered with 403: the
+// infrastructure API key IBM stores for the region and resource group, which may belong to another identity, or the
+// caller's credentials lack permissions.
+//
+// Parameters:
+//   - name is the effective IBM cluster name.
+//   - region is the IBM Cloud region.
+//   - resourceGroupID is the resource group.
+//   - identity is the Description of the credentials.Identity the request used.
+//   - reference is IBM's code (cpIBMCode); "" when IBM sent none.
+func cpInfrastructureKeyDeniedMessage(name, region, resourceGroupID, identity, reference string) string {
+	return fmt.Sprintf("IBM Cloud refused to create cluster %s with HTTP 403%s: the infrastructure API key IBM stores for region "+
+		"%s and resource group %s, or the credentials of %s, lack permissions; the credentials need %s, and `ibmcloud ks "+
+		"api-key info --cluster <a cluster of that region and resource group>` shows whose key IBM stores, which `ibmcloud "+
+		"ks api-key reset --region %s` replaces; %s", name, reference, region, resourceGroupID, identity,
+		cpKubernetesServiceRoles, region, cpIAMPageHint)
+}
+
+// cpCreatedNothing reports whether a CreateCluster error proves that no cluster was created: IBM's code or status says
+// so (ClearIntentErrorCodes, ClearIntentStatusCodes), or the request never reached IBM (CAPIBM's request validation,
+// or IAM refusing the credentials). err is CreateCluster's error.
+func cpCreatedNothing(err error) bool {
+	if errors.Is(err, kubernetesservice.ErrInvalidRequest) || errors.Is(err, kubernetesservice.ErrCredentialsRejected) {
+		return true
+	}
+	var apiErr *kubernetesservice.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return slices.Contains(ClearIntentErrorCodes(), apiErr.Code) || slices.Contains(ClearIntentStatusCodes(), apiErr.StatusCode)
+}
+
+// cpIntentForAttempt returns the intent to persist before a create request: a leftover inFlightAttemptTime (a crash or a
+// lost status patch after an earlier POST) is first folded into the unknown-outcome bounds, because its outcome is
+// unknown, and then the new attempt is in flight. An intent recorded for another name cannot have created a cluster
+// with this one and is replaced.
+//
+// Parameters:
+//   - previous is status.createIntent as read.
+//   - name is the effective IBM cluster name.
+//   - now is the attempt's time.
+func cpIntentForAttempt(previous controlplanev1.CreateIntent, name string, now metav1.Time) controlplanev1.CreateIntent {
+	intent := previous
+	if intent.ClusterName != name {
+		intent = controlplanev1.CreateIntent{}
+	}
+	intent = cpFoldInFlight(intent)
+	intent.ClusterName = name
+	intent.InFlightAttemptTime = now
+	return intent
+}
+
+// cpFoldInFlight moves an inFlightAttemptTime into [firstUnknownOutcomeTime, lastUnknownOutcomeTime]: the attempt may
+// have created a cluster. intent is the intent to change; an intent without an attempt in flight is returned as it is.
+func cpFoldInFlight(intent controlplanev1.CreateIntent) controlplanev1.CreateIntent {
+	inFlight := intent.InFlightAttemptTime
+	if inFlight.IsZero() {
+		return intent
+	}
+	if intent.FirstUnknownOutcomeTime.IsZero() || inFlight.Before(&intent.FirstUnknownOutcomeTime) {
+		intent.FirstUnknownOutcomeTime = inFlight
+	}
+	if intent.LastUnknownOutcomeTime.IsZero() || intent.LastUnknownOutcomeTime.Before(&inFlight) {
+		intent.LastUnknownOutcomeTime = inFlight
+	}
+	intent.InFlightAttemptTime = metav1.Time{}
+	return intent
+}
+
+// cpClearAttempt takes the attempt in flight out of the intent after an answer that proves it created nothing, and
+// clears the whole intent when no attempt of unknown outcome remains. intent is the intent to change.
+func cpClearAttempt(intent controlplanev1.CreateIntent) controlplanev1.CreateIntent {
+	intent.InFlightAttemptTime = metav1.Time{}
+	if intent.FirstUnknownOutcomeTime.IsZero() && intent.LastUnknownOutcomeTime.IsZero() {
+		return controlplanev1.CreateIntent{}
+	}
+	return intent
+}
+
+// cpNonCriticalCodes returns the codes of IBM's non-critical create errors for status.nonCriticalCreateErrorCodes:
+// sorted and without duplicates, so the field is deterministic; a code that the field cannot hold, or one beyond its
+// item limit, stays in the events only. items are the non-critical errors; none gives nil, which omits the field.
+func cpNonCriticalCodes(items []kubernetesservice.IBMMessage) []string {
+	var codes []string
+	for _, item := range items {
+		if item.Code != "" && len(item.Code) <= cpNonCriticalCodesMaxLength {
+			codes = append(codes, item.Code)
+		}
+	}
+	slices.Sort(codes)
+	codes = slices.Compact(codes)
+	if len(codes) > cpNonCriticalCodesMaxItems {
+		codes = codes[:cpNonCriticalCodesMaxItems]
+	}
+	return codes
+}
+
+// cpNonCriticalSentence says that IBM created the cluster with non-critical errors. codes are their codes.
+func cpNonCriticalSentence(codes []string) string {
+	return fmt.Sprintf("IBM created the cluster with non-critical errors %s (see the %s events)", strings.Join(codes, ", "),
+		EventReasonIBMCreateWarnings)
+}
+
+// cpNonCriticalNote returns "; " plus cpNonCriticalSentence, or "" when there are no codes. codes are the codes.
+func cpNonCriticalNote(codes []string) string {
+	if len(codes) == 0 {
+		return ""
+	}
+	return "; " + cpNonCriticalSentence(codes)
+}
+
+// cpNonCriticalEventMessage is the IBMCreateWarnings event of one non-critical create error, with IBM's own text.
+//
+// Parameters:
+//   - name is the effective IBM cluster name.
+//   - clusterID is the new cluster's ID.
+//   - incidentID is IBM's incident ID of the non-critical errors; "" when IBM sent none.
+//   - item is the error.
+func cpNonCriticalEventMessage(name, clusterID, incidentID string, item kubernetesservice.IBMMessage) string {
+	message := fmt.Sprintf("IBM created cluster %s (ID %s) with the non-critical error %s", name, clusterID, item.Code)
+	if item.Type != "" {
+		message += " (" + item.Type + ")"
+	}
+	if item.Description != "" {
+		message += ": " + item.Description
+	}
+	if item.RecoveryCLI != "" {
+		message += " Recovery: " + item.RecoveryCLI
+	}
+	if incidentID != "" {
+		message += " [incident " + incidentID + "]"
+	}
+	return message
+}
+
+// The hold after a definitive create refusal: a refused create is rechecked after about 15 minutes (5 minutes after a
+// 401), never in a hot loop. A refusal that proves nothing was created clears the intent, so the next reconcile would
+// decide binding row 10 again and send the same request, which IBM refuses again. The controller's own status patch
+// brings that reconcile at once (the For() watch has no predicate), so without a hold one refusal turns into a create
+// request every few milliseconds, each spending the shared IKS rate limit of every other cluster and pool.
+const (
+	// CreateHoldAnnotation is the CAPIBM annotation on an IBMCloudManagedControlPlane that holds create requests after
+	// a definitive refusal: its value is the time (RFC 3339, UTC) before which CAPIBM sends no new one. It is an
+	// annotation, not a status field, because the API has no field for it in this release; it is in the domain of the
+	// controller-owned annotations. Anyone who can edit the control plane can change it, which shifts the next create
+	// request by at most CreateRefusalHold (cpCreateHold ignores a later time).
+	CreateHoldAnnotation = "ibmcloudmanaged.controlplane.cluster.x-k8s.io/create-hold-until"
+
+	// CreateRefusalHold is how long a Terminal create refusal (A0656, 403, 400, 422, E0007 with no cluster found)
+	// holds the next create request. It is shorter than terminalRecheck (15 minutes, internal/controllers/managed
+	// requeue.go) minus its 10 % jitter, so that the recheck the refusal's Terminal outcome scheduled always finds the
+	// hold over and sends the next request, about 15 minutes after the refusal.
+	CreateRefusalHold = 12 * time.Minute
+
+	// CreateUnauthorizedHold is how long a 401 (IBM or the IAM token service rejected the credentials) holds the next
+	// create request. It is shorter than steadyStatePoll (5 minutes) minus its jitter, so that the recheck of the 401's
+	// outcome sends the next request about 5 minutes later with a rebuilt authenticator.
+	CreateUnauthorizedHold = 4 * time.Minute
+)
+
+// cpCreateRefusalReasons are the IBMClusterProvisioned reasons a definitive create refusal leaves (createFailed,
+// afterNameExists).
+var cpCreateRefusalReasons = []string{
+	controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason,
+	controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason,
+	controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedClusterNameConflictReason,
+}
+
+// cpCreateHoldFor returns how long a create answer of class holds the next create request, and whether it holds at
+// all. ClassClusterNameExists is not held here: E0007 is held only when the lookup after it finds no cluster
+// (afterNameExists); a found cluster is decided by the binding on every reconcile. class is Classify's class of the
+// CreateCluster error.
+func cpCreateHoldFor(class kubernetesservice.ErrorClass) (time.Duration, bool) {
+	switch class {
+	case kubernetesservice.ClassUnauthorized:
+		return CreateUnauthorizedHold, true
+	case kubernetesservice.ClassInfrastructureKeyNotCreatable, kubernetesservice.ClassInfrastructureKeyDenied,
+		kubernetesservice.ClassPermissionDenied, kubernetesservice.ClassBadRequest:
+		return CreateRefusalHold, true
+	default:
+		return 0, false
+	}
+}
+
+// holdCreates records in CreateHoldAnnotation that no create request is sent before now plus hold; the deferred
+// patch persists it with the refusal's condition. hold is CreateRefusalHold or CreateUnauthorizedHold.
+func (s *ControlPlaneScope) holdCreates(hold time.Duration) {
+	metav1.SetMetaDataAnnotation(&s.ControlPlane.ObjectMeta, CreateHoldAnnotation, s.now().Add(hold).Format(time.RFC3339))
+}
+
+// cpCreateHold reports whether a definitive create refusal still holds the next create request of cp, and until when.
+// It holds while all of these are true, so that only the refusal itself, unchanged, keeps CAPIBM from asking again:
+//   - no IBM cluster can be bound (NoIBMClusterCanExist): no status.clusterID, no endpoint and no create attempt of
+//     unknown outcome, which the binding rows resolve on every reconcile;
+//   - CreateHoldAnnotation parses and lies after now, but at most CreateRefusalHold after it; a later value was not
+//     written by CAPIBM (or by a clock far ahead) and is ignored, so that no edit of the annotation stops creates;
+//   - IBMClusterProvisioned is still the refusal's condition: False with a reason of cpCreateRefusalReasons, observed
+//     at the current generation. A spec change therefore ends the hold at once (a Terminal outcome waits for a spec
+//     edit or its recheck), and so does any other report that replaced the refusal's condition since.
+//
+// Parameters:
+//   - cp is the control plane as read.
+//   - now is the clock's time.
+func cpCreateHold(cp *controlplanev1.IBMCloudManagedControlPlane, now time.Time) (time.Time, bool) {
+	if cp == nil || !NoIBMClusterCanExist(cp) || cp.Annotations[CreateHoldAnnotation] == "" {
+		return time.Time{}, false
+	}
+	until, err := time.Parse(time.RFC3339, cp.Annotations[CreateHoldAnnotation])
+	if err != nil || !now.Before(until) || until.Sub(now) > CreateRefusalHold {
+		return time.Time{}, false
+	}
+	condition := conditions.Get(cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition)
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.ObservedGeneration != cp.Generation ||
+		!slices.Contains(cpCreateRefusalReasons, condition.Reason) {
+		return time.Time{}, false
+	}
+	return until, true
+}
+
+// wait reports an expected wait in IBMClusterProvisioned and polls at clusterProvisioningPoll.
+//
+// Parameters:
+//   - reason is the IBMClusterProvisioned reason.
+//   - message names what is awaited.
+func (s *ControlPlaneScope) wait(reason, message string) Outcome {
+	s.setProvisioned(metav1.ConditionFalse, reason, message)
+	s.setAvailableWaiting()
+	return NotDone(IntervalClusterProvisioning, reason)
+}
+
+// now returns the clock's time at the precision the API keeps (seconds), so that the time written into status equals
+// the time that is read back on the next reconcile.
+func (s *ControlPlaneScope) now() metav1.Time {
+	return metav1.NewTime(s.params.Clock.Now().UTC().Truncate(time.Second))
 }
