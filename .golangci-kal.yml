@@ -98,6 +98,17 @@ linters:
     - text: "IBMCloudManagedControlPlaneStatus.ExternalManagedControlPlane pointer should not use a bool"
       linters:
         - kubeapilinter
+    - text: "IBMCloudManagedMachinePoolInitializationStatus.Provisioned pointer should not use a bool"
+      linters:
+        - kubeapilinter
+    - text: "IBMCloudManagedMachinePoolStatus.Ready pointer should not use a bool"
+      linters:
+        - kubeapilinter
+    # WorkerDisruptionStatus.phase is a bounded enum of the steps of one in-flight drain operation, not an object
+    # lifecycle phase; conditions carry the pool state.
+    - text: "field WorkerDisruptionStatus.Phase: phase fields are deprecated"
+      linters:
+        - kubeapilinter
 
 issues:
   max-same-issues: 0

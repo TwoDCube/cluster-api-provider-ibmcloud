@@ -16,6 +16,7 @@ resources:
 - bases/infrastructure.cluster.x-k8s.io_ibmvpcclustertemplates.yaml
 - bases/infrastructure.cluster.x-k8s.io_ibmcloudmanagedclusters.yaml
 - bases/controlplane.cluster.x-k8s.io_ibmcloudmanagedcontrolplanes.yaml
+- bases/infrastructure.cluster.x-k8s.io_ibmcloudmanagedmachinepools.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 # [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix.

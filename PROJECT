@@ -167,4 +167,13 @@ resources:
   kind: IBMCloudManagedControlPlane
   path: sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1
   version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: cluster.x-k8s.io
+  group: infrastructure
+  kind: IBMCloudManagedMachinePool
+  path: sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/v1alpha1
+  version: v1alpha1
 version: "3"
