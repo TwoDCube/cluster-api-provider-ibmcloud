@@ -35,6 +35,7 @@ import (
 	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/ibmversion"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/managedkubeconfig"
 )
 
 // The tests of this file pin every value of assumptions.go to its source, so that switching a decision point after a
@@ -366,4 +367,182 @@ func TestDeleteDecisionPoints(t *testing.T) {
 	g.Expect(DeleteReissueAfter).To(Equal(10 * time.Minute))
 	// IBM was observed to report 404 about 5 minutes after the DELETE, so a re-issue never races the normal deletion.
 	g.Expect(DeleteReissueAfter).To(BeNumerically(">", 5*time.Minute))
+}
+
+func TestAdminKubeconfigAndTrust(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(AdminKubeconfigFormat).To(Equal("json"))
+	g.Expect(CATrustFor(controlplanev1.DistributionKubernetes)).To(Equal(managedkubeconfig.ClusterCA), "IKS needs the cluster CA: the cluster CA issues the API server certificate")
+	g.Expect(CATrustFor(controlplanev1.DistributionOpenShift)).To(Equal(managedkubeconfig.SystemRoots), "ROKS -e serves a public certificate")
+	g.Expect(CATrustFor("Other")).To(Equal(managedkubeconfig.ClusterCA), "an unknown distribution gets the narrower trust")
+}
+
+func TestKubeconfigPolicy(t *testing.T) {
+	g := NewWithT(t)
+	policy := KubeconfigPolicy()
+	g.Expect(policy.Validate()).To(Succeed())
+	g.Expect(policy).To(Equal(managedkubeconfig.Policy{
+		RefreshFraction:       0.5,
+		SameCertificateRetry:  24 * time.Hour,
+		ExpiryWarning:         30 * 24 * time.Hour,
+		CARecheckInterval:     12 * time.Hour,
+		RotationPollInterval:  time.Minute,
+		AuthFailureBackoffMin: time.Minute,
+		AuthFailureBackoffMax: 10 * time.Minute,
+		MinRequeue:            time.Minute,
+		MaxRequeue:            12 * time.Hour,
+	}))
+	// IBM's admin certificate is valid two years: it is refreshed after about a year, and the expiry warning comes well
+	// after that.
+	twoYears := 2 * 365 * 24 * time.Hour
+	g.Expect(time.Duration(float64(twoYears) * policy.RefreshFraction)).To(BeNumerically(">", policy.ExpiryWarning))
+}
+
+func TestManagementServerURL(t *testing.T) {
+	iks := loadCluster(t, "iks-getCluster-normal.json")
+	roks := loadCluster(t, "roks-getCluster-normal.json")
+	withURL := func(masterURL string) *kubernetesservice.Cluster {
+		c := iks
+		c.MasterURL = masterURL
+		return &c
+	}
+	testCases := []struct {
+		name         string
+		distribution controlplanev1.Distribution
+		cluster      *kubernetesservice.Cluster
+		want         string
+		wantErr      string
+	}{
+		{name: "https_host_without_port_gets_443", distribution: controlplanev1.DistributionKubernetes, cluster: withURL("https://c111.eu-de.containers.cloud.ibm.com"), want: "https://c111.eu-de.containers.cloud.ibm.com:443"},
+		{name: "https_host_with_port_keeps_it", distribution: controlplanev1.DistributionKubernetes, cluster: withURL("https://c111.eu-de.containers.cloud.ibm.com:30123"), want: "https://c111.eu-de.containers.cloud.ibm.com:30123"},
+		{name: "http_is_rejected", distribution: controlplanev1.DistributionKubernetes, cluster: withURL("http://c111.eu-de.containers.cloud.ibm.com"), wantErr: `uses scheme "http"`},
+		{name: "IKS live capture", distribution: controlplanev1.DistributionKubernetes, cluster: &iks, want: "https://c111.eu-de.containers.cloud.ibm.com:30101"},
+		{name: "ROKS live capture", distribution: controlplanev1.DistributionOpenShift, cluster: &roks, want: "https://c113-e.eu-de.containers.cloud.ibm.com:30102"},
+		{name: "trailing slash is accepted", distribution: controlplanev1.DistributionKubernetes, cluster: withURL("https://c111.eu-de.containers.cloud.ibm.com:30101/"), want: "https://c111.eu-de.containers.cloud.ibm.com:30101"},
+		{name: "IPv6 host keeps its brackets", distribution: controlplanev1.DistributionKubernetes, cluster: withURL("https://[fd00::1]"), want: "https://[fd00::1]:443"},
+		{name: "empty master URL", distribution: controlplanev1.DistributionKubernetes, cluster: withURL(""), wantErr: "reports no masterURL"},
+		{name: "not a URL", distribution: controlplanev1.DistributionKubernetes, cluster: withURL("https://c111 .example:1"), wantErr: "is not a URL"},
+		{name: "user information", distribution: controlplanev1.DistributionKubernetes, cluster: withURL("https://admin:secret@c111.example:30101"), wantErr: "carries user information"},
+		{name: "path", distribution: controlplanev1.DistributionKubernetes, cluster: withURL("https://c111.example:30101/api"), wantErr: "carries a path"},
+		{name: "query", distribution: controlplanev1.DistributionKubernetes, cluster: withURL("https://c111.example:30101?x=1"), wantErr: "carries a path, a query"},
+		{name: "fragment", distribution: controlplanev1.DistributionKubernetes, cluster: withURL("https://c111.example:30101#top"), wantErr: "carries a path, a query or a fragment"},
+		{name: "no host", distribution: controlplanev1.DistributionKubernetes, cluster: withURL("https://:30101"), wantErr: "names no host"},
+		{name: "port zero", distribution: controlplanev1.DistributionKubernetes, cluster: withURL("https://c111.example:0"), wantErr: `has port "0"`},
+		{name: "port too large", distribution: controlplanev1.DistributionKubernetes, cluster: withURL("https://c111.example:65536"), wantErr: `has port "65536"`},
+		{name: "unknown distribution", distribution: "Other", cluster: &iks, wantErr: `unknown distribution "Other"`},
+		{name: "nil cluster", distribution: controlplanev1.DistributionKubernetes, cluster: nil, wantErr: "no IBM cluster"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			got, err := ManagementServerURL(tc.distribution, tc.cluster)
+			if tc.wantErr != "" {
+				g.Expect(err).To(MatchError(ContainSubstring(tc.wantErr)))
+				g.Expect(got).To(BeEmpty())
+				return
+			}
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(got).To(Equal(tc.want))
+		})
+	}
+}
+
+func TestIsCARotationInProgress(t *testing.T) {
+	testCases := []struct {
+		name   string
+		status string
+		want   bool
+	}{
+		{name: "no rotation ever ran (live captures)", status: loadCluster(t, "iks-getCluster-normal.json").CARotationStatus, want: false},
+		{name: "white space only", status: "  ", want: false},
+		{name: "rotation complete", status: "CA certificate rotation complete", want: false},
+		{name: "rotation complete with details", status: "CA certificate rotation complete. Update your kubeconfig.", want: false},
+		{name: "rotation in progress", status: "CA certificate rotation in progress", want: true},
+		{name: "unknown status string is fail-safe", status: "Something IBM has not documented", want: true},
+		{name: "a different case is not the complete marker", status: "ca certificate rotation complete", want: true},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(IsCARotationInProgress(tc.status)).To(Equal(tc.want))
+		})
+	}
+}
+
+func TestIsMasterUpdatePending(t *testing.T) {
+	normal := loadCluster(t, "iks-getCluster-normal.json")
+	roks := loadCluster(t, "roks-getCluster-normal.json")
+	with := func(c kubernetesservice.Cluster, state, master, target string) *kubernetesservice.Cluster {
+		c.State, c.MasterKubeVersion, c.TargetVersion = state, master, target
+		return &c
+	}
+	testCases := []struct {
+		name    string
+		cluster *kubernetesservice.Cluster
+		want    bool
+	}{
+		{name: "IKS live capture: target equals master", cluster: &normal, want: false},
+		{name: "ROKS live capture: target equals master", cluster: &roks, want: false},
+		{name: "(pending) marker", cluster: with(normal, "normal", "1.37.1_1517 (pending)", "1.37.1_1517"), want: true},
+		{name: "state updating", cluster: with(normal, "updating", "1.36.5_1537", "1.36.5_1537"), want: true},
+		{name: "target on the next minor", cluster: with(normal, "normal", "1.36.5_1537", "1.37.1_1517"), want: true},
+		{name: "target a newer fix pack (IBM patch)", cluster: with(normal, "normal", "1.36.5_1537", "1.36.6_1540"), want: true},
+		{name: "target a newer build of the same patch", cluster: with(normal, "normal", "1.36.5_1537", "1.36.5_1540"), want: true},
+		{name: "ROKS target a newer fix pack", cluster: with(roks, "normal", "4.21.35_1537_openshift", "4.21.40_1540_openshift"), want: true},
+		{name: "target older than the master", cluster: with(normal, "normal", "1.36.6_1540", "1.36.5_1537"), want: false},
+		{name: "target on an older minor", cluster: with(normal, "normal", "1.37.1_1517", "1.36.6_1540"), want: false},
+		{name: "no target", cluster: with(normal, "normal", "1.36.5_1537", ""), want: false},
+		{name: "unparseable master version is fail-safe", cluster: with(normal, "normal", "garbage", "1.36.5_1537"), want: true},
+		{name: "empty master version is fail-safe", cluster: with(normal, "deploying", "", ""), want: true},
+		{name: "unparseable target is fail-safe", cluster: with(normal, "normal", "1.36.5_1537", "v1.36.5"), want: true},
+		{name: "minor-only target on the same minor is fail-safe", cluster: with(normal, "normal", "1.36.5_1537", "1.36"), want: true},
+		{name: "nil", cluster: nil, want: false},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(IsMasterUpdatePending(tc.cluster)).To(Equal(tc.want))
+		})
+	}
+}
+
+func TestReportedKubernetesVersion(t *testing.T) {
+	testCases := []struct {
+		name    string
+		current string
+		probe   string
+		rolling bool
+		want    string
+	}{
+		{name: "empty_status_takes_the_probe", current: "", probe: "v1.36.5+IKS", rolling: false, want: "v1.36.5+IKS"},
+		{name: "empty_status_takes_the_probe_while_rolling", current: "", probe: "v1.36.6+IKS", rolling: true, want: "v1.36.6+IKS"},
+		{name: "rolling_new_replica_keeps_the_old_version", current: "v1.36.5+IKS", probe: "v1.36.6+IKS", rolling: true, want: "v1.36.5+IKS"},
+		{name: "rolling_old_replica_keeps_the_old_version", current: "v1.36.5+IKS", probe: "v1.36.5+IKS", rolling: true, want: "v1.36.5+IKS"},
+		{name: "update_done_takes_the_new_version", current: "v1.36.5+IKS", probe: "v1.36.6+IKS", rolling: false, want: "v1.36.6+IKS"},
+		{name: "lower_probe_outside_a_rollout_wins", current: "v1.36.6+IKS", probe: "v1.36.5+IKS", rolling: false, want: "v1.36.5+IKS"},
+		{name: "rolling_lower_probe_lowers_the_minimum", current: "v1.36.6+IKS", probe: "v1.36.5+IKS", rolling: true, want: "v1.36.5+IKS"},
+		{name: "ROKS reports a Kubernetes version", current: "", probe: "v1.34.9", rolling: false, want: "v1.34.9"},
+		{name: "rolling over a minor keeps the old minor", current: "v1.34.9", probe: "v1.35.2", rolling: true, want: "v1.34.9"},
+		{name: "empty probe keeps the published version", current: "v1.36.5+IKS", probe: "", rolling: false, want: "v1.36.5+IKS"},
+		{name: "rolling with an unparseable probe keeps the published version", current: "v1.36.5+IKS", probe: "1.36.5_1537", rolling: true, want: "v1.36.5+IKS"},
+		{name: "rolling with an unparseable published version keeps it", current: "garbage", probe: "v1.36.5+IKS", rolling: true, want: "garbage"},
+		{name: "not rolling replaces an unparseable published version", current: "garbage", probe: "v1.36.5+IKS", rolling: false, want: "v1.36.5+IKS"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(ReportedKubernetesVersion(tc.current, tc.probe, tc.rolling)).To(Equal(tc.want))
+		})
+	}
+
+	t.Run("alternating_probes_while_rolling_never_change_status", func(t *testing.T) {
+		g := NewWithT(t)
+		published := "v1.36.5+IKS"
+		for _, probe := range []string{"v1.36.5+IKS", "v1.36.6+IKS", "v1.36.5+IKS", "v1.36.6+IKS"} {
+			published = ReportedKubernetesVersion(published, probe, true)
+			g.Expect(published).To(Equal("v1.36.5+IKS"))
+		}
+		// IBM reports the update done: the next probe is published.
+		g.Expect(ReportedKubernetesVersion(published, "v1.36.6+IKS", false)).To(Equal("v1.36.6+IKS"))
+	})
 }

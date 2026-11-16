@@ -17,14 +17,21 @@ limitations under the License.
 package managed
 
 import (
+	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
+
+	"k8s.io/apimachinery/pkg/util/version"
 
 	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/ibmversion"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/managedkubeconfig"
 )
 
 // This file holds every fact about IBM's API that only a live probe can settle, in one place, so that a reviewer sees
@@ -230,3 +237,221 @@ func ClearIntentStatusCodes() []int {
 // then state deleting, then 404 after about 5 minutes on both flavors, but IBM's answer to a repeated DELETE is open;
 // default 10 minutes; fallback: adjust once that answer is known.
 const DeleteReissueAfter = 10 * time.Minute
+
+// Kubeconfig, endpoint and versions.
+
+// AdminKubeconfigFormat is the format CAPIBM requests IBM's admin kubeconfig in (kubernetesservice's
+// GetAdminKubeconfig, getKubeconfig?admin=true&format=json). Observed on IBM Cloud: on both flavors the JSON's user
+// holds client-certificate-data and client-key-data and no token, exec or auth-provider; on IKS it also carries the
+// cluster CA. kubernetesservice sends this value; the constant records the decision with the other live facts.
+const AdminKubeconfigFormat = "json"
+
+// CATrustFor returns how the API server certificate of a distribution's public master is verified.
+// Observed on IBM Cloud: IKS serves a certificate of the cluster CA, so the system roots fail and ClusterCA is used;
+// ROKS's "-e" master serves a publicly trusted certificate that getCACert's CA does not validate, so SystemRoots is
+// used. Private-only clusters are not yet verified against IBM Cloud; the caller therefore tries the other mode when
+// this one fails and records the winner. An unknown distribution gets ClusterCA, the narrower trust.
+//
+// Parameters:
+//   - d: the control plane's spec.distribution.
+func CATrustFor(d controlplanev1.Distribution) managedkubeconfig.CATrust {
+	if d == controlplanev1.DistributionOpenShift {
+		return managedkubeconfig.SystemRoots
+	}
+	return managedkubeconfig.ClusterCA
+}
+
+// KubeconfigPolicy returns the refresh timings of the admin kubeconfig (managedkubeconfig.Decide).
+// Observed on IBM Cloud: IBM's admin certificate is valid two years from its first fetch and IBM re-serves the same
+// certificate (the same serial) on every fetch, so the credential is refreshed at half its lifetime (the kubeadm
+// control plane's ratio, about one year), a refresh that got the stored certificate back is retried only after a day,
+// and there is no fixed-age refresh. The other values bound requeues and backoffs: the expiry warning 30 days ahead
+// (when IBM mints a new certificate near expiry is not yet verified against IBM Cloud), a CA re-check every 12 hours,
+// a 1 minute poll while IBM rotates the CA, a 401 backoff from 1 to 10 minutes, and requeues between 1 minute and
+// 12 hours.
+func KubeconfigPolicy() managedkubeconfig.Policy {
+	return managedkubeconfig.Policy{
+		RefreshFraction:       0.5,
+		SameCertificateRetry:  24 * time.Hour,
+		ExpiryWarning:         30 * 24 * time.Hour,
+		CARecheckInterval:     12 * time.Hour,
+		RotationPollInterval:  time.Minute,
+		AuthFailureBackoffMin: time.Minute,
+		AuthFailureBackoffMax: 10 * time.Minute,
+		MinRequeue:            time.Minute,
+		MaxRequeue:            12 * time.Hour,
+	}
+}
+
+// defaultMasterPort is the port of a master URL that names none. Observed on IBM Cloud: masterURL is https with an
+// explicit port. IBM shows the port-443 control plane hostnames of ROKS 4.22 without a port
+// (https://cloud.ibm.com/docs/openshift?topic=openshift-notice-cp-port-443); whether masterURL then names one is not
+// yet verified against IBM Cloud.
+const defaultMasterPort = "443"
+
+// ManagementServerURL returns the API server URL CAPIBM uses for a cluster: IBM's masterURL, which is also the server
+// of IBM's admin kubeconfig, normalised to https://<host>:<port> with the port always present. The port is 443 when IBM
+// gives none, because Go's url.Port returns "" then and Cluster API copies only an endpoint with a non-zero port.
+// Observed on IBM Cloud: masterURL equals the kubeconfig server on both flavors, with ports such as 30101 and 30102.
+// Not yet verified against IBM Cloud: masterURL also for a private-only cluster; fallback: the private service
+// endpoint URL.
+//
+// Parameters:
+//   - d: the control plane's spec.distribution; both distributions use masterURL today, and the private-only check
+//     may change that for one of them.
+//   - c: the cluster as GetCluster returned it.
+//
+// It returns an error naming the URL and what is wrong when the distribution is unknown, c is nil, masterURL is empty
+// or does not parse, is not https, carries user information, a path, a query or a fragment, or has a port outside
+// 1-65535. The caller treats the error as terminal for the endpoint and writes nothing.
+func ManagementServerURL(d controlplanev1.Distribution, c *kubernetesservice.Cluster) (string, error) {
+	switch {
+	case d != controlplanev1.DistributionKubernetes && d != controlplanev1.DistributionOpenShift:
+		return "", fmt.Errorf("unknown distribution %q; want %q or %q", d, controlplanev1.DistributionKubernetes, controlplanev1.DistributionOpenShift)
+	case c == nil:
+		return "", errors.New("no IBM cluster to take the master URL from")
+	case c.MasterURL == "":
+		return "", fmt.Errorf("IBM reports no masterURL for cluster %s yet; it is set once the master is deployed", c.ID)
+	}
+	u, err := url.Parse(c.MasterURL)
+	if err != nil {
+		return "", fmt.Errorf("IBM masterURL %q of cluster %s is not a URL: %w", c.MasterURL, c.ID, err)
+	}
+	if problem := masterURLProblem(u); problem != "" {
+		return "", fmt.Errorf("IBM masterURL %q of cluster %s %s", c.MasterURL, c.ID, problem)
+	}
+	port := u.Port()
+	if port == "" {
+		port = defaultMasterPort
+	}
+	return "https://" + net.JoinHostPort(u.Hostname(), port), nil
+}
+
+// masterURLProblem returns why a parsed master URL cannot be the API server URL, or "" when it can.
+// Observed on IBM Cloud: IBM's masterURL is a plain https://<host>:<port>.
+//
+// Parameters:
+//   - u: the parsed masterURL.
+func masterURLProblem(u *url.URL) string {
+	switch {
+	case u.Scheme != "https":
+		return fmt.Sprintf("uses scheme %q; CAPIBM connects to IBM masters only over https", u.Scheme)
+	case u.User != nil:
+		return "carries user information; a master URL names only a host and a port"
+	case u.Hostname() == "":
+		return "names no host"
+	case u.Opaque != "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "":
+		return "carries a path, a query or a fragment; a master URL names only a host and a port"
+	}
+	if port := u.Port(); port != "" {
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			return fmt.Sprintf("has port %q; want a port between 1 and 65535", port)
+		}
+	}
+	return ""
+}
+
+// caRotationCompletePrefix starts IBM's caCertRotationStatus.status once a CA rotation has finished, as IBM's
+// documentation words it. Not yet verified against IBM Cloud: no rotation has been observed.
+const caRotationCompletePrefix = "CA certificate rotation complete"
+
+// IsCARotationInProgress reports whether IBM reports a CA certificate rotation that has not completed.
+// Not yet verified against IBM Cloud: the rotation status strings were not observed (a rotation is destructive), so
+// the rule is fail-safe: every non-empty status that does not start with "CA certificate rotation complete" counts as
+// in progress, and an unknown string blocks master updates and polls the kubeconfig faster instead of being ignored;
+// fallback: poll faster.
+//
+// Parameters:
+//   - status: caCertRotationStatus.status of the cluster (kubernetesservice.Cluster.CARotationStatus); "" when no
+//     rotation ever ran.
+func IsCARotationInProgress(status string) bool {
+	status = strings.TrimSpace(status)
+	return status != "" && !strings.HasPrefix(status, caRotationCompletePrefix)
+}
+
+// clusterStateUpdating is the cluster state while IBM updates the master, as IBM documents it.
+// Not yet verified against IBM Cloud: the probes ran no master update.
+const clusterStateUpdating = "updating"
+
+// IsMasterUpdatePending reports whether IBM is updating the master or has an update queued: masterKubeVersion carries
+// " (pending)", the state is "updating", or targetVersion names a newer version than masterKubeVersion (an IBM-driven
+// patch included). Not yet verified against IBM Cloud: none of the three was observed yet (the probes ran no master
+// update); fallback: a parser tweak for the marker IBM actually returns, and a longer MasterUpdatePendingGrace. It is
+// fail-safe: a masterKubeVersion or targetVersion that does not parse counts as pending, because "pending" only delays
+// worker removals and master update requests and keeps the reported Kubernetes version at the minimum. nil is not
+// pending.
+//
+// Parameters:
+//   - c: the cluster as GetCluster returned it.
+func IsMasterUpdatePending(c *kubernetesservice.Cluster) bool {
+	if c == nil {
+		return false
+	}
+	if c.State == clusterStateUpdating {
+		return true
+	}
+	master, err := ibmversion.Parse(c.MasterKubeVersion)
+	if err != nil || master.Pending {
+		return true
+	}
+	if c.TargetVersion == "" {
+		return false
+	}
+	target, err := ibmversion.Parse(c.TargetVersion)
+	if err != nil {
+		return true
+	}
+	return isNewerIBMVersion(target, master)
+}
+
+// isNewerIBMVersion reports whether target is newer than current: a newer minor, or a newer fix pack of the same minor.
+// When the fix packs cannot be compared (one is minor-only, or only one is an OpenShift version) it returns true, the
+// fail-safe answer of IsMasterUpdatePending. Not yet verified against IBM Cloud: targetVersion was observed to equal
+// masterKubeVersion when nothing is pending; how it moves during an update is open.
+//
+// Parameters:
+//   - target: IBM's targetVersion.
+//   - current: IBM's masterKubeVersion.
+func isNewerIBMVersion(target, current ibmversion.Version) bool {
+	if byMinor := target.MinorVersion().Compare(current.MinorVersion()); byMinor != 0 {
+		return byMinor > 0
+	}
+	byFixPack, err := target.WithoutPending().CompareFixPack(current.WithoutPending())
+	return err != nil || byFixPack > 0
+}
+
+// ReportedKubernetesVersion returns the Kubernetes version CAPIBM publishes in status.versions and status.version: the
+// API server's gitVersion, except while the master is updated, when it is the lower of the published and the probed
+// version. IBM updates its API server replicas one at a time, so one /version call can reach an old or a new replica,
+// and the contract field is the minimum (control-plane.md:438-439). Not yet verified against IBM Cloud: whether
+// /version alternates during an update is open; fallback: widen the rolling window.
+//
+// Parameters:
+//   - current: the published version (status.versions[0].version); "" when none is published yet.
+//   - probe: the gitVersion of this reconcile's successful probe, for example "v1.36.5+IKS" (IKS 1.36) or "v1.34.9"
+//     (ROKS 4.21), as observed on IBM Cloud.
+//   - rolling: IsMasterUpdatePending(c) or the IBM state "updating".
+//
+// An empty probe keeps current: a status field is never cleared by a failed read. While rolling, a version that does
+// not parse keeps current, so status never flips between two strings it cannot order. Outside a rollout the probe
+// wins even when it is lower, for example after IBM returned the master to the old patch.
+func ReportedKubernetesVersion(current, probe string, rolling bool) string {
+	if probe == "" {
+		return current
+	}
+	if current == "" || !rolling {
+		return probe
+	}
+	published, err := version.ParseSemantic(current)
+	if err != nil {
+		return current
+	}
+	probed, err := version.ParseSemantic(probe)
+	if err != nil {
+		return current
+	}
+	if probed.LessThan(published) {
+		return probe
+	}
+	return current
+}
