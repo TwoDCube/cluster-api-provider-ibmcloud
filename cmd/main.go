@@ -51,6 +51,7 @@ import (
 	powervsinfrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/powervs/v1beta3"
 	vpcinfrav1beta1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/vpc/v1beta1"
 	vpcinfrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/vpc/v1beta2"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/feature"
 	powervscontroller "sigs.k8s.io/cluster-api-provider-ibmcloud/internal/controllers/powervs"
 	vpccontroller "sigs.k8s.io/cluster-api-provider-ibmcloud/internal/controllers/vpc"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/endpoints"
@@ -158,6 +159,9 @@ func initFlags(fs *pflag.FlagSet) {
 		"List of CRD migration phases to skip. Valid values are: StorageVersionMigration, CleanupManagedFields.")
 
 	flags.AddManagerOptions(fs, &managerOptions)
+
+	// --feature-gates, e.g. ManagedKubernetes=true (Alpha, off by default; package feature explains the gate).
+	feature.MutableGates.AddFlag(fs)
 }
 
 func validateFlags() error {
