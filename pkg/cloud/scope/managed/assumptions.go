@@ -206,3 +206,11 @@ func ClearIntentErrorCodes() []string {
 func ClearIntentStatusCodes() []int {
 	return []int{400, 401, 403, 422}
 }
+
+// Delete: the deletion of the IBM cluster.
+
+// DeleteReissueAfter is how long after status.deletionRequestTime CAPIBM sends DELETE again while IBM still reports
+// the cluster in a state other than deleting. Not yet verified against IBM Cloud: a DELETE was observed to get 204,
+// then state deleting, then 404 after about 5 minutes on both flavors, but IBM's answer to a repeated DELETE is open;
+// default 10 minutes; fallback: adjust once that answer is known.
+const DeleteReissueAfter = 10 * time.Minute

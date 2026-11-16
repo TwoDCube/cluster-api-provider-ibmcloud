@@ -331,3 +331,11 @@ func withMaster(c kubernetesservice.Cluster, state, status, url string) *kuberne
 	c.MasterState, c.MasterStatus, c.MasterURL = state, status, url
 	return &c
 }
+
+// TestDeleteDecisionPoints pins the delete decision point, DeleteReissueAfter.
+func TestDeleteDecisionPoints(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(DeleteReissueAfter).To(Equal(10 * time.Minute))
+	// IBM was observed to report 404 about 5 minutes after the DELETE, so a re-issue never races the normal deletion.
+	g.Expect(DeleteReissueAfter).To(BeNumerically(">", 5*time.Minute))
+}
