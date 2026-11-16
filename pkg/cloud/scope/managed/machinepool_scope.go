@@ -395,7 +395,8 @@ func (s *MachinePoolScope) credentialsProblem(err error) Outcome {
 // findPool lists the IBM pools of the cluster and returns the one named spec.poolName, or nil when IBM has none. It
 // decides the cases that end the reconcile: a failed listing, a pool IBM still removes (PoolNameBeingReleased) and a
 // pool of another flavor (PoolConflict, which also stops publication). For an IBM pool CAPIBM did not create it
-// records status.poolID and emits WorkerPoolAdopted.
+// records status.poolID and emits WorkerPoolAdopted, except for the pool IBM creates together with the cluster
+// (comesWithCluster).
 //
 // Parameters:
 //   - ctx is the reconcile context.
@@ -425,15 +426,28 @@ func (s *MachinePoolScope) findPool(ctx context.Context, clients *poolClients) (
 		s.report(reason, message)
 		return nil, Terminal(reason, message), true
 	}
-	if s.Pool.Status.PoolID == "" && pool.Name != InitialWorkerPoolName {
-		// IBM creates the initial pool together with the cluster; every other pool found without a recorded ID was
-		// made outside this object (or before a clusterctl move), and from now on CAPIBM sizes and removes it.
+	if s.Pool.Status.PoolID == "" && !s.comesWithCluster() {
+		// Every pool found without a recorded ID, other than the one IBM creates with the cluster, was made outside
+		// this object (or before a clusterctl move), and from now on CAPIBM sizes and removes it. The event is the only
+		// effect of the marker here; every pool is found by name and owned alike.
 		s.params.Recorder.Eventf(s.Pool, corev1.EventTypeNormal, EventWorkerPoolAdopted,
 			"CAPIBM now sizes IBM worker pool %s (%s) and removes it when this object is deleted", pool.Name, pool.ID)
 	}
 	s.Pool.Status.PoolID = pool.ID
 	s.addNote(zonesNote(pool, s.Pool))
 	return pool, Outcome{}, false
+}
+
+// comesWithCluster reports whether this pool is the one IBM creates together with the cluster, so that finding it is
+// expected and no adoption: it is marked spec.creation WithCluster and the control plane is not initialized yet. The
+// marker, not the pool name, tells it apart, because any name is valid for that pool (IBM honours a custom pool name
+// at create). The control plane reads the marker only until the IBM cluster exists, so once the control plane is
+// initialized a WithCluster pool is handled like any other: one that names a pool made by hand takes it over with
+// WorkerPoolAdopted. The price is one extra WorkerPoolAdopted event for the initial pool when this controller first
+// lists it only after the control plane was initialized, for example after a clusterctl move; that is accepted.
+func (s *MachinePoolScope) comesWithCluster() bool {
+	return s.Pool.Spec.Creation == infrav1.PoolCreationWithCluster &&
+		!ptr.Deref(s.ControlPlane.Status.Initialization.ControlPlaneInitialized, false)
 }
 
 // createPool creates the IBM pool when every guard passes, the control plane is initialized and the cluster state
@@ -450,12 +464,15 @@ func (s *MachinePoolScope) createPool(ctx context.Context, clients *poolClients,
 		return s.guardOutcome(guards)
 	}
 	clusterID := s.ControlPlane.Status.ClusterID
+	// Only the wait message depends on spec.creation. Once the control plane is initialized, a WithCluster pool that
+	// IBM does not list (an adopted cluster, a marker set after the create, a pool removed out of band) is created like
+	// any other pool: the control plane reads the marker only before it creates the IBM cluster.
 	if !ptr.Deref(s.ControlPlane.Status.Initialization.ControlPlaneInitialized, false) {
 		message := fmt.Sprintf("the master of IBM cluster %s is not ready yet; pool %s is created once "+
 			"IBMCloudManagedControlPlane %s is initialized", clusterID, s.Pool.Spec.PoolName, s.ControlPlane.Name)
-		if s.Pool.Spec.PoolName == InitialWorkerPoolName {
-			message = fmt.Sprintf("IBM creates pool %s together with cluster %s; waiting for it to be listed",
-				InitialWorkerPoolName, clusterID)
+		if s.Pool.Spec.Creation == infrav1.PoolCreationWithCluster {
+			message = fmt.Sprintf("IBM creates pool %s together with cluster %s (spec.creation: %s); waiting for it to "+
+				"be listed", s.Pool.Spec.PoolName, clusterID, infrav1.PoolCreationWithCluster)
 		}
 		return s.waitForControlPlane(message)
 	}

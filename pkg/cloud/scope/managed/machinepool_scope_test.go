@@ -19,6 +19,7 @@ package managed
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -567,16 +568,49 @@ func TestMachinePoolScopeFindsThePool(t *testing.T) {
 		g.Expect(f.pool.Status.PoolID).To(Equal(poolTestPoolID))
 		g.Expect(f.events()).To(ConsistOf(ContainSubstring("Normal WorkerPoolAdopted CAPIBM now sizes IBM worker pool workers")))
 	})
-	t.Run("the initial pool and a known pool are not adopted again", func(t *testing.T) {
-		for _, tc := range []struct{ poolName, poolID string }{{"default", ""}, {"workers", poolTestPoolID}} {
+	// The WorkerPoolAdopted rule: finding the pool IBM creates with the cluster is no adoption. spec.creation, not the
+	// pool name, tells that pool apart, and only while the control plane is not initialized: afterwards a WithCluster
+	// pool is handled like any other, so one that names a pool made by hand takes it over with the event. A recorded
+	// status.poolID means CAPIBM has seen the pool before. Every kind of pool is found by name and recorded alike.
+	withCluster, afterCluster := infrav1.PoolCreationWithCluster, infrav1.PoolCreationAfterCluster
+	for _, tc := range []struct {
+		name     string
+		poolName string
+		creation infrav1.PoolCreation
+		poolID   string
+		// uninitialized leaves the control plane without status.initialization.controlPlaneInitialized.
+		uninitialized bool
+		wantEvent     bool
+	}{
+		{name: "a_WithCluster_pool_with_a_custom_name_is_not_adopted", poolName: "workers-a", creation: withCluster, uninitialized: true},
+		{name: "a WithCluster pool named default is not adopted", poolName: "default", creation: withCluster, uninitialized: true},
+		{name: "a pool named default without the marker is adopted", poolName: "default", wantEvent: true},
+		{name: "a pool without the marker is adopted before the control plane is initialized", poolName: "default",
+			uninitialized: true, wantEvent: true},
+		{name: "an AfterCluster pool found without an ID is adopted", poolName: "workers", creation: afterCluster, wantEvent: true},
+		{name: "a_WithCluster_pool_first_found_after_initialization_is_adopted", poolName: "workers-b", creation: withCluster,
+			wantEvent: true},
+		{name: "a known pool is not adopted again", poolName: "workers", poolID: poolTestPoolID},
+		{name: "a known WithCluster pool is not adopted again", poolName: "workers-a", creation: withCluster, poolID: poolTestPoolID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 			f := newPoolFixture(t)
-			f.pool.Spec.PoolName, f.pool.Status.PoolID = tc.poolName, tc.poolID
+			f.pool.Spec.PoolName, f.pool.Spec.Creation, f.pool.Status.PoolID = tc.poolName, tc.creation, tc.poolID
+			if tc.uninitialized {
+				f.cp.Status.Initialization.ControlPlaneInitialized = nil
+			}
 			f.expectObservation([]kubernetesservice.WorkerPool{ibmPool(tc.poolName, 2, "us-south-1", "us-south-2")}, readyWorkers(4))
-			f.scope().ReconcileNormal(context.Background())
+			g.Expect(f.scope().ReconcileNormal(context.Background())).To(Equal(Done()))
+			g.Expect(f.pool.Status.PoolID).To(Equal(poolTestPoolID))
+			if tc.wantEvent {
+				g.Expect(f.events()).To(ConsistOf("Normal WorkerPoolAdopted CAPIBM now sizes IBM worker pool " + tc.poolName +
+					" (" + poolTestPoolID + ") and removes it when this object is deleted"))
+				return
+			}
 			g.Expect(f.events()).To(BeEmpty())
-		}
-	})
+		})
+	}
 	t.Run("a_pool_of_another_flavor_is_not_ours", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newPoolFixture(t)
@@ -664,23 +698,50 @@ func TestMachinePoolScopeCreatesThePool(t *testing.T) {
 		g.Expect(condition(f.pool, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCondition).Message).
 			To(ContainSubstring("(HTTP 400, code E0001) while creating worker pool workers in IBM cluster " + poolTestClusterID))
 	})
-	t.Run("a pool other than default waits for the initialized control plane", func(t *testing.T) {
+	// Before the control plane is initialized every pool IBM does not list waits, with no IBM mutation; only the
+	// message depends on spec.creation, and it names the pool's own spec.poolName.
+	notReady := "the master of IBM cluster " + poolTestClusterID + " is not ready yet; pool %s is created once " +
+		"IBMCloudManagedControlPlane " + poolTestCluster + " is initialized"
+	for _, tc := range []struct {
+		name        string
+		poolName    string
+		creation    infrav1.PoolCreation
+		wantMessage string
+	}{
+		{name: "a WithCluster pool comes with the cluster", poolName: "system", creation: infrav1.PoolCreationWithCluster,
+			wantMessage: "IBM creates pool system together with cluster " + poolTestClusterID + " (spec.creation: WithCluster); " +
+				"waiting for it to be listed"},
+		{name: "an AfterCluster pool waits for the initialized control plane", poolName: "workers",
+			creation: infrav1.PoolCreationAfterCluster, wantMessage: fmt.Sprintf(notReady, "workers")},
+		{name: "a pool without the marker waits for the initialized control plane", poolName: "workers",
+			wantMessage: fmt.Sprintf(notReady, "workers")},
+		{name: "a pool named default without the marker is not the WithCluster pool", poolName: "default",
+			wantMessage: fmt.Sprintf(notReady, "default")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			f := newPoolFixture(t)
+			f.pool.Spec.PoolName, f.pool.Spec.Creation = tc.poolName, tc.creation
+			f.cp.Status.Initialization.ControlPlaneInitialized = nil
+			f.ibm.EXPECT().ListWorkerPools(gomock.Any(), poolTestClusterID).Return(nil, nil)
+			g.Expect(f.scope().ReconcileNormal(context.Background())).
+				To(Equal(NotDone(IntervalClusterProvisioning, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForControlPlaneReason)))
+			g.Expect(condition(f.pool, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCondition).Message).To(Equal(tc.wantMessage))
+		})
+	}
+	t.Run("a_WithCluster_pool_IBM_does_not_list_is_created_like_any_other_once_the_control_plane_is_initialized", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newPoolFixture(t)
-		f.cp.Status.Initialization.ControlPlaneInitialized = nil
+		f.pool.Spec.PoolName, f.pool.Spec.Creation = "system", infrav1.PoolCreationWithCluster
 		f.ibm.EXPECT().ListWorkerPools(gomock.Any(), poolTestClusterID).Return(nil, nil)
+		f.ibm.EXPECT().CreateWorkerPool(gomock.Any(), kubernetesservice.CreateWorkerPoolRequest{
+			ClusterID: poolTestClusterID, Name: "system", Flavor: poolTestFlavor, VPCID: testVPCID, WorkerCountPerZone: 2,
+			Zones: []kubernetesservice.ZoneSubnet{{Zone: "us-south-1", SubnetID: "sn-1"}, {Zone: "us-south-2", SubnetID: "sn-2"}},
+		}).Return(poolTestPoolID, nil)
 		g.Expect(f.scope().ReconcileNormal(context.Background())).
-			To(Equal(NotDone(IntervalClusterProvisioning, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForControlPlaneReason)))
-	})
-	t.Run("the default pool comes with the cluster", func(t *testing.T) {
-		g := NewWithT(t)
-		f := newPoolFixture(t)
-		f.pool.Spec.PoolName = InitialWorkerPoolName
-		f.cp.Status.Initialization.ControlPlaneInitialized = nil
-		f.ibm.EXPECT().ListWorkerPools(gomock.Any(), poolTestClusterID).Return(nil, nil)
-		f.scope().ReconcileNormal(context.Background())
-		g.Expect(condition(f.pool, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCondition).Message).
-			To(ContainSubstring("IBM creates pool default together with cluster"))
+			To(Equal(NotDone(IntervalPoolTransition, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCreatingReason)))
+		g.Expect(f.pool.Status.PoolID).To(Equal(poolTestPoolID))
+		g.Expect(f.events()).To(BeEmpty(), "a pool CAPIBM creates is not adopted")
 	})
 	t.Run("an unresolved subnet waits for the IBMCloudManagedCluster", func(t *testing.T) {
 		g := NewWithT(t)
@@ -689,6 +750,56 @@ func TestMachinePoolScopeCreatesThePool(t *testing.T) {
 		f.ibm.EXPECT().ListWorkerPools(gomock.Any(), poolTestClusterID).Return(nil, nil)
 		g.Expect(f.scope().ReconcileNormal(context.Background())).
 			To(Equal(NotDone(IntervalPoolTransition, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForInfrastructureReason)))
+	})
+}
+
+// TestMachinePoolScopeMarkerMovedBetweenCreateAttempts is the pool side of a spec.creation marker that moves between
+// two create attempts: the create attempt that timed out sent object a (poolName default, then marked), and before
+// the cluster showed up the user moved spec.creation: WithCluster to object b (poolName workers). IBM lists only pool
+// default. Each object touches only the IBM pool its own spec.poolName names: a, no longer marked, publishes and sizes
+// default and reports the adoption; b never publishes, sizes or records default, waits while the control plane is not
+// initialized and then creates its own pool workers. gomock fails a case on any IBM call it does not expect.
+func TestMachinePoolScopeMarkerMovedBetweenCreateAttempts(t *testing.T) {
+	listed := []kubernetesservice.WorkerPool{ibmPool("default", 2, "us-south-1", "us-south-2")}
+	waiting := NotDone(IntervalClusterProvisioning, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForControlPlaneReason)
+	t.Run("object_a_without_the_marker_adopts_the_pool_its_poolName_names", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newPoolFixture(t)
+		f.pool.Spec.PoolName, f.pool.Spec.Creation = "default", infrav1.PoolCreationAfterCluster
+		f.cp.Status.Initialization.ControlPlaneInitialized = nil
+		f.expectObservation(listed, readyWorkers(4))
+		g.Expect(f.scope().ReconcileNormal(context.Background())).To(Equal(Done()))
+		g.Expect(f.pool.Status.PoolID).To(Equal(poolTestPoolID))
+		g.Expect(f.pool.Spec.ProviderIDList).To(HaveLen(4), "a publishes the workers of default")
+		g.Expect(f.events()).To(ConsistOf("Normal WorkerPoolAdopted CAPIBM now sizes IBM worker pool default (" +
+			poolTestPoolID + ") and removes it when this object is deleted"))
+	})
+	t.Run("object_b_with_the_marker_leaves_the_pool_it_does_not_name_alone", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newPoolFixture(t)
+		f.pool.Spec.PoolName, f.pool.Spec.Creation = "workers", infrav1.PoolCreationWithCluster
+		f.cp.Status.Initialization.ControlPlaneInitialized = nil
+		f.ibm.EXPECT().ListWorkerPools(gomock.Any(), poolTestClusterID).Return(listed, nil)
+		g.Expect(f.scope().ReconcileNormal(context.Background())).To(Equal(waiting))
+		g.Expect(f.pool.Status.PoolID).To(BeEmpty())
+		g.Expect(f.pool.Spec.ProviderIDList).To(BeEmpty())
+		g.Expect(f.pool.Status.Ready).To(BeNil())
+		g.Expect(f.events()).To(BeEmpty())
+	})
+	t.Run("object_b_creates_its_own_pool_once_the_control_plane_is_initialized", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newPoolFixture(t)
+		f.pool.Spec.PoolName, f.pool.Spec.Creation = "workers", infrav1.PoolCreationWithCluster
+		f.ibm.EXPECT().ListWorkerPools(gomock.Any(), poolTestClusterID).Return(listed, nil)
+		f.ibm.EXPECT().CreateWorkerPool(gomock.Any(), kubernetesservice.CreateWorkerPoolRequest{
+			ClusterID: poolTestClusterID, Name: "workers", Flavor: poolTestFlavor, VPCID: testVPCID, WorkerCountPerZone: 2,
+			Zones: []kubernetesservice.ZoneSubnet{{Zone: "us-south-1", SubnetID: "sn-1"}, {Zone: "us-south-2", SubnetID: "sn-2"}},
+		}).Return(poolTestClusterID+"-workers", nil)
+		g.Expect(f.scope().ReconcileNormal(context.Background())).
+			To(Equal(NotDone(IntervalPoolTransition, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCreatingReason)))
+		g.Expect(f.pool.Status.PoolID).To(Equal(poolTestClusterID+"-workers"), "never the ID of default")
+		g.Expect(f.pool.Spec.ProviderIDList).To(BeEmpty())
+		g.Expect(f.events()).To(BeEmpty())
 	})
 }
 
