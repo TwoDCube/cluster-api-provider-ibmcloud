@@ -178,6 +178,11 @@ func (s *ControlPlaneScope) deleteUnprovenCluster(ctx context.Context, clients *
 		return NotDone(IntervalTerminalRecheck, reason), false
 	case controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMClusterNotFoundReason:
 		if decision.Row == "4" {
+			// A known ID that IBM answers with 404 is gone only if its stored kubeconfig no longer authenticates: the 404 may
+			// only mean that the credentials cannot see the cluster.
+			if outcome, kept := s.keepWhileKubeconfigAuthenticates(ctx, clients); kept {
+				return outcome, false
+			}
 			s.reportGoneCluster(ctx, clients, name)
 		}
 		return Done(), true
@@ -331,8 +336,8 @@ func (s *ControlPlaneScope) deleteTransient(outcome Outcome, message string) Out
 // Unless CAPIBM's own DELETE preceded the 404 (status.deletionRequestTime, the later-poll case of the delete flow),
 // this is row 4 proper, and a same-named IBM cluster in the resource group is named as not deleted
 // (recordSameNamedCluster).
-// A probe of the stored kubeconfig (IBMClusterNotVisible, finalizer kept), which is not wired yet, is to come before
-// all of this.
+// It runs only once keepWhileKubeconfigAuthenticates found no stored CAPIBM kubeconfig of that ID that still authenticates
+// (IBMClusterNotVisible keeps the finalizer otherwise).
 //
 // Parameters:
 //   - ctx is the reconcile context.

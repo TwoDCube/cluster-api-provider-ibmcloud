@@ -365,8 +365,9 @@ func cpToken(token string) string {
 }
 
 // decideBinding gathers the inputs of DecideBinding, makes the one GetCluster call it names and returns its decision
-// (rows 1-10, in delete mode for the delete flow). The proof of possession is not run in this release of the control
-// plane (OwnershipProofNotAttempted), so rows 2 and 5 end terminal instead of binding.
+// (rows 1-10, in delete mode for the delete flow). When only the proof of possession stands between a candidate of
+// rows 2 or 5 and its binding (ProofNeeded), it runs the proof (proveOwnership) and decides again with its result; no
+// IBM credential is fetched for a candidate before it is proven.
 //
 // Parameters:
 //   - ctx is the reconcile context.
@@ -374,17 +375,25 @@ func cpToken(token string) string {
 //   - name is the effective IBM cluster name.
 //   - deleting selects the delete mode of DecideBinding.
 //
-// It returns a *controlPlaneCallError when GetCluster failed with anything but 404, and any other error for a read
-// of the kubeconfig Secret that failed or an input DecideBinding rejected.
+// It returns a *controlPlaneCallError when GetCluster failed with anything but 404 or getCACert failed during the
+// proof, and any other error for a read of the kubeconfig Secret that failed or an input DecideBinding rejected.
 func (s *ControlPlaneScope) decideBinding(ctx context.Context, clients *controlPlaneClients, name string, deleting bool) (BindingDecision, error) {
 	cp := s.ControlPlane
-	secretClusterID, err := s.kubeconfigSecretClusterID(ctx)
+	kubeconfig, err := s.loadKubeconfigSecret(ctx)
 	if err != nil {
 		return BindingDecision{}, err
 	}
+	secretClusterID, secretServer := "", ""
+	if kubeconfig != nil {
+		secretClusterID = kubeconfig.Annotations[controlplanev1.KubeconfigClusterIDAnnotation]
+		secretServer = kubeconfig.Annotations[KubeconfigServerAnnotation]
+	}
+	// The Secret's annotations are untrusted (anyone in the namespace can write them): the cluster-id only selects the
+	// candidate of row 2 and the server only feeds EndpointMatches of row 5, both of which bind only with the proof.
 	in := BindingInput{
 		StatusClusterID: cp.Status.ClusterID,
 		SecretClusterID: secretClusterID,
+		SecretServer:    secretServer,
 		Endpoint:        cp.Spec.ControlPlaneEndpoint,
 		Intent:          cp.Status.CreateIntent,
 		Name:            name,
@@ -405,22 +414,23 @@ func (s *ControlPlaneScope) decideBinding(ctx context.Context, clients *controlP
 	}
 	in.Found = found
 	decision, err := DecideBinding(in)
-	if err != nil {
-		return BindingDecision{}, fmt.Errorf("deciding the binding of %s: %w", s.objectName(), err)
+	if err != nil || !decision.ProofNeeded {
+		return decision, s.bindingError(err)
 	}
-	return decision, nil
+	if in.Proof, in.ProofFailure, err = s.proveOwnership(ctx, clients, decision.Cluster); err != nil {
+		return BindingDecision{}, err
+	}
+	decision, err = DecideBinding(in)
+	return decision, s.bindingError(err)
 }
 
-// kubeconfigSecretClusterID returns the cluster-id annotation of the Cluster's <cluster>-kubeconfig Secret, or "" when
-// the Secret or the annotation does not exist. The value is untrusted (anyone in the namespace can write it): it only
-// selects the candidate of DecideBinding row 2, which binds only with the proof of possession. The Secret is read
-// uncached with the API reader, because the manager has no cluster-wide Secret informer. ctx is the reconcile context.
-func (s *ControlPlaneScope) kubeconfigSecretClusterID(ctx context.Context) (string, error) {
-	kubeconfig, err := s.loadKubeconfigSecret(ctx)
-	if err != nil || kubeconfig == nil {
-		return "", err
+// bindingError names the control plane in an input error of DecideBinding, a programming error; nil stays nil. err is
+// DecideBinding's error.
+func (s *ControlPlaneScope) bindingError(err error) error {
+	if err == nil {
+		return nil
 	}
-	return kubeconfig.Annotations[controlplanev1.KubeconfigClusterIDAnnotation], nil
+	return fmt.Errorf("deciding the binding of %s: %w", s.objectName(), err)
 }
 
 // loadInfraCluster reads the IBMCloudManagedCluster that the Cluster's spec.infrastructureRef names and stores it in
