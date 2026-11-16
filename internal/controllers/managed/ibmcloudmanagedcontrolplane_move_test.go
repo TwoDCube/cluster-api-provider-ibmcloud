@@ -27,16 +27,20 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"k8s.io/client-go/tools/record"
+	clocktesting "k8s.io/utils/clock/testing"
 	"k8s.io/utils/ptr"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/controllers/clustercache"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/kubeconfig"
 
 	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
+	infrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/v1alpha1"
 	managedscope "sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/scope/managed"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
 	ksmock "sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice/mock"
@@ -485,4 +489,65 @@ func TestControlPlaneEnvtestMove(t *testing.T) {
 	after := &corev1.Secret{}
 	g.Expect(testEnv.GetAPIReader().Get(ctx, secretKey, after)).To(Succeed())
 	g.Expect(after.ResourceVersion).To(Equal(movedVersion), "the valid moved Secret is not rewritten")
+}
+
+// TestControlPlaneEnvtestMovePool runs the pool side of the clusterctl move target against the real API server: the
+// pool arrives without status, its control plane is bound again (as TestControlPlaneEnvtestMove leaves it), and the
+// first observation of the existing IBM pool sets lastDisruptionTime to now, so that no disruptive call starts within
+// DisruptionSettleDelay of the move (clusterctl move has no minimum pause). No manager runs; the Cluster is paused at
+// cleanup so that a later envtest manager watching every namespace leaves it alone.
+func TestControlPlaneEnvtestMovePool(t *testing.T) {
+	t.Run("a_moved_pool_with_empty_status_sets_lastDisruptionTime_to_now", testMovedPoolStartsTheSettleDelay)
+}
+
+// testMovedPoolStartsTheSettleDelay is the case of TestControlPlaneEnvtestMovePool. t is the test.
+func testMovedPoolStartsTheSettleDelay(t *testing.T) {
+	g := NewWithT(t)
+	namespace := newTestNamespace(t, "cp-move-pool")
+	cluster, _ := createEnvtestCreateInputs(t, namespace)
+	t.Cleanup(func() { pauseTestCluster(t, cluster) })
+	cp := createEnvtestControlPlane(t, namespace, "dev", cluster)
+	cp.Finalizers = []string{controlplanev1.IBMCloudManagedControlPlaneFinalizer}
+	cp.Spec.ControlPlaneEndpoint = cpTestEndpoint
+	g.Expect(testEnv.Update(ctx, cp)).To(Succeed())
+	cp.Status = controlplanev1.IBMCloudManagedControlPlaneStatus{ClusterID: cpIKSClusterID, ClusterCRN: cpTestCRN, State: "normal",
+		DistributionVersion: "1.36.5_1537", ExternalManagedControlPlane: ptr.To(true),
+		Initialization: controlplanev1.IBMCloudManagedControlPlaneInitializationStatus{ControlPlaneInitialized: ptr.To(true)}}
+	g.Expect(testEnv.Status().Update(ctx, cp)).To(Succeed())
+
+	// The moved pool: spec and finalizer, no status but the Paused condition of its first reconcile on the target.
+	poolKey := client.ObjectKey{Namespace: namespace, Name: cpTestPoolName}
+	pool := &infrav1.IBMCloudManagedMachinePool{}
+	g.Expect(testEnv.GetAPIReader().Get(ctx, poolKey, pool)).To(Succeed())
+	pool.Finalizers = []string{infrav1.IBMCloudManagedMachinePoolFinalizer}
+	g.Expect(testEnv.Update(ctx, pool)).To(Succeed())
+	pool.Status.Conditions = []metav1.Condition{{Type: clusterv1.PausedCondition, Status: metav1.ConditionFalse,
+		Reason: clusterv1.NotPausedReason, LastTransitionTime: metav1.NewTime(cpTestStart)}}
+	g.Expect(testEnv.Status().Update(ctx, pool)).To(Succeed())
+	g.Expect(pool.Status.LastDisruptionTime.IsZero()).To(BeTrue(), "clusterctl move does not carry status")
+
+	kube := ksmock.NewMockKubernetesService(gomock.NewController(t))
+	ibmPool := kubernetesservice.WorkerPool{ID: cpIKSClusterID + "-pool1", Name: "default", Flavor: "bx2.4x16", SizePerZone: 1,
+		Zones: []kubernetesservice.WorkerPoolZone{{ID: "us-south-1", WorkerCount: 1}, {ID: "us-south-2", WorkerCount: 1}}}
+	workers := []kubernetesservice.Worker{
+		{ID: "w1", PoolID: ibmPool.ID, Zone: "us-south-1", ActualState: "deployed", HealthState: "normal",
+			KubeVersionActual: "1.36.5_1540", KubeVersionTarget: "1.36.5_1540"},
+		{ID: "w2", PoolID: ibmPool.ID, Zone: "us-south-2", ActualState: "deployed", HealthState: "normal",
+			KubeVersionActual: "1.36.5_1540", KubeVersionTarget: "1.36.5_1540"},
+	}
+	kube.EXPECT().ListWorkerPools(gomock.Any(), cpIKSClusterID).Return([]kubernetesservice.WorkerPool{ibmPool}, nil)
+	kube.EXPECT().ListWorkers(gomock.Any(), cpIKSClusterID).Return(workers, nil)
+	c := uncachedClient(t)
+	r := &IBMCloudManagedMachinePoolReconciler{Client: c, APIReader: c, Recorder: record.NewFakeRecorder(100),
+		Resolver: &recordingResolver{}, ClientBuilder: &stubClientBuilder{kubernetes: kube},
+		ClusterCache: clustercache.NewFakeEmptyClusterCache(), Clock: clocktesting.NewFakeClock(cpTestStart)}
+
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: poolKey})
+
+	g.Expect(err).NotTo(HaveOccurred())
+	moved := &infrav1.IBMCloudManagedMachinePool{}
+	g.Expect(testEnv.GetAPIReader().Get(ctx, poolKey, moved)).To(Succeed())
+	g.Expect(moved.Status.LastDisruptionTime.Time).To(BeTemporally("==", cpTestStart), "the settle delay starts at the move")
+	g.Expect(moved.Status.PoolID).To(Equal(ibmPool.ID), "the pool is found again by its name")
+	g.Expect(moved.Status.Ready).To(Equal(ptr.To(true)))
 }
