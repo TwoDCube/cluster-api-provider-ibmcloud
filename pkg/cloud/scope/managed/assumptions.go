@@ -474,3 +474,18 @@ func ReportedKubernetesVersion(current, probe string, rolling bool) string {
 func ProvesOwnership(r workloadprobe.Result) bool {
 	return r.ClusterAdmin
 }
+
+// Pool service methods (kubernetesservice).
+
+// CreatePoolWithZones records how kubernetesservice.CreateWorkerPool creates a pool: with its zones and subnets in one
+// createWorkerPool call (zones[].subnetID). Not yet verified against IBM Cloud: whether that one call provisions the
+// workers; fallback: a zone-less create plus one zone add per zone. The switch itself is
+// kubernetesservice.CreatePoolWithZones, because the service package cannot import this one; this alias lists the
+// decision point with the others and stops compiling if the switch is renamed or removed.
+const CreatePoolWithZones = kubernetesservice.CreatePoolWithZones
+
+// ListWorkerPoolsViaSDK records the source of kubernetesservice.ListWorkerPools: the SDK's GetWorkerPools1
+// (GET /v2/getWorkerPools). Not yet verified against IBM Cloud: only the swagger documents that path's array shape on
+// VPC clusters, while the live probes measured GET /v2/vpc/getWorkerPools; fallback: a compat decoder for
+// /v2/vpc/getWorkerPools. As for CreatePoolWithZones, the switch is kubernetesservice.ListWorkerPoolsViaSDK.
+const ListWorkerPoolsViaSDK = kubernetesservice.ListWorkerPoolsViaSDK

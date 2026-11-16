@@ -585,3 +585,11 @@ func TestProvesOwnership(t *testing.T) {
 		})
 	}
 }
+
+// TestPoolServiceDecisionPoints pins the pool service decision points CreatePoolWithZones and ListWorkerPoolsViaSDK:
+// both defaults are on.
+func TestPoolServiceDecisionPoints(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(CreatePoolWithZones).To(BeTrue())
+	g.Expect(ListWorkerPoolsViaSDK).To(BeTrue())
+}
