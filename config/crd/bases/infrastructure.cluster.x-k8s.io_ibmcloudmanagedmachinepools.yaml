@@ -78,6 +78,20 @@ spec:
           spec:
             description: spec is the desired worker pool.
             properties:
+              creation:
+                description: |-
+                  creation selects the cluster's initial worker pool. WithCluster: IBM creates this pool together with the IBM
+                  cluster (the worker pool of createCluster, named spec.poolName); exactly one IBMCloudManagedMachinePool of the
+                  Cluster must say so before the IBM cluster is created, otherwise the control plane waits
+                  (WaitingForInitialWorkerPool, none) or stops (InvalidConfiguration, several). AfterCluster, also when omitted:
+                  the pool is created once the control plane is initialized. The control plane reads it only until the IBM cluster
+                  exists. Until the control plane is initialized, a WithCluster pool waits for IBM to list it, and finding it is no
+                  adoption (no WorkerPoolAdopted event); afterwards a WithCluster pool is handled like an AfterCluster pool. It never
+                  changes which IBM pool this object manages: that is always the pool named spec.poolName. Mutable.
+                enum:
+                - WithCluster
+                - AfterCluster
+                type: string
               entitlement:
                 description: |-
                   entitlement is OCPEntitled for OpenShift pools covered by a Cloud Pak licence; omitted means none.
@@ -101,8 +115,9 @@ spec:
                   rule: self == oldSelf
               poolName:
                 description: |-
-                  poolName is the IBM worker pool name, unique within the Cluster. The pool named "default" is created together
-                  with the IBM cluster. Immutable. IBM honours custom names (observed on IBM Cloud); MaxLength stays conservative.
+                  poolName is the IBM worker pool name, unique within the Cluster. CAPIBM finds, sizes and removes the IBM pool by
+                  this name only, whatever spec.creation says. Any valid name works, also for the pool created together with the
+                  IBM cluster. Immutable. IBM honours custom names (observed on IBM Cloud); MaxLength stays conservative.
                 maxLength: 32
                 minLength: 1
                 pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
@@ -157,8 +172,8 @@ spec:
               zones:
                 description: |-
                   zones lists the pool's zones; each must be a zone of the IBMCloudManagedCluster. Immutable in v1alpha1.
-                  For ROKS, give the "default" pool every zone the cluster will ever use: IBM does not extend the router load
-                  balancer to zones added later.
+                  For ROKS, give the WithCluster pool (spec.creation) every zone the cluster will ever use: IBM does not extend the
+                  router load balancer to zones added later.
                 items:
                   description: WorkerPoolZone is one zone of a pool. A per-pool subnet
                     override can be added later (additive optional field).

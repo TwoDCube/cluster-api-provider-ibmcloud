@@ -102,7 +102,9 @@ const (
 	IBMCloudManagedMachinePoolWorkerPoolReadyExternallyAutoscaledReason = "ExternallyAutoscaled"
 
 	// IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForControlPlaneReason surfaces while the control plane has no IBM
-	// cluster ID yet, or, for a pool other than "default", is not initialized.
+	// cluster ID yet, or is not initialized and IBM does not list the pool yet: IBM creates a WithCluster pool
+	// (spec.creation) together with the cluster, and CAPIBM creates any other pool once the control plane is
+	// initialized.
 	IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForControlPlaneReason = "WaitingForControlPlane"
 
 	// IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForInfrastructureReason surfaces while a zone of the pool is not yet

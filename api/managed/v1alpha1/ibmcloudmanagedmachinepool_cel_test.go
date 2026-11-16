@@ -26,6 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/v1alpha1"
 )
@@ -35,8 +36,8 @@ const (
 	entitlementPresenceMessage = "entitlement cannot be added or removed after creation"
 )
 
-// newIBMCloudManagedMachinePool returns a valid IBMCloudManagedMachinePool in namespace: the "default" pool, flavor bx2.4x16,
-// one zone.
+// newIBMCloudManagedMachinePool returns a valid IBMCloudManagedMachinePool in namespace: poolName "default", flavor
+// bx2.4x16, one zone, spec.creation omitted.
 func newIBMCloudManagedMachinePool(namespace string) *infrav1.IBMCloudManagedMachinePool {
 	return &infrav1.IBMCloudManagedMachinePool{
 		ObjectMeta: metav1.ObjectMeta{GenerateName: "ibmcmmp-", Namespace: namespace},
@@ -75,6 +76,7 @@ func TestIBMCloudManagedMachinePoolCreateValidation(t *testing.T) {
 			name: "all_optional_fields_accepted",
 			mutate: func(p *infrav1.IBMCloudManagedMachinePool) {
 				p.Spec.PoolName = "gpu-pool-1"
+				p.Spec.Creation = infrav1.PoolCreationWithCluster
 				p.Spec.Flavor = "gx3.16x80.l4"
 				p.Spec.Zones = poolZones("us-south-1", "us-south-2", "us-south-3")
 				p.Spec.Entitlement = infrav1.EntitlementOCPEntitled
@@ -236,6 +238,62 @@ func TestIBMCloudManagedMachinePoolUpdateValidation(t *testing.T) {
 			}
 			g.Expect(testEnv.Create(ctx, obj)).To(Succeed())
 			tc.update(obj)
+			expectAPIResult(g, testEnv.Update(ctx, obj), tc.wantErr)
+		})
+	}
+}
+
+// TestIBMCloudManagedMachinePoolCreationMarker covers spec.creation: both values and an omitted field are accepted, any
+// other value is rejected, an omitted field stays omitted (the schema has no default, so "omitted means AfterCluster"
+// stays the controller's reading), and the field may change in every direction, because the control plane reads it
+// only before the IBM cluster is created.
+func TestIBMCloudManagedMachinePoolCreationMarker(t *testing.T) {
+	namespace := newTestNamespace(t, "ibmcmmp-creation")
+
+	createCases := []struct {
+		name     string
+		creation infrav1.PoolCreation
+		wantErr  string
+	}{
+		{name: "creation_with_cluster_accepted", creation: infrav1.PoolCreationWithCluster},
+		{name: "creation_after_cluster_accepted", creation: infrav1.PoolCreationAfterCluster},
+		{name: "creation_omitted_accepted", creation: ""},
+		{name: "creation_not_in_enum_rejected", creation: "Later", wantErr: `spec.creation: Unsupported value: "Later"`},
+		{name: "creation_is_case_sensitive", creation: "withCluster", wantErr: `spec.creation: Unsupported value: "withCluster"`},
+	}
+	for _, tc := range createCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			obj := newIBMCloudManagedMachinePool(namespace)
+			obj.Spec.Creation = tc.creation
+			expectAPIResult(g, testEnv.Create(ctx, obj), tc.wantErr)
+			if tc.wantErr == "" {
+				stored := &infrav1.IBMCloudManagedMachinePool{}
+				g.Expect(testEnv.GetAPIReader().Get(ctx, client.ObjectKeyFromObject(obj), stored)).To(Succeed())
+				g.Expect(stored.Spec.Creation).To(Equal(tc.creation), "the API server stores the value as sent, without a default")
+			}
+		})
+	}
+
+	updateCases := []struct {
+		name     string
+		from, to infrav1.PoolCreation
+		wantErr  string
+	}{
+		{name: "creation_with_cluster_to_after_cluster_allowed", from: infrav1.PoolCreationWithCluster, to: infrav1.PoolCreationAfterCluster},
+		{name: "creation_after_cluster_to_with_cluster_allowed", from: infrav1.PoolCreationAfterCluster, to: infrav1.PoolCreationWithCluster},
+		{name: "creation_added_allowed", from: "", to: infrav1.PoolCreationWithCluster},
+		{name: "creation_removed_allowed", from: infrav1.PoolCreationWithCluster, to: ""},
+		{name: "creation_changed_to_unknown_value_rejected", from: infrav1.PoolCreationWithCluster, to: "Never",
+			wantErr: `spec.creation: Unsupported value: "Never"`},
+	}
+	for _, tc := range updateCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			obj := newIBMCloudManagedMachinePool(namespace)
+			obj.Spec.Creation = tc.from
+			g.Expect(testEnv.Create(ctx, obj)).To(Succeed())
+			obj.Spec.Creation = tc.to
 			expectAPIResult(g, testEnv.Update(ctx, obj), tc.wantErr)
 		})
 	}

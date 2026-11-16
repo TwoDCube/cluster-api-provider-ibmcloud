@@ -49,6 +49,22 @@ const (
 	EntitlementOCPEntitled Entitlement = "OCPEntitled"
 )
 
+// PoolCreation selects whether IBM creates the pool together with the IBM cluster (the cluster's initial worker pool)
+// or after it. It is an enum, not a bool, because the API linter forbids bools (nobools) and a later way of creating
+// a pool can then be added as a value. The schema has no default marker (KAL), so "omitted means AfterCluster" is
+// implemented in code.
+// +kubebuilder:validation:Enum=WithCluster;AfterCluster
+type PoolCreation string
+
+const (
+	// PoolCreationWithCluster marks the cluster's initial worker pool: CAPIBM sends it in IBM's createCluster request,
+	// so IBM creates it together with the cluster. Exactly one pool of a Cluster has it when the IBM cluster is created.
+	PoolCreationWithCluster PoolCreation = "WithCluster"
+	// PoolCreationAfterCluster creates the pool with its own IBM request once the control plane is initialized;
+	// it is also the meaning of an omitted spec.creation.
+	PoolCreationAfterCluster PoolCreation = "AfterCluster"
+)
+
 // WorkerUpdatePolicy selects when CAPIBM replaces workers for which IBM offers a newer fix pack of the same minor.
 // +kubebuilder:validation:Enum=Manual;Automatic
 type WorkerUpdatePolicy string
@@ -70,14 +86,26 @@ const (
 // removed after creation.
 // +kubebuilder:validation:XValidation:rule="has(self.entitlement) == has(oldSelf.entitlement)",message="entitlement cannot be added or removed after creation"
 type IBMCloudManagedMachinePoolSpec struct {
-	// poolName is the IBM worker pool name, unique within the Cluster. The pool named "default" is created together
-	// with the IBM cluster. Immutable. IBM honours custom names (observed on IBM Cloud); MaxLength stays conservative.
+	// poolName is the IBM worker pool name, unique within the Cluster. CAPIBM finds, sizes and removes the IBM pool by
+	// this name only, whatever spec.creation says. Any valid name works, also for the pool created together with the
+	// IBM cluster. Immutable. IBM honours custom names (observed on IBM Cloud); MaxLength stays conservative.
 	// +required
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=32
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="poolName is immutable"
 	PoolName string `json:"poolName,omitempty"`
+
+	// creation selects the cluster's initial worker pool. WithCluster: IBM creates this pool together with the IBM
+	// cluster (the worker pool of createCluster, named spec.poolName); exactly one IBMCloudManagedMachinePool of the
+	// Cluster must say so before the IBM cluster is created, otherwise the control plane waits
+	// (WaitingForInitialWorkerPool, none) or stops (InvalidConfiguration, several). AfterCluster, also when omitted:
+	// the pool is created once the control plane is initialized. The control plane reads it only until the IBM cluster
+	// exists. Until the control plane is initialized, a WithCluster pool waits for IBM to list it, and finding it is no
+	// adoption (no WorkerPoolAdopted event); afterwards a WithCluster pool is handled like an AfterCluster pool. It never
+	// changes which IBM pool this object manages: that is always the pool named spec.poolName. Mutable.
+	// +optional
+	Creation PoolCreation `json:"creation,omitempty"`
 
 	// flavor is the VPC worker flavor, for example bx2.4x16 (ROKS needs at least 4 vCPU and 16 GB). Immutable:
 	// to change it, add a new pool and delete this one.
@@ -89,8 +117,8 @@ type IBMCloudManagedMachinePoolSpec struct {
 	Flavor string `json:"flavor,omitempty"`
 
 	// zones lists the pool's zones; each must be a zone of the IBMCloudManagedCluster. Immutable in v1alpha1.
-	// For ROKS, give the "default" pool every zone the cluster will ever use: IBM does not extend the router load
-	// balancer to zones added later.
+	// For ROKS, give the WithCluster pool (spec.creation) every zone the cluster will ever use: IBM does not extend the
+	// router load balancer to zones added later.
 	// +required
 	// +listType=map
 	// +listMapKey=name
