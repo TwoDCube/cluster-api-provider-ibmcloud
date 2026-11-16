@@ -1370,3 +1370,75 @@ func TestMachinePoolScopeScaleDownGuardBlocked(t *testing.T) {
 		g.Expect(f.cordoned()).To(Equal([]string{"10.0.0.1", "10.0.0.2"}))
 	})
 }
+
+// TestScaleDownRunner checks how the scale-down parameterises the removal runner it shares with the pool deletion
+// (removal_runner.go): its operation and victims, the cluster state the control plane observed, the resize to the
+// plan's target, and its refusal record on WorkerPoolReady with refusalMessage. The scale-down's flow tests cover the
+// steps themselves.
+func TestScaleDownRunner(t *testing.T) {
+	newScaleDown := func(f *scaleDownFixture, desired int64) *scaleDown {
+		f.t.Helper()
+		scope := f.scope()
+		scope.ControlPlane = f.cp
+		sd, err := scope.newScaleDown(scaleDownInput{clients: &poolClients{kubernetes: f.ibm}, pool: &f.ibmPool, workers: f.workers,
+			desired: desired, workload: workloadNodes{client: f.workload, nodes: readNodes(f.t, f.workload)}})
+		NewWithT(f.t).Expect(err).NotTo(HaveOccurred())
+		return sd
+	}
+	t.Run("a planned scale-down runs on the plan's victims with the resize to its target", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newScaleDownFixture(t, nil)
+		f.cp.Status.State = "unsupported"
+		sd := newScaleDown(f, 1)
+		runner := sd.runner
+		g.Expect(runner.operation).To(Equal(infrav1.WorkerDisruptionOperationScaleDown))
+		g.Expect(runner.victims).To(Equal(sd.plan.Victims))
+		g.Expect(runner.victims).To(HaveLen(2))
+		g.Expect(runner.victimNodes).To(HaveLen(2))
+		g.Expect(runner.clusterState).To(Equal("unsupported"))
+		g.Expect(runner.clusterStateCheck().Allowed).To(BeTrue(), "a shrink is allowed on an unsupported cluster")
+		g.Expect(runner.drain).NotTo(BeNil())
+		g.Expect(runner.drainsNothing).To(BeFalse())
+		g.Expect(runner.call.op).To(Equal(kubernetesservice.OpResizeWorkerPool))
+		g.Expect(runner.call.action).To(Equal("shrinking worker pool workers of IBM cluster " + poolTestClusterID + " to 1 workers per zone"))
+		f.ibm.EXPECT().ResizeWorkerPool(gomock.Any(), poolTestClusterID, poolTestPoolID, int64(1)).Return(nil)
+		g.Expect(runner.call.send(context.Background())).To(Succeed())
+		g.Expect(runner.refusal.condition).To(Equal(infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCondition))
+		g.Expect(runner.refusal.status).To(Equal(metav1.ConditionFalse))
+		g.Expect(runner.refusal.message(ReasonWaitingForClusterMinimum)).To(Equal(refusalMessage(ReasonWaitingForClusterMinimum)))
+	})
+	t.Run("the refusal record needs refusalMessage", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newScaleDownFixture(t, nil)
+		sd := newScaleDown(f, 1)
+		ready := metav1.Condition{Type: infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCondition, Status: metav1.ConditionFalse,
+			Reason: string(ReasonWaitingForClusterMinimum), Message: "scale-down of pool workers removing workers w0, w1: the cluster has " +
+				"4 ready workers; removing 2 would leave 2, below IBM's minimum"}
+		f.pool.Status.Conditions = []metav1.Condition{ready}
+		g.Expect(sd.runner.recordedRefusal()).To(BeEmpty(), "the pre-call gate's capacity hold is no refusal")
+		f.pool.Status.Conditions[0].Message = "scale-down of pool workers removing workers w0, w1: " + refusalMessage(ReasonWaitingForClusterMinimum)
+		g.Expect(sd.runner.recordedRefusal()).To(Equal(ReasonWaitingForClusterMinimum))
+	})
+	t.Run("ResizeOnly drains nothing", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newScaleDownFixture(t, nil)
+		scope := f.scope()
+		scope.ControlPlane = f.cp
+		scope.scaleDownMode = ScaleDownResizeOnly
+		sd, err := scope.newScaleDown(scaleDownInput{clients: &poolClients{kubernetes: f.ibm}, pool: &f.ibmPool, workers: f.workers,
+			desired: 1, workload: workloadNodes{client: f.workload, nodes: readNodes(t, f.workload)}})
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(sd.runner.drainsNothing).To(BeTrue())
+		g.Expect(sd.runner.drain).To(BeNil())
+	})
+	t.Run("a resize without victims has a runner too, for its gate and its call", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newScaleDownFixture(t, nil)
+		f.workers = withState(f.workers, WorkerStateDeleted, "w2", "w3")
+		sd := newScaleDown(f, 1)
+		g.Expect(sd.plan.Victims).To(BeEmpty())
+		g.Expect(sd.runner).NotTo(BeNil())
+		g.Expect(sd.runner.victims).To(BeEmpty())
+		g.Expect(sd.token).To(BeNil(), "no token without victims")
+	})
+}
