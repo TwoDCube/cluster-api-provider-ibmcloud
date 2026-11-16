@@ -43,4 +43,13 @@ type KubernetesService interface {
 	// ListVersions returns the offered Kubernetes and OpenShift versions. SDK GetVersionsWithContext
 	// (GET /v1/versions; the SDK's V2GetVersions decodes the wrong shape).
 	ListVersions(ctx context.Context) (*Versions, error)
+
+	// GetAdminKubeconfig returns the parts of IBM's admin kubeconfig (getKubeconfig?admin=true&format=json): the
+	// server, the CA (IKS only) and the admin client certificate and key. It rejects a user entry that uses a token, an
+	// exec plugin, an auth provider or a password: the admin certificate is the only credential CAPIBM accepts, never a
+	// token or the OpenShift OAuth server. A compat function (compat.go).
+	GetAdminKubeconfig(ctx context.Context, clusterID string) (*AdminKubeconfig, error)
+	// GetCACertificate returns the cluster CA (PEM) and IBM's rotatedAt value. It never returns a credential, so the
+	// ownership proof and the CA re-check may call it. A compat function (compat.go).
+	GetCACertificate(ctx context.Context, clusterID string) (*CACertificate, error)
 }

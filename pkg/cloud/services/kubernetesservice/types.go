@@ -169,6 +169,39 @@ type ReleaseVersion struct {
 	EndOfService string
 }
 
+// AdminKubeconfig holds the parts of IBM's admin kubeconfig that CAPIBM uses. KeyPEM is a cluster-admin private key:
+// never log it; String and GoString redact it.
+type AdminKubeconfig struct {
+	// Server is the kubeconfig's server, which equals the cluster's masterURL (observed on IBM Cloud).
+	Server string
+	// CertificateAuthorityPEM is the cluster CA from certificate-authority-data. IKS: the cluster CA; ROKS: nil,
+	// because the ROKS master serves a publicly trusted certificate (observed on IBM Cloud).
+	CertificateAuthorityPEM []byte
+	// CertificatePEM is client-certificate-data: IBM's admin client certificate (O=ibm-admins, valid two years).
+	CertificatePEM []byte
+	// KeyPEM is client-key-data: the private key of CertificatePEM.
+	KeyPEM []byte
+}
+
+// String describes k without its private key, so that a stray log line cannot leak it.
+func (k AdminKubeconfig) String() string {
+	return fmt.Sprintf("AdminKubeconfig{Server: %q, CertificateAuthorityPEM: %d bytes, CertificatePEM: %d bytes, KeyPEM: <redacted>}",
+		k.Server, len(k.CertificateAuthorityPEM), len(k.CertificatePEM))
+}
+
+// GoString redacts the private key in %#v output as well.
+func (k AdminKubeconfig) GoString() string {
+	return k.String()
+}
+
+// CACertificate is the cluster CA as getCACert returns it.
+type CACertificate struct {
+	// PEM is the CA certificate bundle, decoded from IBM's base64 caCert field.
+	PEM []byte
+	// RotatedAt is IBM's rotatedAt value as text; "" when IBM sends none.
+	RotatedAt string
+}
+
 // entitlementOCPEntitled is the one worker-pool entitlement besides none: the customer brings its own OpenShift
 // license (ROKS only).
 const entitlementOCPEntitled = "ocp_entitled"

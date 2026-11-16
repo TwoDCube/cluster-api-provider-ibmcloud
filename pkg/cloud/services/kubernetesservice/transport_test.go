@@ -18,6 +18,7 @@ package kubernetesservice
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -71,6 +72,23 @@ func limiterCalls(t *testing.T) []limiterCall {
 			answer: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) },
 			call: func(ctx context.Context, s *Service) error {
 				return s.DeleteCluster(ctx, testIKSClusterID, "")
+			},
+		},
+		{
+			// The compat path that bypasses BaseService.Request still waits on the limiter.
+			name:   "GetAdminKubeconfig",
+			answer: reply(http.StatusOK, synthesizeKubeconfig(t, "iks-kubeconfig-shape.json", newTestCredentials(t), kubeconfigOptions{})),
+			call: func(ctx context.Context, s *Service) error {
+				_, err := s.GetAdminKubeconfig(ctx, testIKSClusterID)
+				return err
+			},
+		},
+		{
+			name:   "GetCACertificate",
+			answer: reply(http.StatusOK, []byte(`{"caCert":"`+base64.StdEncoding.EncodeToString(newTestCredentials(t).caPEM)+`","rotatedAt":""}`)),
+			call: func(ctx context.Context, s *Service) error {
+				_, err := s.GetCACertificate(ctx, testIKSClusterID)
+				return err
 			},
 		},
 	}

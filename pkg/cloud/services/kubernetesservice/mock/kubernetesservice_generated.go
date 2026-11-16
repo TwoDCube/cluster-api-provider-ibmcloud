@@ -85,6 +85,36 @@ func (mr *MockKubernetesServiceMockRecorder) DeleteCluster(ctx, clusterID, resou
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteCluster", reflect.TypeOf((*MockKubernetesService)(nil).DeleteCluster), ctx, clusterID, resourceGroupID)
 }
 
+// GetAdminKubeconfig mocks base method.
+func (m *MockKubernetesService) GetAdminKubeconfig(ctx context.Context, clusterID string) (*kubernetesservice.AdminKubeconfig, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetAdminKubeconfig", ctx, clusterID)
+	ret0, _ := ret[0].(*kubernetesservice.AdminKubeconfig)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetAdminKubeconfig indicates an expected call of GetAdminKubeconfig.
+func (mr *MockKubernetesServiceMockRecorder) GetAdminKubeconfig(ctx, clusterID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetAdminKubeconfig", reflect.TypeOf((*MockKubernetesService)(nil).GetAdminKubeconfig), ctx, clusterID)
+}
+
+// GetCACertificate mocks base method.
+func (m *MockKubernetesService) GetCACertificate(ctx context.Context, clusterID string) (*kubernetesservice.CACertificate, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetCACertificate", ctx, clusterID)
+	ret0, _ := ret[0].(*kubernetesservice.CACertificate)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetCACertificate indicates an expected call of GetCACertificate.
+func (mr *MockKubernetesServiceMockRecorder) GetCACertificate(ctx, clusterID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetCACertificate", reflect.TypeOf((*MockKubernetesService)(nil).GetCACertificate), ctx, clusterID)
+}
+
 // GetCluster mocks base method.
 func (m *MockKubernetesService) GetCluster(ctx context.Context, idOrName, resourceGroupID string) (*kubernetesservice.Cluster, error) {
 	m.ctrl.T.Helper()

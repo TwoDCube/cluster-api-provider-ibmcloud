@@ -41,6 +41,10 @@ const (
 	// OpDeleteCluster is KubernetesService.DeleteCluster. It has no operation-specific rows: the delete flow never
 	// treats an answer as terminal and maps the generic classes itself.
 	OpDeleteCluster Operation = "DeleteCluster"
+	// OpGetAdminKubeconfig is KubernetesService.GetAdminKubeconfig.
+	OpGetAdminKubeconfig Operation = "GetAdminKubeconfig"
+	// OpGetCACertificate is KubernetesService.GetCACertificate.
+	OpGetCACertificate Operation = "GetCACertificate"
 )
 
 // ErrorClass is what an error from KubernetesService means for a controller. Each controller decides what to do for
@@ -258,7 +262,7 @@ func callError(op Operation, tracker *callTracker, response *core.DetailedRespon
 		// Nothing reached IBM Cloud Kubernetes Service. A response here is the IAM token service's answer
 		// (go-sdk-core v5.25.3 base_service.go:390-395), so its status says nothing about IKS.
 		if response != nil && credentialsRejected(response.StatusCode) {
-			return fmt.Errorf("%w: %s: the IAM token service answered HTTP %d: %w", ErrCredentialsRejected, op, response.StatusCode, err)
+			return rejectedCredentialsError(op, response.StatusCode, err)
 		}
 		return fmt.Errorf("kubernetesservice: %s: the request was not sent: %w", op, err)
 	}
@@ -266,6 +270,31 @@ func callError(op Operation, tracker *callTracker, response *core.DetailedRespon
 		return newAPIError(op, response)
 	}
 	return fmt.Errorf("kubernetesservice: %s: %w", op, err)
+}
+
+// rejectedCredentialsError is the error of a request the IAM token service refused to authorize.
+//
+// Parameters:
+//   - op is the operation.
+//   - iamStatus is the IAM answer's status.
+//   - err is the authenticator's error.
+func rejectedCredentialsError(op Operation, iamStatus int, err error) error {
+	return fmt.Errorf("%w: %s: the IAM token service answered HTTP %d: %w", ErrCredentialsRejected, op, iamStatus, err)
+}
+
+// authenticationError is the error of a request whose authenticator failed before it was sent, for the compat path
+// that calls the authenticator itself.
+//
+// Parameters:
+//   - op is the operation.
+//   - err is the authenticator's error; go-sdk-core's authenticators return *core.AuthenticationError with the IAM
+//     answer when the token service answered.
+func authenticationError(op Operation, err error) error {
+	var authErr *core.AuthenticationError
+	if errors.As(err, &authErr) && authErr.HTTPProblem != nil && authErr.Response != nil && credentialsRejected(authErr.Response.StatusCode) {
+		return rejectedCredentialsError(op, authErr.Response.StatusCode, err)
+	}
+	return fmt.Errorf("kubernetesservice: %s: the request was not sent: authenticating: %w", op, err)
 }
 
 // credentialsRejected reports whether a status of the IAM token service means that it refused the credentials

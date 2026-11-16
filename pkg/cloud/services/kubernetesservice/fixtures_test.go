@@ -34,6 +34,11 @@ package kubernetesservice
 //     create sequence, sampled every 60 s.
 //   - versions.json: the anonymous versions list of 2026-11-16 (the same ReleaseVersion schema that /v1/versions
 //     returns, a map of "kubernetes" and "openshift" lists).
+//   - {iks,roks}-kubeconfig-shape.json: what the probes recorded about getKubeconfig?admin=true&format=json and
+//     getCACert: the server, whether CA data is present, the user's keys, the admin certificate's subject shape
+//     and validity, and the getCACert keys. They hold no key material; the probe's OpenShift OAuth block was removed
+//     and the certificate fingerprint replaced by a placeholder. The tests synthesize the kubeconfig bodies from
+//     these shapes with certificates generated in the test (compat_test.go).
 
 import (
 	"context"
