@@ -125,13 +125,9 @@ const DeleteLookupGracePeriod = 30 * time.Minute
 // the live probes had distinct URLs); switch to true once both are confirmed.
 const AdoptByEndpointMatch = false
 
-// Create and observe (BuildCreateClusterRequest, IsMasterReady).
-
-// InitialWorkerPoolName is the name of the worker pool CAPIBM embeds into createCluster: the IBMCloudManagedMachinePool
-// with this poolName is the cluster's initial pool, and every pool, this one included, is then adopted by name.
-// Observed on IBM Cloud: IBM honours a custom workerPool.name and names the pool "default" when none is sent, so
-// CAPIBM's convention matches IBM's default.
-const InitialWorkerPoolName = "default"
+// Create and observe (BuildCreateClusterRequest, IsMasterReady). The pool sent in createCluster is the one with
+// spec.creation WithCluster, under its own spec.poolName (IBM was observed to honour a custom workerPool.name), so no
+// pool name is assumed here.
 
 // ROKSWorkerOperatingSystem is the operatingSystem CAPIBM sends for new workers of either distribution: "" means the
 // field is not sent and IBM picks its default. Observed on IBM Cloud: IBM picked UBUNTU_24_64 for IKS 1.36 and RHCOS

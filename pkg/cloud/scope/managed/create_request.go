@@ -56,24 +56,28 @@ func (e *ConfigurationError) Error() string {
 // newest patch (observed on IBM Cloud); the InfraCluster's resource group; the public service endpoint switch; the pod
 // and service subnets of Cluster.spec.clusterNetwork (ValidateClusterNetwork); for OpenShift the COS instance CRN,
 // which IBM requires for a ROKS cluster on VPC, and ocp_entitled when the initial pool is entitled; and the initial
-// worker pool named InitialWorkerPoolName with its flavor, the VPC, the workers per zone (replicas / zones: IBM's
-// workerCount is per zone) and each zone's subnet from the InfraCluster status. Taints, labels and the worker operating
-// system are never sent: IBM picks its default OS (observed on IBM Cloud; ROKSWorkerOperatingSystem).
+// worker pool, named by the pool's own spec.poolName (IBM honours a custom pool name, observed on IBM Cloud), with its
+// flavor, the VPC, the workers per zone (replicas / zones: IBM's workerCount is per zone) and each zone's subnet from
+// the InfraCluster status. Taints, labels and the worker operating system are never sent: IBM picks its default OS
+// (observed on IBM Cloud; ROKSWorkerOperatingSystem).
 //
-// Guards: the replicas must divide by the zones; each zone gets at least MinWorkersPerZoneAtCreate workers (whether
-// IBM's ROKS minimum at create counts per zone or in total is not yet verified against IBM Cloud, so the guard asks for
-// it in every zone); the pool's zones must be InfraCluster zones; an entitlement only for OpenShift; the COS CRN
-// exactly for OpenShift.
+// Guards: the pool has a name; the replicas must divide by the zones; each zone gets at least MinWorkersPerZoneAtCreate
+// workers (whether IBM's ROKS minimum at create counts per zone or in total is not yet verified against IBM Cloud, so
+// the guard asks for it in every zone); the pool's zones must be InfraCluster zones; an entitlement only for OpenShift;
+// the COS CRN exactly for OpenShift. Which pool is the initial one is the caller's choice (withClusterPools: the pool
+// marked spec.creation WithCluster); as a programming-error guard, a pool without spec.creation WithCluster is refused
+// (createRequestInputs), so that no caller can send a pool the user did not mark as the cluster's initial pool.
 //
 // Parameters:
 //   - cp: the IBMCloudManagedControlPlane.
 //   - cluster: its owning CAPI Cluster.
 //   - infra: the Cluster's IBMCloudManagedCluster, provisioned (status.vpc and status.zones resolved).
-//   - pool: the IBMCloudManagedMachinePool of the Cluster whose spec.poolName is InitialWorkerPoolName.
+//   - pool: the IBMCloudManagedMachinePool of the Cluster that is created together with the IBM cluster (the one pool
+//     with spec.creation WithCluster).
 //   - mp: the MachinePool that owns pool; its spec.replicas is the pool's total size.
 //
-// It returns a *ConfigurationError listing every problem the user must fix, or another error when an input is missing,
-// the pool is not the initial pool, or the InfraCluster has not resolved the VPC or a zone of the pool yet.
+// It returns a *ConfigurationError listing every problem the user must fix, or another error when an input is missing
+// or the InfraCluster has not resolved the VPC or a zone of the pool yet.
 func BuildCreateClusterRequest(cp *controlplanev1.IBMCloudManagedControlPlane, cluster *clusterv1.Cluster,
 	infra *infrav1.IBMCloudManagedCluster, pool *infrav1.IBMCloudManagedMachinePool, mp *clusterv1.MachinePool,
 ) (kubernetesservice.CreateClusterRequest, error) {
@@ -97,6 +101,13 @@ func BuildCreateClusterRequest(cp *controlplanev1.IBMCloudManagedControlPlane, c
 	problems = append(problems, entitlementProblems...)
 	perZone, sizeProblems := createRequestWorkersPerZone(d, pool, mp)
 	problems = append(problems, sizeProblems...)
+	if pool.Spec.PoolName == "" {
+		// The CRD requires the name; the guard keeps the mapping safe on its own. Without a name IBM would call the
+		// pool "default" (observed on IBM Cloud), and the pool controller, which finds pools by spec.poolName, would
+		// never find it.
+		problems = append(problems, fmt.Sprintf("IBMCloudManagedMachinePool %s has no spec.poolName; set the IBM worker "+
+			"pool name, for example default", pool.Name))
+	}
 	if pool.Spec.Flavor == "" {
 		problems = append(problems, fmt.Sprintf("IBMCloudManagedMachinePool %s has no spec.flavor; set a VPC worker "+
 			"flavor such as bx2.4x16", pool.Name))
@@ -131,7 +142,7 @@ func BuildCreateClusterRequest(cp *controlplanev1.IBMCloudManagedControlPlane, c
 		COSInstanceCRN:               cos,
 		DefaultWorkerPoolEntitlement: entitlement,
 		WorkerPool: kubernetesservice.InitialWorkerPool{
-			Name:               InitialWorkerPoolName,
+			Name:               pool.Spec.PoolName,
 			Flavor:             pool.Spec.Flavor,
 			VPCID:              infra.Status.VPC.ID,
 			WorkerCountPerZone: perZone,
@@ -140,9 +151,9 @@ func BuildCreateClusterRequest(cp *controlplanev1.IBMCloudManagedControlPlane, c
 	}, nil
 }
 
-// createRequestInputs returns an error when an input of BuildCreateClusterRequest is missing, when pool is not the
-// initial pool, or when the InfraCluster has not resolved its VPC: these are the caller's to fix or wait for, not the
-// user's.
+// createRequestInputs returns an error when an input of BuildCreateClusterRequest is missing, when the pool is not the
+// one marked as the cluster's initial pool, or when the InfraCluster has not resolved its VPC: these are the caller's
+// to fix or wait for, not the user's.
 //
 // Parameters: the inputs of BuildCreateClusterRequest.
 func createRequestInputs(cp *controlplanev1.IBMCloudManagedControlPlane, cluster *clusterv1.Cluster,
@@ -157,16 +168,37 @@ func createRequestInputs(cp *controlplanev1.IBMCloudManagedControlPlane, cluster
 		return errors.New("BuildCreateClusterRequest needs the Cluster's IBMCloudManagedCluster; got nil")
 	case pool == nil:
 		return errors.New("BuildCreateClusterRequest needs the initial IBMCloudManagedMachinePool; got nil")
+	case pool.Spec.Creation != infrav1.PoolCreationWithCluster:
+		// The spec.creation marker, not the pool name, selects the initial pool; the caller selects it with
+		// withClusterPools, so an unmarked pool here is a caller bug. The pool name is not compared, because IBM
+		// honours any valid name for the cluster's first pool.
+		return fmt.Errorf("BuildCreateClusterRequest needs the IBMCloudManagedMachinePool marked spec.creation: %s; "+
+			"%s has spec.creation %q", infrav1.PoolCreationWithCluster, pool.Name, pool.Spec.Creation)
 	case mp == nil:
 		return errors.New("BuildCreateClusterRequest needs the MachinePool that owns the initial pool; got nil")
-	case pool.Spec.PoolName != InitialWorkerPoolName:
-		return fmt.Errorf("IBMCloudManagedMachinePool %s has spec.poolName %q; BuildCreateClusterRequest takes the "+
-			"initial pool, whose spec.poolName is %q", pool.Name, pool.Spec.PoolName, InitialWorkerPoolName)
 	case infra.Status.VPC.ID == "":
 		return fmt.Errorf("IBMCloudManagedCluster %s has not resolved its VPC (status.vpc.id); wait until "+
 			"status.initialization.provisioned is true", infra.Name)
 	}
 	return nil
+}
+
+// withClusterPools returns the pools that ask to be created together with the IBM cluster: spec.creation WithCluster
+// and not being deleted. An omitted spec.creation means AfterCluster. The caller creates the IBM cluster only when
+// exactly one pool is returned; the pool's name plays no part in the choice, so any valid spec.poolName works for it
+// (IBM honours a custom name for the cluster's first pool, observed on IBM Cloud). The result keeps the order of pools
+// and points into it.
+//
+// Parameters:
+//   - pools are the IBMCloudManagedMachinePools of one Cluster (its cluster-name label).
+func withClusterPools(pools []infrav1.IBMCloudManagedMachinePool) []*infrav1.IBMCloudManagedMachinePool {
+	var selected []*infrav1.IBMCloudManagedMachinePool
+	for i := range pools {
+		if pools[i].Spec.Creation == infrav1.PoolCreationWithCluster && pools[i].DeletionTimestamp.IsZero() {
+			selected = append(selected, &pools[i])
+		}
+	}
+	return selected
 }
 
 // createRequestZones maps the pool's zones to the subnets the InfraCluster resolved. It returns the zones, the problems

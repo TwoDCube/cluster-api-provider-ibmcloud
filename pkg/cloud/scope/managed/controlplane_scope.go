@@ -809,27 +809,25 @@ func (s *ControlPlaneScope) createCluster(ctx context.Context, name string) Outc
 	return s.created(name, result)
 }
 
-// initialPool returns the IBMCloudManagedMachinePool of the Cluster whose spec.poolName is InitialWorkerPoolName and the
-// MachinePool that owns it; IBM creates that pool with the cluster. ok is false when the outcome says to
-// wait (no such pool, or CAPI has not linked it to its MachinePool yet; the pool watch brings the control plane back)
-// or to stop (more than one). ctx is the reconcile context.
+// initialPool returns the IBMCloudManagedMachinePool of the Cluster that is created together with the IBM cluster (the
+// one pool with spec.creation WithCluster, withClusterPools) and the MachinePool that owns it. ok is false when the
+// outcome says to wait (no such pool, or CAPI has not linked it to its MachinePool yet) or to stop (more than one);
+// neither makes an IBM call. The pool watch brings the control plane back when a pool is added, linked or re-marked
+// (machinePoolToControlPlane). It runs only for binding row 10, after the binding lookup, so the marker never changes
+// which IBM cluster the control plane stands for. ctx is the reconcile context.
 func (s *ControlPlaneScope) initialPool(ctx context.Context) (*infrav1.IBMCloudManagedMachinePool, *clusterv1.MachinePool, Outcome, bool) {
 	pools := &infrav1.IBMCloudManagedMachinePoolList{}
 	if err := s.params.Client.List(ctx, pools, client.InNamespace(s.Cluster.Namespace),
 		client.MatchingLabels{clusterv1.ClusterNameLabel: s.Cluster.Name}); err != nil {
 		return nil, nil, Transient(fmt.Errorf("listing the IBMCloudManagedMachinePools of Cluster %s: %w", s.Cluster.Name, err)), false
 	}
-	var initial []*infrav1.IBMCloudManagedMachinePool
-	for i := range pools.Items {
-		if pools.Items[i].Spec.PoolName == InitialWorkerPoolName && pools.Items[i].DeletionTimestamp.IsZero() {
-			initial = append(initial, &pools.Items[i])
-		}
-	}
+	initial := withClusterPools(pools.Items)
 	waiting := controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInitialWorkerPoolReason
 	switch len(initial) {
 	case 0:
-		return nil, nil, s.wait(waiting, fmt.Sprintf("No IBMCloudManagedMachinePool with spec.poolName %q belongs to Cluster %s; "+
-			"the first pool is created with the cluster", InitialWorkerPoolName, s.Cluster.Name)), false
+		return nil, nil, s.wait(waiting, fmt.Sprintf("No IBMCloudManagedMachinePool of Cluster %s has spec.creation: %s; "+
+			"mark exactly one pool, it is created together with the IBM cluster", s.Cluster.Name,
+			infrav1.PoolCreationWithCluster)), false
 	case 1:
 	default:
 		names := make([]string, 0, len(initial))
@@ -838,8 +836,10 @@ func (s *ControlPlaneScope) initialPool(ctx context.Context) (*infrav1.IBMCloudM
 		}
 		slices.Sort(names)
 		return nil, nil, s.notProvisioned(controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason,
-			fmt.Sprintf("IBMCloudManagedMachinePools %s of Cluster %s all have spec.poolName %q; IBM creates the cluster with one "+
-				"initial pool, so keep only one of them", strings.Join(names, ", "), s.Cluster.Name, InitialWorkerPoolName)), false
+			fmt.Sprintf("IBMCloudManagedMachinePools %s of Cluster %s all have spec.creation: %s; IBM creates the cluster with "+
+				"one initial pool, so keep exactly one of them %s and set spec.creation: %s on the others (or omit it)",
+				strings.Join(names, ", "), s.Cluster.Name, infrav1.PoolCreationWithCluster,
+				infrav1.PoolCreationWithCluster, infrav1.PoolCreationAfterCluster)), false
 	}
 	pool := initial[0]
 	mp, err := util.GetOwnerMachinePool(ctx, s.params.Client, pool.ObjectMeta)

@@ -38,6 +38,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/clock"
 	clocktesting "k8s.io/utils/clock/testing"
 	"k8s.io/utils/ptr"
@@ -48,8 +49,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/config"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllertest"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	clusterctlv1 "sigs.k8s.io/cluster-api/cmd/clusterctl/api/v1alpha3"
@@ -938,6 +943,88 @@ func TestControlPlaneMapFunctions(t *testing.T) {
 		f := newCPFixture(t, objs)
 		g.Expect(f.r.machinePoolToControlPlane(ctx, poolOf(cpTestName))).To(BeEmpty())
 	})
+
+	// The pool created with the cluster is chosen by spec.creation, so re-marking a pool must reach a control plane that
+	// waits for its initial pool (WaitingForInitialWorkerPool, or InvalidConfiguration with its 15-minute
+	// terminalRecheck) at once. The watch has no predicate and the map reads only the cluster-name label, so the handler
+	// the watch uses enqueues every spec.creation change and the deletion of a marked pool, with the same filter as any
+	// pool event: only a control plane without status.clusterID or one being deleted is woken.
+	creationEdits := []struct {
+		name     string
+		from, to infrav1.PoolCreation
+	}{
+		{name: "is marked WithCluster", from: "", to: infrav1.PoolCreationWithCluster},
+		{name: "moves from WithCluster to AfterCluster", from: infrav1.PoolCreationWithCluster, to: infrav1.PoolCreationAfterCluster},
+		{name: "loses its WithCluster marker", from: infrav1.PoolCreationWithCluster, to: ""},
+	}
+	for _, state := range []struct {
+		name  string
+		setup func(objs *cpObjects)
+		wake  bool
+	}{
+		{name: "waits for its initial pool", setup: func(*cpObjects) {}, wake: true},
+		{name: "is bound", setup: func(objs *cpObjects) { objs.cp.Status.ClusterID = cpIKSClusterID }},
+		{name: "is bound and being deleted", wake: true, setup: func(objs *cpObjects) {
+			objs.cp.Status.ClusterID = cpIKSClusterID
+			objs.cp.DeletionTimestamp = ptr.To(metav1.NewTime(cpTestStart))
+		}},
+	} {
+		objs := newCPObjects()
+		state.setup(objs)
+		f := newCPFixture(t, objs)
+		enqueue := handler.EnqueueRequestsFromMapFunc(f.r.machinePoolToControlPlane)
+		verb := "wakes"
+		if !state.wake {
+			verb = "does not wake"
+		}
+		expectWoken := func(g Gomega, queue *controllertest.Queue) {
+			if state.wake {
+				g.Expect(queuedRequests(queue)).To(Equal(want))
+				return
+			}
+			g.Expect(queuedRequests(queue)).To(BeEmpty())
+		}
+		for _, edit := range creationEdits {
+			t.Run(fmt.Sprintf("a pool that %s %s a control plane that %s", edit.name, verb, state.name), func(t *testing.T) {
+				g := NewWithT(t)
+				before := poolOf(cpTestName)
+				before.Spec.Creation, before.ResourceVersion = edit.from, "1"
+				after := before.DeepCopy()
+				after.Spec.Creation, after.ResourceVersion = edit.to, "2"
+				queue := newTestQueue(t)
+				enqueue.Update(ctx, event.UpdateEvent{ObjectOld: before, ObjectNew: after}, queue)
+				expectWoken(g, queue)
+			})
+		}
+		t.Run(fmt.Sprintf("a deleted WithCluster pool %s a control plane that %s", verb, state.name), func(t *testing.T) {
+			g := NewWithT(t)
+			pool := poolOf(cpTestName)
+			pool.Spec.Creation = infrav1.PoolCreationWithCluster
+			queue := newTestQueue(t)
+			enqueue.Delete(ctx, event.DeleteEvent{Object: pool}, queue)
+			expectWoken(g, queue)
+		})
+	}
+}
+
+// newTestQueue returns a synchronous work queue for calling an event handler directly; it is shut down when the test
+// ends. t is the test.
+func newTestQueue(t *testing.T) *controllertest.Queue {
+	t.Helper()
+	queue := &controllertest.Queue{TypedInterface: workqueue.NewTyped[reconcile.Request]()}
+	t.Cleanup(queue.ShutDown)
+	return queue
+}
+
+// queuedRequests drains queue and returns the requests in the order they were added. queue is the test queue.
+func queuedRequests(queue *controllertest.Queue) []reconcile.Request {
+	var requests []reconcile.Request
+	for queue.Len() > 0 {
+		request, _ := queue.Get()
+		queue.Done(request)
+		requests = append(requests, request)
+	}
+	return requests
 }
 
 func TestControlPlaneReconcilerValidate(t *testing.T) {
@@ -1376,29 +1463,58 @@ func TestControlPlaneReconcilerSetupWithManager(t *testing.T) {
 // cpTestPoolName names the initial pool and its MachinePool in the create tests.
 const cpTestPoolName = "dev-default"
 
-// withInitialPool adds the initial IBMCloudManagedMachinePool (two zones) and its MachinePool (replicas 2) to objs, linked
-// by the owner reference CAPI sets.
+// withInitialPool adds the initial IBMCloudManagedMachinePool of the templates (poolName default, spec.creation
+// WithCluster, two zones) and its MachinePool (replicas 2) to objs, linked by the owner reference CAPI sets. The
+// MachinePool is objs.extra[0] and the pool objs.extra[1] when objs had no extra objects before.
 func withInitialPool(objs *cpObjects) {
+	withPool(objs, cpTestPoolName, "default", infrav1.PoolCreationWithCluster)
+}
+
+// withPool adds an IBMCloudManagedMachinePool of the test Cluster (two zones) and its MachinePool (replicas 2) to objs,
+// linked by the owner reference CAPI sets; the MachinePool comes first.
+//
+// Parameters:
+//   - objs are the objects of the test.
+//   - name names both objects.
+//   - poolName is the pool's spec.poolName.
+//   - creation is the pool's spec.creation ("" leaves it omitted).
+func withPool(objs *cpObjects, name, poolName string, creation infrav1.PoolCreation) {
 	mp := &clusterv1.MachinePool{
-		ObjectMeta: metav1.ObjectMeta{Namespace: cpTestNamespace, Name: cpTestPoolName, UID: "machinepool-uid",
+		ObjectMeta: metav1.ObjectMeta{Namespace: cpTestNamespace, Name: name, UID: types.UID("machinepool-uid-" + name),
 			Labels: map[string]string{clusterv1.ClusterNameLabel: cpTestName}},
 		Spec: clusterv1.MachinePoolSpec{ClusterName: cpTestName, Replicas: ptr.To[int32](2)},
 	}
 	pool := &infrav1.IBMCloudManagedMachinePool{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: cpTestNamespace, Name: cpTestPoolName,
+			Namespace: cpTestNamespace, Name: name,
 			Labels: map[string]string{clusterv1.ClusterNameLabel: cpTestName},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: clusterv1.GroupVersion.String(), Kind: "MachinePool", Name: mp.Name, UID: mp.UID,
 			}},
 		},
 		Spec: infrav1.IBMCloudManagedMachinePoolSpec{
-			PoolName: managedscope.InitialWorkerPoolName,
+			PoolName: poolName,
+			Creation: creation,
 			Flavor:   "bx2.4x16",
 			Zones:    []infrav1.WorkerPoolZone{{Name: "us-south-1"}, {Name: "us-south-2"}},
 		},
 	}
 	objs.extra = append(objs.extra, mp, pool)
+}
+
+// setPoolCreation changes spec.creation of the stored IBMCloudManagedMachinePool name, as a user's edit between two
+// reconciles would.
+//
+// Parameters:
+//   - name is the pool's object name.
+//   - creation is the new spec.creation ("" removes it).
+func (f *cpFixture) setPoolCreation(name string, creation infrav1.PoolCreation) {
+	f.t.Helper()
+	g := NewWithT(f.t)
+	pool := &infrav1.IBMCloudManagedMachinePool{}
+	g.Expect(f.client.Get(ctx, types.NamespacedName{Namespace: cpTestNamespace, Name: name}, pool)).To(Succeed())
+	pool.Spec.Creation = creation
+	g.Expect(f.client.Update(ctx, pool)).To(Succeed())
 }
 
 // cpOfferedVersions are the versions IBM offers in the create tests.
@@ -1739,6 +1855,235 @@ func TestControlPlaneCreate(t *testing.T) {
 		g.Expect(cp.Status.CreateIntent.FirstUnknownOutcomeTime.Time).To(BeTemporally("==", cpTestStart))
 	})
 
+	t.Run("the WithCluster pool is sent under its own name whatever the other pools are called", func(t *testing.T) {
+		g := NewWithT(t)
+		objs := newCPObjects()
+		// The marker selects the pool, not the name; a pool named default without it is created later.
+		withPool(objs, "dev-default", "default", "")
+		withPool(objs, "dev-gpu", "gpu", infrav1.PoolCreationAfterCluster)
+		withPool(objs, "dev-workers-a", "workers-a", infrav1.PoolCreationWithCluster)
+		objs.extra[4].(*clusterv1.MachinePool).Spec.Replicas = ptr.To[int32](4)
+		f := newCPFixture(t, objs)
+		var sent kubernetesservice.CreateClusterRequest
+		gomock.InOrder(
+			f.expectLookupByName(nil),
+			f.kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil),
+			f.expectCreate(&kubernetesservice.CreateClusterResult{ClusterID: cpIKSClusterID}, nil).
+				Do(func(_ context.Context, req kubernetesservice.CreateClusterRequest) { sent = req }),
+		)
+
+		_, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(sent.WorkerPool.Name).To(Equal("workers-a"), "IBM honours the custom pool name")
+		g.Expect(sent.WorkerPool.WorkerCountPerZone).To(Equal(int64(2)), "4 replicas of the workers-a MachinePool over 2 zones")
+		g.Expect(f.controlPlane().Status.ClusterID).To(Equal(cpIKSClusterID))
+	})
+
+	// Two pools, neither marked (one omits spec.creation, one says AfterCluster), make the control plane wait without
+	// any IBM call besides the binding lookup; once one of them is marked, the next reconcile creates the cluster with
+	// that pool. That the pool watch brings this reconcile at once, not at the next clusterProvisioningPoll, is proven by
+	// TestControlPlaneEnvtestCreationMarkerWakesTheControlPlane.
+	t.Run("marking one of two waiting pools creates the cluster with it", func(t *testing.T) {
+		g := NewWithT(t)
+		objs := newCPObjects()
+		withPool(objs, cpTestPoolName, "default", "")
+		withPool(objs, "dev-gpu", "gpu", infrav1.PoolCreationAfterCluster)
+		f := newCPFixture(t, objs)
+		f.expectLookupByName(nil) // no ListVersions and no CreateCluster expectation: gomock fails the test on either
+
+		result, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		expectRequeue(g, result, time.Minute)
+		cp := f.controlPlane()
+		g.Expect(cp.Status.CreateIntent).To(BeZero(), "nothing is recorded while no pool is marked")
+		condition := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, metav1.ConditionFalse,
+			controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInitialWorkerPoolReason)
+		g.Expect(condition.Message).To(Equal(cpNoWithClusterPoolMessage))
+
+		f.setPoolCreation("dev-gpu", infrav1.PoolCreationWithCluster)
+		var sent kubernetesservice.CreateClusterRequest
+		gomock.InOrder(
+			f.expectLookupByName(nil),
+			f.kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil),
+			f.expectCreate(&kubernetesservice.CreateClusterResult{ClusterID: cpIKSClusterID}, nil).
+				Do(func(_ context.Context, req kubernetesservice.CreateClusterRequest) { sent = req }),
+		)
+		_, err = f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(sent.WorkerPool.Name).To(Equal("gpu"), "the marked pool, not the one named default")
+		g.Expect(f.controlPlane().Status.ClusterID).To(Equal(cpIKSClusterID))
+	})
+
+	// Pools b and a both marked stop the create with InvalidConfiguration naming them, sorted, and an unmarked pool is
+	// not named; no IBM call besides the binding lookup. Once the marker is removed from b, the next reconcile creates the
+	// cluster with a.
+	t.Run("two marked pools stop the create until the marker is removed from one", func(t *testing.T) {
+		g := NewWithT(t)
+		objs := newCPObjects()
+		withPool(objs, "dev-b", "workers-b", infrav1.PoolCreationWithCluster)
+		withPool(objs, "dev-other", "other", "")
+		withPool(objs, "dev-a", "workers-a", infrav1.PoolCreationWithCluster)
+		f := newCPFixture(t, objs)
+		f.expectLookupByName(nil) // no ListVersions and no CreateCluster expectation: gomock fails the test on either
+
+		result, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		expectRequeue(g, result, 15*time.Minute)
+		cp := f.controlPlane()
+		g.Expect(cp.Status.CreateIntent).To(BeZero(), "nothing is recorded while several pools are marked")
+		condition := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, metav1.ConditionFalse,
+			controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason)
+		g.Expect(condition.Message).To(Equal("IBMCloudManagedMachinePools dev-a, dev-b of Cluster dev all have spec.creation: " +
+			"WithCluster; IBM creates the cluster with one initial pool, so keep exactly one of them WithCluster and set " +
+			"spec.creation: AfterCluster on the others (or omit it)"))
+
+		f.setPoolCreation("dev-b", "")
+		var sent kubernetesservice.CreateClusterRequest
+		gomock.InOrder(
+			f.expectLookupByName(nil),
+			f.kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil),
+			f.expectCreate(&kubernetesservice.CreateClusterResult{ClusterID: cpIKSClusterID}, nil).
+				Do(func(_ context.Context, req kubernetesservice.CreateClusterRequest) { sent = req }),
+		)
+		_, err = f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(sent.WorkerPool.Name).To(Equal("workers-a"))
+		g.Expect(f.controlPlane().Status.ClusterID).To(Equal(cpIKSClusterID))
+	})
+
+	// The control plane reads spec.creation only until the IBM cluster exists. A second WithCluster pool added to a
+	// bound control plane, and the marker removed from the initial pool, change no condition and send no create (no
+	// InvalidConfiguration, no WaitingForInitialWorkerPool); the pool controller creates the new pool like an
+	// AfterCluster pool (TestMachinePoolScopeCreatesThePool).
+	t.Run("markers changed after the IBM cluster exists change nothing", func(t *testing.T) {
+		g := NewWithT(t)
+		objs := newCPObjects()
+		objs.cp.Status.ClusterID = cpIKSClusterID
+		withInitialPool(objs)
+		f := newCPFixture(t, objs)
+		// Only the observation by ID, once per reconcile: gomock fails the test on a lookup, ListVersions or CreateCluster.
+		f.kube.EXPECT().GetCluster(gomock.Any(), cpIKSClusterID, "").Return(cpCluster("normal"), nil).Times(2)
+		_, err := f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+		before := f.controlPlane()
+		f.events()
+
+		added := &cpObjects{}
+		withPool(added, "dev-gpu", "gpu", infrav1.PoolCreationWithCluster)
+		for _, obj := range added.extra {
+			g.Expect(f.client.Create(ctx, obj)).To(Succeed())
+		}
+		f.setPoolCreation(cpTestPoolName, "")
+		_, err = f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		after := f.controlPlane()
+		g.Expect(after.Status.Conditions).To(Equal(before.Status.Conditions))
+		g.Expect(after.Status.ClusterID).To(Equal(cpIKSClusterID))
+		g.Expect(after.Status.CreateIntent).To(BeZero())
+		g.Expect(f.events()).To(BeEmpty())
+	})
+
+	// spec.creation only shapes the create request. The binding of a create whose response was lost rests on the
+	// cluster name and the intent's time window (DecideBinding row 6, untouched), and pools are found by name, so
+	// moving, removing or doubling the marker before the retry neither changes the binding nor sends a second create.
+	// The pool side (each object touches only the IBM pool its poolName names) is
+	// TestMachinePoolScopeMarkerMovedBetweenCreateAttempts.
+	for _, tc := range []struct {
+		name string
+		edit func(f *cpFixture)
+	}{
+		{name: "marker moved to another pool", edit: func(f *cpFixture) {
+			f.setPoolCreation(cpTestPoolName, infrav1.PoolCreationAfterCluster)
+			other := &cpObjects{}
+			withPool(other, "dev-workers", "workers", infrav1.PoolCreationWithCluster)
+			for _, obj := range other.extra {
+				NewWithT(f.t).Expect(f.client.Create(ctx, obj)).To(Succeed())
+			}
+		}},
+		{name: "marker removed", edit: func(f *cpFixture) { f.setPoolCreation(cpTestPoolName, "") }},
+		{name: "marker set on a second pool", edit: func(f *cpFixture) {
+			other := &cpObjects{}
+			withPool(other, "dev-workers", "workers", infrav1.PoolCreationWithCluster)
+			for _, obj := range other.extra {
+				NewWithT(f.t).Expect(f.client.Create(ctx, obj)).To(Succeed())
+			}
+		}},
+	} {
+		t.Run("a lost create is still bound after the "+tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			objs := newCPObjects()
+			withInitialPool(objs)
+			f := newCPFixture(t, objs)
+			gomock.InOrder(
+				f.expectLookupByName(nil),
+				f.kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil),
+				f.expectCreate(nil, createTimeoutErr),
+			)
+			_, err := f.reconcile()
+			g.Expect(err).To(HaveOccurred(), "the create's response was lost")
+
+			tc.edit(f)
+			// The retry, inside the read-after-create window: the lookup finds the cluster the lost create made.
+			f.clock.SetTime(cpTestStart.Add(time.Minute))
+			f.expectLookupByName(cpCluster("deploying")) // no CreateCluster expectation: gomock fails the test if it is called
+			_, err = f.reconcile()
+
+			g.Expect(err).NotTo(HaveOccurred())
+			cp := f.controlPlane()
+			g.Expect(cp.Status.ClusterID).To(Equal(cpIKSClusterID), "row 6 binds the cluster of the lost create")
+			provisioned := conditions.Get(cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition)
+			g.Expect(provisioned).NotTo(BeNil())
+			g.Expect(provisioned.Reason).NotTo(BeElementOf(
+				controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInitialWorkerPoolReason,
+				controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason),
+				"the marker is not read once a cluster is bound: %s", provisioned.Message)
+		})
+	}
+
+	// The E0007 path: after attempt 1 (pool default) timed out, the marker moved to pool b (poolName workers), and
+	// attempt 2, sent after attempt 1's read-after-create window while IBM still listed nothing, carries b. IBM refuses
+	// it with E0007, the lookup then finds attempt 1's cluster, and row 6 binds it over attempt 1. IBM pool default
+	// stays object a's, found by name (TestMachinePoolScopeMarkerMovedBetweenCreateAttempts).
+	t.Run("marker moved, then attempt 2 gets E0007 and attempt 1 is bound", func(t *testing.T) {
+		g := NewWithT(t)
+		objs := newCPObjects()
+		withInitialPool(objs)
+		f := newCPFixture(t, objs)
+		gomock.InOrder(
+			f.expectLookupByName(nil),
+			f.kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil),
+			f.expectCreate(nil, createTimeoutErr),
+		)
+		_, err := f.reconcile()
+		g.Expect(err).To(HaveOccurred(), "attempt 1 timed out")
+
+		f.setPoolCreation(cpTestPoolName, infrav1.PoolCreationAfterCluster)
+		moved := &cpObjects{}
+		withPool(moved, "dev-workers", "workers", infrav1.PoolCreationWithCluster)
+		for _, obj := range moved.extra {
+			g.Expect(f.client.Create(ctx, obj)).To(Succeed())
+		}
+		f.clock.SetTime(cpTestStart.Add(6 * time.Minute))
+		var sent kubernetesservice.CreateClusterRequest
+		gomock.InOrder(
+			f.expectLookupByName(nil),
+			f.expectCreate(nil, ibmError(kubernetesservice.OpCreateCluster, http.StatusConflict, "E0007")).
+				Do(func(_ context.Context, req kubernetesservice.CreateClusterRequest) { sent = req }),
+			f.expectLookupByName(cpCluster("deploying")),
+		)
+		_, err = f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(sent.WorkerPool.Name).To(Equal("workers"), "attempt 2 carried the newly marked pool")
+		g.Expect(f.controlPlane().Status.ClusterID).To(Equal(cpIKSClusterID), "row 6: attempt 1 created it")
+	})
+
 	t.Run("the next create goes out only after the terminal recheck", func(t *testing.T) {
 		g := NewWithT(t)
 		objs := newCPObjects()
@@ -1915,6 +2260,13 @@ func TestCreateHoldsEndBeforeTheirRecheck(t *testing.T) {
 	g.Expect(managedscope.CreateRefusalHold).To(BeNumerically(">", managedscope.CreateUnauthorizedHold))
 }
 
+// cpNoWithClusterPoolMessage is the IBMClusterProvisioned message of a Cluster without a WithCluster pool.
+const cpNoWithClusterPoolMessage = "No IBMCloudManagedMachinePool of Cluster dev has spec.creation: WithCluster; mark exactly one " +
+	"pool, it is created together with the IBM cluster"
+
+// TestControlPlaneCreateWaitsAndGuards covers the checks before a create. No case reaches CreateCluster or records an
+// intent: after the binding lookup (row 10) the initial pool selection and the request guards make no IBM call, and
+// only the version check lists the offered versions; gomock fails a case on any IBM call it does not expect.
 func TestControlPlaneCreateWaitsAndGuards(t *testing.T) {
 	testCases := []struct {
 		name        string
@@ -1925,11 +2277,58 @@ func TestControlPlaneCreateWaitsAndGuards(t *testing.T) {
 		wantMessage string
 	}{
 		{
-			name:        "no initial pool waits",
+			name:        "no pool waits for the initial pool",
 			expect:      func(f *cpFixture) { f.expectLookupByName(nil) },
 			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInitialWorkerPoolReason,
 			wantRequeue: time.Minute,
-			wantMessage: `No IBMCloudManagedMachinePool with spec.poolName "default" belongs to Cluster dev; the first pool is created with the cluster`,
+			wantMessage: cpNoWithClusterPoolMessage,
+		},
+		{
+			// The name is no longer a convention; a pool named default needs the marker as well.
+			name: "a pool named default without spec.creation waits",
+			setup: func(objs *cpObjects) {
+				withPool(objs, cpTestPoolName, "default", "")
+			},
+			expect:      func(f *cpFixture) { f.expectLookupByName(nil) },
+			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInitialWorkerPoolReason,
+			wantRequeue: time.Minute,
+			wantMessage: cpNoWithClusterPoolMessage,
+		},
+		{
+			// One pool omits spec.creation, the other says AfterCluster.
+			name: "two pools, neither marked, wait for the initial pool",
+			setup: func(objs *cpObjects) {
+				withPool(objs, cpTestPoolName, "default", "")
+				withPool(objs, "dev-gpu", "gpu", infrav1.PoolCreationAfterCluster)
+			},
+			expect:      func(f *cpFixture) { f.expectLookupByName(nil) },
+			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInitialWorkerPoolReason,
+			wantRequeue: time.Minute,
+			wantMessage: cpNoWithClusterPoolMessage,
+		},
+		{
+			name: "a deleting WithCluster pool is not the initial pool",
+			setup: func(objs *cpObjects) {
+				withInitialPool(objs)
+				pool := objs.extra[1].(*infrav1.IBMCloudManagedMachinePool)
+				pool.Finalizers = []string{infrav1.IBMCloudManagedMachinePoolFinalizer}
+				pool.DeletionTimestamp = ptr.To(metav1.NewTime(cpTestStart))
+			},
+			expect:      func(f *cpFixture) { f.expectLookupByName(nil) },
+			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInitialWorkerPoolReason,
+			wantRequeue: time.Minute,
+			wantMessage: cpNoWithClusterPoolMessage,
+		},
+		{
+			name: "a WithCluster pool of another Cluster does not count",
+			setup: func(objs *cpObjects) {
+				withInitialPool(objs)
+				objs.extra[1].SetLabels(map[string]string{clusterv1.ClusterNameLabel: "other"})
+			},
+			expect:      func(f *cpFixture) { f.expectLookupByName(nil) },
+			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInitialWorkerPoolReason,
+			wantRequeue: time.Minute,
+			wantMessage: cpNoWithClusterPoolMessage,
 		},
 		{
 			name: "a pool CAPI has not linked yet waits",
@@ -1940,20 +2339,6 @@ func TestControlPlaneCreateWaitsAndGuards(t *testing.T) {
 			expect:      func(f *cpFixture) { f.expectLookupByName(nil) },
 			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInitialWorkerPoolReason,
 			wantRequeue: time.Minute,
-		},
-		{
-			name: "two initial pools are InvalidConfiguration",
-			setup: func(objs *cpObjects) {
-				withInitialPool(objs)
-				second := objs.extra[1].DeepCopyObject().(*infrav1.IBMCloudManagedMachinePool)
-				second.Name = "dev-other"
-				objs.extra = append(objs.extra, second)
-			},
-			expect:      func(f *cpFixture) { f.expectLookupByName(nil) },
-			wantReason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason,
-			wantRequeue: 15 * time.Minute,
-			wantMessage: `IBMCloudManagedMachinePools dev-default, dev-other of Cluster dev all have spec.poolName "default"; IBM creates ` +
-				"the cluster with one initial pool, so keep only one of them",
 		},
 		{
 			name: "a configuration IBM would refuse is caught without an IBM mutation",
@@ -2262,4 +2647,72 @@ func TestControlPlaneEnvtestCreateRefusalSendsOneCreate(t *testing.T) {
 			g.Expect(invalidated).To(BeNumerically("<=", 1), "a 401 rebuilds the authenticator once, not on every pass")
 		})
 	}
+}
+
+// TestControlPlaneEnvtestCreationMarkerWakesTheControlPlane proves the pool watch end to end: a control plane that
+// waits for its initial pool (WaitingForInitialWorkerPool, requeued only after clusterProvisioningPoll, one minute)
+// creates the IBM cluster within seconds of a pool being marked spec.creation: WithCluster, because the pool's update
+// reaches it through the IBMCloudManagedMachinePool watch. The manager watches only the test's namespace and the
+// Cluster is paused at cleanup, so that neither this manager nor one of a later test acts on another test's objects.
+func TestControlPlaneEnvtestCreationMarkerWakesTheControlPlane(t *testing.T) {
+	t.Run("marking a pool WithCluster wakes the waiting control plane through the pool watch", func(t *testing.T) {
+		g := NewWithT(t)
+		namespace := newTestNamespace(t, "cp-marker")
+		cluster, _ := createEnvtestCreateInputs(t, namespace)
+		// Registered before the manager starts, so it runs after the manager has stopped.
+		t.Cleanup(func() { pauseTestCluster(t, cluster) })
+		poolKey := client.ObjectKey{Namespace: namespace, Name: cpTestPoolName}
+		setCreation := func(creation infrav1.PoolCreation) {
+			g.Eventually(func() error {
+				pool := &infrav1.IBMCloudManagedMachinePool{}
+				if err := testEnv.GetAPIReader().Get(ctx, poolKey, pool); err != nil {
+					return err
+				}
+				pool.Spec.Creation = creation
+				return testEnv.Update(ctx, pool)
+			}, 10*time.Second, 100*time.Millisecond).Should(Succeed())
+		}
+		setCreation("") // the template's pool without its marker
+
+		var lookups, creates atomic.Int64
+		kube := ksmock.NewMockKubernetesService(gomock.NewController(t))
+		kube.EXPECT().GetCluster(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_ context.Context, idOrName, _ string) (*kubernetesservice.Cluster, error) {
+				if idOrName == cpIKSClusterID {
+					return cpCluster("deploying"), nil // the bound cluster, observed by ID after the create
+				}
+				lookups.Add(1)
+				return nil, ibmError(kubernetesservice.OpGetCluster, http.StatusNotFound, "")
+			}).AnyTimes()
+		kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil).AnyTimes()
+		kube.EXPECT().CreateCluster(gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_ context.Context, req kubernetesservice.CreateClusterRequest) (*kubernetesservice.CreateClusterResult, error) {
+				creates.Add(1)
+				if req.WorkerPool.Name != "default" {
+					t.Errorf("CreateCluster sent worker pool %q, want the marked pool's spec.poolName default", req.WorkerPool.Name)
+				}
+				return &kubernetesservice.CreateClusterResult{ClusterID: cpIKSClusterID}, nil
+			}).AnyTimes()
+		startControlPlaneManager(t, namespace, kube)
+		key := client.ObjectKeyFromObject(createEnvtestControlPlane(t, namespace, "dev", cluster))
+
+		g.Eventually(func(g Gomega) {
+			expectCondition(g, getEnvtestControlPlane(t, key), controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition,
+				metav1.ConditionFalse, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInitialWorkerPoolReason)
+		}, 30*time.Second, 100*time.Millisecond).Should(Succeed())
+		// Settled: the wait made no create, and the control plane's own status write does not keep waking it.
+		settled := lookups.Load()
+		g.Consistently(func(g Gomega) {
+			g.Expect(creates.Load()).To(BeZero(), "no create without a WithCluster pool")
+			g.Expect(lookups.Load()).To(BeNumerically("<=", settled+1), "binding lookups while waiting")
+		}, noHotLoopWindow, 100*time.Millisecond).Should(Succeed())
+
+		setCreation(infrav1.PoolCreationWithCluster)
+
+		// Well inside clusterProvisioningPoll minus its jitter: only the pool watch can have brought the control plane back.
+		g.Eventually(func(g Gomega) {
+			g.Expect(creates.Load()).To(Equal(int64(1)))
+			g.Expect(getEnvtestControlPlane(t, key).Status.ClusterID).To(Equal(cpIKSClusterID))
+		}, 20*time.Second, 100*time.Millisecond).Should(Succeed())
+	})
 }

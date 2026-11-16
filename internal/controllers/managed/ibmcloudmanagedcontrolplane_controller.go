@@ -270,7 +270,10 @@ func (r *IBMCloudManagedControlPlaneReconciler) SetupWithManager(ctx context.Con
 			builder.WithPredicates(predicates.ClusterPausedTransitionsOrInfrastructureProvisioned(mgr.GetScheme(), predicateLog)),
 		).
 		// The initial worker pool is created with the cluster, and a deleting control plane waits for the pools of its
-		// Cluster; both react to pool events, and only those (machinePoolToControlPlane).
+		// Cluster; both react to pool events, and only those (machinePoolToControlPlane). No predicate on purpose: the
+		// pool's spec.creation (WithCluster selects the one pool that is created with the cluster), the owner reference CAPI
+		// adds, and a deletion must all reach a control plane that waits for its initial pool, within seconds instead of at
+		// its next clusterProvisioningPoll or terminalRecheck.
 		Watches(
 			&infrav1.IBMCloudManagedMachinePool{},
 			handler.EnqueueRequestsFromMapFunc(r.machinePoolToControlPlane),
@@ -297,10 +300,12 @@ func (r *IBMCloudManagedControlPlaneReconciler) clusterToControlPlane(_ context.
 
 // machinePoolToControlPlane maps an IBMCloudManagedMachinePool to the IBMCloudManagedControlPlane of the same Cluster,
 // found through the pool's cluster-name label and the Cluster's spec.controlPlaneRef, while that control plane waits
-// for pools: before its IBM cluster is created or bound (no status.clusterID; the initial pool sizes the create) and
-// while it is being deleted (it waits until no pool is left). Every reconcile of a bound control plane costs a
-// GetCluster, and the pool controller writes status through drains, rollouts and resizes, so a bound, live control
-// plane is not woken by pool events and keeps its IBM request budget of one call per steadyStatePoll.
+// for pools: before its IBM cluster is created or bound (no status.clusterID; the pool with spec.creation WithCluster
+// is sent in the create, so adding, linking or re-marking any pool can end a WaitingForInitialWorkerPool or
+// InvalidConfiguration wait) and while it is being deleted (it waits until no pool is left). The map reads no pool
+// field besides the cluster-name label, so every kind of pool event counts. Every reconcile of a bound control plane
+// costs a GetCluster, and the pool controller writes status through drains, rollouts and resizes, so a bound, live
+// control plane is not woken by pool events and keeps its IBM request budget of one call per steadyStatePoll.
 //
 // Parameters:
 //   - ctx is the watch context.

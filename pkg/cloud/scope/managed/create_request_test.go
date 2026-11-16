@@ -51,7 +51,8 @@ func (o createRequestObjects) build() (kubernetesservice.CreateClusterRequest, e
 }
 
 // createRequestIKS returns the objects of the HA IKS template (3 zones x 2 workers) without clusterNetwork, so that IBM
-// picks the ranges. Every ID is a placeholder.
+// picks the ranges; the initial pool is the template's (poolName default, spec.creation WithCluster). Every ID is a
+// placeholder.
 func createRequestIKS() createRequestObjects {
 	meta := func(name string) metav1.ObjectMeta { return metav1.ObjectMeta{Name: name, Namespace: "default"} }
 	zones := []string{"eu-de-1", "eu-de-2", "eu-de-3"}
@@ -62,7 +63,7 @@ func createRequestIKS() createRequestObjects {
 	}}
 	infra.Status.VPC = infrav1.ResolvedResource{ID: "r010-00000000-0000-0000-0000-00000000000a", Name: "dev-vpc"}
 	pool := &infrav1.IBMCloudManagedMachinePool{ObjectMeta: meta("dev-iks-default"), Spec: infrav1.IBMCloudManagedMachinePoolSpec{
-		PoolName: InitialWorkerPoolName, Flavor: "bx2.4x16",
+		PoolName: "default", Creation: infrav1.PoolCreationWithCluster, Flavor: "bx2.4x16",
 	}}
 	for i, zone := range zones {
 		subnetID := fmt.Sprintf("02b7-00000000-0000-0000-0000-%012d", i+1)
@@ -136,6 +137,15 @@ func TestBuildCreateClusterRequestGolden(t *testing.T) {
 		NewWithT(t).Expect(err).NotTo(HaveOccurred())
 		createRequestGolden(t, req, "roks-entitled.json")
 	})
+	t.Run("the initial pool keeps its own custom name", func(t *testing.T) {
+		// IBM names the cluster's first pool after workerPool.name (a custom name is honoured, observed on IBM Cloud),
+		// so the marked pool's spec.poolName is sent as it is.
+		o := createRequestIKS()
+		o.pool.Spec.PoolName = "workers-a"
+		req, err := o.build()
+		NewWithT(t).Expect(err).NotTo(HaveOccurred())
+		createRequestGolden(t, req, "iks-custom-pool-name.json")
+	})
 	t.Run("the request passes the service's own validation fields", func(t *testing.T) {
 		g := NewWithT(t)
 		req, err := createRequestIKS().build()
@@ -204,6 +214,9 @@ func TestBuildCreateClusterRequestGuards(t *testing.T) {
 		{name: "no flavor", objs: createRequestIKS,
 			mutate: func(o createRequestObjects) { o.pool.Spec.Flavor = "" },
 			want:   []string{"has no spec.flavor"}},
+		{name: "no pool name", objs: createRequestIKS,
+			mutate: func(o createRequestObjects) { o.pool.Spec.PoolName = "" },
+			want:   []string{"IBMCloudManagedMachinePool dev-iks-default has no spec.poolName; set the IBM worker pool name"}},
 		{name: "no resource group", objs: createRequestIKS,
 			mutate: func(o createRequestObjects) { o.infra.Spec.ResourceGroup.ID = "" },
 			want:   []string{"has no spec.resourceGroup.id"}},
@@ -263,8 +276,13 @@ func TestBuildCreateClusterRequestInputs(t *testing.T) {
 		{name: "nil InfraCluster", mutate: func(o *createRequestObjects) { o.infra = nil }, want: "needs the Cluster's IBMCloudManagedCluster"},
 		{name: "nil pool", mutate: func(o *createRequestObjects) { o.pool = nil }, want: "needs the initial IBMCloudManagedMachinePool"},
 		{name: "nil MachinePool", mutate: func(o *createRequestObjects) { o.mp = nil }, want: "needs the MachinePool"},
-		{name: "not the initial pool", mutate: func(o *createRequestObjects) { o.pool.Spec.PoolName = "gpu" },
-			want: `has spec.poolName "gpu"; BuildCreateClusterRequest takes the initial pool`},
+		// The caller selects the pool marked spec.creation WithCluster (withClusterPools); an unmarked one is a caller
+		// bug, whatever its name, so a pool named default without the marker is refused too.
+		{name: "a pool without spec.creation is not the initial pool", mutate: func(o *createRequestObjects) { o.pool.Spec.Creation = "" },
+			want: `needs the IBMCloudManagedMachinePool marked spec.creation: WithCluster; dev-iks-default has spec.creation ""`},
+		{name: "an AfterCluster pool is not the initial pool",
+			mutate: func(o *createRequestObjects) { o.pool.Spec.Creation = infrav1.PoolCreationAfterCluster },
+			want:   `dev-iks-default has spec.creation "AfterCluster"`},
 		{name: "VPC not resolved yet", mutate: func(o *createRequestObjects) { o.infra.Status.VPC = infrav1.ResolvedResource{} },
 			want: "has not resolved its VPC"},
 		{name: "zone declared but not resolved yet", mutate: func(o *createRequestObjects) { o.infra.Status.Zones = o.infra.Status.Zones[:1] },
@@ -281,6 +299,55 @@ func TestBuildCreateClusterRequestInputs(t *testing.T) {
 			g.Expect(errors.As(err, &configErr)).To(BeFalse(), "a missing input or a pending InfraCluster is not the user's to fix")
 		})
 	}
+}
+
+func TestWithClusterPools(t *testing.T) {
+	pool := func(name string, creation infrav1.PoolCreation) infrav1.IBMCloudManagedMachinePool {
+		return infrav1.IBMCloudManagedMachinePool{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec:       infrav1.IBMCloudManagedMachinePoolSpec{PoolName: name, Creation: creation},
+		}
+	}
+	deleting := func(p infrav1.IBMCloudManagedMachinePool) infrav1.IBMCloudManagedMachinePool {
+		p.DeletionTimestamp = ptr.To(metav1.Now())
+		p.Finalizers = []string{infrav1.IBMCloudManagedMachinePoolFinalizer}
+		return p
+	}
+	withCluster, afterCluster := infrav1.PoolCreationWithCluster, infrav1.PoolCreationAfterCluster
+	testCases := []struct {
+		name  string
+		pools []infrav1.IBMCloudManagedMachinePool
+		want  []string
+	}{
+		{name: "no pools", pools: nil},
+		{name: "an omitted marker means AfterCluster", pools: []infrav1.IBMCloudManagedMachinePool{pool("default", "")}},
+		{name: "AfterCluster pools are not selected", pools: []infrav1.IBMCloudManagedMachinePool{pool("a", afterCluster), pool("b", afterCluster)}},
+		{name: "the one WithCluster pool, whatever its name",
+			pools: []infrav1.IBMCloudManagedMachinePool{pool("default", afterCluster), pool("system", withCluster), pool("gpu", "")},
+			want:  []string{"system"}},
+		{name: "every WithCluster pool, in list order, so the caller can name them",
+			pools: []infrav1.IBMCloudManagedMachinePool{pool("z", withCluster), pool("b", afterCluster), pool("a", withCluster)},
+			want:  []string{"z", "a"}},
+		{name: "a deleting WithCluster pool is not selected",
+			pools: []infrav1.IBMCloudManagedMachinePool{deleting(pool("old", withCluster)), pool("new", withCluster)},
+			want:  []string{"new"}},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			selected := withClusterPools(tc.pools)
+			names := make([]string, 0, len(selected))
+			for _, p := range selected {
+				names = append(names, p.Name)
+			}
+			g.Expect(names).To(Equal(append([]string{}, tc.want...)))
+		})
+	}
+	t.Run("the result points into the list", func(t *testing.T) {
+		g := NewWithT(t)
+		pools := []infrav1.IBMCloudManagedMachinePool{pool("system", withCluster)}
+		g.Expect(withClusterPools(pools)[0]).To(BeIdenticalTo(&pools[0]))
+	})
 }
 
 func TestConfigurationError(t *testing.T) {

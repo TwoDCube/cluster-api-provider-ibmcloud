@@ -350,7 +350,8 @@ func TestMasterHealth(t *testing.T) {
 // a create intent.
 func TestCreateDecisionPoints(t *testing.T) {
 	g := NewWithT(t)
-	g.Expect(InitialWorkerPoolName).To(Equal("default"))
+	// The initial pool's name needs no constant: the pool sent in createCluster is the one with spec.creation
+	// WithCluster, under its own spec.poolName, and IBM was observed to honour a custom pool name.
 	g.Expect(ROKSWorkerOperatingSystem).To(BeEmpty())
 	g.Expect(ClearIntentErrorCodes()).To(Equal([]string{"E0007", "A0656"}))
 	g.Expect(ClearIntentStatusCodes()).To(Equal([]int{400, 401, 403, 422}))
