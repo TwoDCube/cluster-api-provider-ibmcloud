@@ -38,6 +38,9 @@ const (
 	OpCreateCluster Operation = "CreateCluster"
 	// OpListVersions is KubernetesService.ListVersions.
 	OpListVersions Operation = "ListVersions"
+	// OpDeleteCluster is KubernetesService.DeleteCluster. It has no operation-specific rows: the delete flow never
+	// treats an answer as terminal and maps the generic classes itself.
+	OpDeleteCluster Operation = "DeleteCluster"
 )
 
 // ErrorClass is what an error from KubernetesService means for a controller. Each controller decides what to do for

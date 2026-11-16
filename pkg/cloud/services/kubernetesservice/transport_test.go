@@ -66,6 +66,13 @@ func limiterCalls(t *testing.T) []limiterCall {
 				return err
 			},
 		},
+		{
+			name:   "DeleteCluster",
+			answer: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) },
+			call: func(ctx context.Context, s *Service) error {
+				return s.DeleteCluster(ctx, testIKSClusterID, "")
+			},
+		},
 	}
 }
 

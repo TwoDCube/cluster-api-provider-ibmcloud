@@ -35,6 +35,11 @@ type KubernetesService interface {
 	// caller decides. A 201 may carry non-critical errors (observed on IBM Cloud), returned in the result, never as an
 	// error. SDK VpcCreateClusterWithContext (POST /v2/vpc/createCluster).
 	CreateCluster(ctx context.Context, req CreateClusterRequest) (*CreateClusterResult, error)
+	// DeleteCluster deletes a cluster by ID with deleteResources=false: CAPIBM never deletes the VPC resources or the
+	// persistent storage of a cluster, because it only references the user's VPC. IBM answers 204 and was observed to
+	// report 404 about 5 minutes later. resourceGroupID ("" = none) is sent as X-Auth-Resource-Group. SDK
+	// RemoveClusterWithContext (DELETE /v1/clusters/{idOrName}).
+	DeleteCluster(ctx context.Context, clusterID, resourceGroupID string) error
 	// ListVersions returns the offered Kubernetes and OpenShift versions. SDK GetVersionsWithContext
 	// (GET /v1/versions; the SDK's V2GetVersions decodes the wrong shape).
 	ListVersions(ctx context.Context) (*Versions, error)

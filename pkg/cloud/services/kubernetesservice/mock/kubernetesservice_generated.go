@@ -71,6 +71,20 @@ func (mr *MockKubernetesServiceMockRecorder) CreateCluster(ctx, req any) *gomock
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateCluster", reflect.TypeOf((*MockKubernetesService)(nil).CreateCluster), ctx, req)
 }
 
+// DeleteCluster mocks base method.
+func (m *MockKubernetesService) DeleteCluster(ctx context.Context, clusterID, resourceGroupID string) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DeleteCluster", ctx, clusterID, resourceGroupID)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// DeleteCluster indicates an expected call of DeleteCluster.
+func (mr *MockKubernetesServiceMockRecorder) DeleteCluster(ctx, clusterID, resourceGroupID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteCluster", reflect.TypeOf((*MockKubernetesService)(nil).DeleteCluster), ctx, clusterID, resourceGroupID)
+}
+
 // GetCluster mocks base method.
 func (m *MockKubernetesService) GetCluster(ctx context.Context, idOrName, resourceGroupID string) (*kubernetesservice.Cluster, error) {
 	m.ctrl.T.Helper()

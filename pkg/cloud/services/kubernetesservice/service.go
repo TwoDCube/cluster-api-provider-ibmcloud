@@ -181,6 +181,28 @@ func (s *Service) CreateCluster(ctx context.Context, req CreateClusterRequest) (
 	return createClusterResult(result), nil
 }
 
+// DeleteCluster implements KubernetesService.
+func (s *Service) DeleteCluster(ctx context.Context, clusterID, resourceGroupID string) error {
+	if clusterID == "" {
+		return invalidRequest(OpDeleteCluster, "the cluster ID is empty; pass status.clusterID of the IBMCloudManagedControlPlane (CAPIBM never deletes by name)")
+	}
+	options := &kubernetesserviceapiv1.RemoveClusterOptions{
+		IdOrName: core.StringPtr(clusterID),
+		// "false" keeps the persistent storage and VPC resources IBM would otherwise delete with the cluster: CAPIBM only
+		// references the user's VPC.
+		DeleteResources: core.StringPtr("false"),
+	}
+	if resourceGroupID != "" {
+		options.XAuthResourceGroup = core.StringPtr(resourceGroupID)
+	}
+	ctx, tracker := trackCall(ctx)
+	response, err := s.sdk.RemoveClusterWithContext(ctx, options)
+	if err != nil {
+		return callError(OpDeleteCluster, tracker, response, err)
+	}
+	return nil
+}
+
 // ListVersions implements KubernetesService.
 func (s *Service) ListVersions(ctx context.Context) (*Versions, error) {
 	ctx, tracker := trackCall(ctx)

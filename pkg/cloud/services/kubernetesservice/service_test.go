@@ -571,3 +571,66 @@ func TestListVersions(t *testing.T) {
 		g.Expect(Classify(OpListVersions, err)).To(Equal(ClassTransient))
 	})
 }
+
+func TestDeleteCluster(t *testing.T) {
+	t.Run("DELETE by ID with deleteResources=false and the resource group", func(t *testing.T) {
+		g := NewWithT(t)
+		fake := newFakeIKS(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+		service, _ := newTestService(t, fake)
+		g.Expect(service.DeleteCluster(context.Background(), testIKSClusterID, testResourceGroupID)).To(Succeed())
+		request := fake.last(t)
+		g.Expect(request.Method).To(Equal(http.MethodDelete))
+		g.Expect(request.Path).To(Equal("/global/v1/clusters/" + testIKSClusterID))
+		g.Expect(request.RawQuery).To(Equal("deleteResources=false"))
+		g.Expect(request.Header.Get("Authorization")).To(Equal("Bearer " + testToken))
+		g.Expect(request.Header.Get("X-Auth-Resource-Group")).To(Equal(testResourceGroupID))
+		g.Expect(request.Body).To(BeEmpty())
+	})
+
+	t.Run("no resource group header when none is given", func(t *testing.T) {
+		g := NewWithT(t)
+		fake := newFakeIKS(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+		service, _ := newTestService(t, fake)
+		g.Expect(service.DeleteCluster(context.Background(), testROKSClusterID, "")).To(Succeed())
+		g.Expect(fake.last(t).Header.Values("X-Auth-Resource-Group")).To(BeEmpty())
+	})
+
+	// The delete flow maps these classes itself and never treats one as terminal.
+	errorCases := []struct {
+		name     string
+		status   int
+		body     []byte
+		expected ErrorClass
+	}{
+		{name: "404 is NotFound", status: http.StatusNotFound, body: []byte(`{"code":"G0004","description":"The specified cluster could not be found."}`), expected: ClassNotFound},
+		{name: "409 keeps its status for WaitingForIBMDeletion", status: http.StatusConflict, body: []byte(`{"code":"E0d02","description":"synthesized conflict"}`), expected: ClassUnknown},
+		{name: "400 is BadRequest", status: http.StatusBadRequest, body: nil, expected: ClassBadRequest},
+		{name: "403 is PermissionDenied", status: http.StatusForbidden, body: nil, expected: ClassPermissionDenied},
+		{name: "500 is Transient", status: http.StatusInternalServerError, body: nil, expected: ClassTransient},
+	}
+	for _, tc := range errorCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeIKS(t, reply(tc.status, tc.body))
+			service, _ := newTestService(t, fake)
+			err := service.DeleteCluster(context.Background(), testIKSClusterID, "")
+			g.Expect(Classify(OpDeleteCluster, err)).To(Equal(tc.expected))
+			var apiErr *APIError
+			g.Expect(errors.As(err, &apiErr)).To(BeTrue())
+			g.Expect(apiErr.StatusCode).To(Equal(tc.status))
+			g.Expect(apiErr.Operation).To(Equal(OpDeleteCluster))
+			g.Expect(fake.received()).To(HaveLen(1), "DeleteCluster is sent exactly once")
+		})
+	}
+
+	t.Run("an empty cluster ID is refused before sending", func(t *testing.T) {
+		g := NewWithT(t)
+		fake := newFakeIKS(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+		service, limiter := newTestService(t, fake)
+		err := service.DeleteCluster(context.Background(), "", testResourceGroupID)
+		g.Expect(err).To(MatchError(ErrInvalidRequest))
+		g.Expect(err.Error()).To(ContainSubstring("DeleteCluster: the cluster ID is empty"))
+		g.Expect(fake.received()).To(BeEmpty())
+		g.Expect(limiter.count()).To(BeZero())
+	})
+}
