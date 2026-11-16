@@ -1,0 +1,101 @@
+# clusterctl flavor managed-iks-single-zone: an IBM Cloud Kubernetes Service (IKS) cluster on VPC Gen2 whose control
+# plane IBM manages, with 2 workers in one zone, for development and tests. NOT HA: a zone outage stops every worker,
+# and IBM may report the ingress as warning or critical (expected and informational; CAPIBM ignores it). Use the
+# managed-iks flavor for IBM's HA topology. It reads the first zone and subnet variables of managed-iks, so one set of
+# variables serves all managed flavors. The provider must run with the ManagedKubernetes feature gate
+# (EXP_MANAGED_KUBERNETES=true). The IBM Cloud credentials are the controller's own; this template has no credential
+# variable. templates/README.md lists every variable. Pass --worker-machine-count=2 to clusterctl generate cluster:
+# without the flag or the variable it sets WORKER_MACHINE_COUNT to 0, which the default of 2 below cannot override.
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: Cluster
+metadata:
+  name: "${CLUSTER_NAME}"
+spec:
+  # clusterNetwork is omitted on purpose: IBM then picks the next free pod /18 in the VPC and its default service range.
+  # Custom pod and service ranges cannot be shared between clusters (IBM containers docs, vpc-subnets.md), so a fixed
+  # default here would make the second cluster from this template conflict. To choose ranges, add for example:
+  # clusterNetwork:
+  #   pods:
+  #     cidrBlocks: ["172.17.64.0/18"]     # or the size-only form "0.0.0.0/20"; at least /23
+  #   services:
+  #     cidrBlocks: ["172.22.0.0/16"]      # at least /24; unique per cluster
+  infrastructureRef:
+    apiGroup: infrastructure.cluster.x-k8s.io
+    kind: IBMCloudManagedCluster
+    name: "${CLUSTER_NAME}"
+  controlPlaneRef:
+    apiGroup: controlplane.cluster.x-k8s.io
+    kind: IBMCloudManagedControlPlane
+    name: "${CLUSTER_NAME}-control-plane"
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: IBMCloudManagedCluster
+metadata:
+  name: "${CLUSTER_NAME}"
+spec:
+  region: "${IBMCLOUD_REGION}"
+  resourceGroup:
+    id: "${IBMCLOUD_RESOURCE_GROUP_ID}"
+  vpc:                                        # an existing VPC; CAPIBM never creates or deletes VPC resources
+    type: Reference
+    reference:
+      name: "${IBMCLOUD_VPC_NAME}"
+  # Single zone, for development and tests: NOT HA. A zone outage stops every worker, and IBM may report the ingress
+  # as warning or critical (informational, CAPIBM ignores it). Use the managed-iks or managed-roks flavor for IBM's HA
+  # topology.
+  zones:
+  - name: "${IBMCLOUD_ZONE_1}"
+    subnet:
+      name: "${IBMCLOUD_SUBNET_NAME_1}"
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1alpha1
+kind: IBMCloudManagedControlPlane
+metadata:
+  name: "${CLUSTER_NAME}-control-plane"
+spec:
+  distribution: Kubernetes
+  distributionVersion: "${IKS_DISTRIBUTION_VERSION:=1.36}"   # MAJOR.MINOR only; IBM applies the newest patch
+  # The IBM cluster is named after the Cluster. IBM cluster names are unique per account, so the API server returns an
+  # admission warning about other namespaces or management clusters using the same name. To choose a name:
+  # ibmCloudClusterName: my-iks-cluster       # immutable
+---
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachinePool
+metadata:
+  name: "${CLUSTER_NAME}-default"
+spec:
+  clusterName: "${CLUSTER_NAME}"
+  # 2 workers in the one zone: IBM's minimum for Ingress per zone (ts-ingress-alb-pods-nodes.md) and enough for an IKS
+  # rollout to pass the capacity gate (IKS's minimum of 1 ready worker remains while the other is replaced). 1 is
+  # possible and can never roll a worker.
+  replicas: ${WORKER_MACHINE_COUNT:=2}
+  template:
+    spec:
+      clusterName: "${CLUSTER_NAME}"
+      bootstrap:
+        dataSecretName: ""
+      # Drain knobs (CAPI-native; read by CAPIBM before every worker removal). Unset = wait as long as PDBs require.
+      # deletion:
+      #   nodeDrainTimeoutSeconds: 3600
+      #   nodeVolumeDetachTimeoutSeconds: 600
+      # minReadySeconds: 60                  # replacement soak before the next worker is touched
+      infrastructureRef:
+        apiGroup: infrastructure.cluster.x-k8s.io
+        kind: IBMCloudManagedMachinePool
+        name: "${CLUSTER_NAME}-default"
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: IBMCloudManagedMachinePool
+metadata:
+  name: "${CLUSTER_NAME}-default"
+spec:
+  poolName: default                           # the IBM pool name; IBM accepts any valid name
+  creation: WithCluster                       # the initial pool, created together with the IBM cluster
+  flavor: "${IBMCLOUD_WORKER_FLAVOR:=cx2.2x4}"
+  # Immutable; more zones later: add them to the IBMCloudManagedCluster, then create a new pool there.
+  zones:
+  - name: "${IBMCLOUD_ZONE_1}"
+  workerUpdates:
+    policy: "${WORKER_UPDATE_POLICY:=Manual}"  # Manual: fix packs roll only after rollout.after; Automatic: as IBM offers them
+  # rollout:
+  #   after: "2026-11-20T09:00:00Z"           # replace every worker whose Node is older, one at a time, drained

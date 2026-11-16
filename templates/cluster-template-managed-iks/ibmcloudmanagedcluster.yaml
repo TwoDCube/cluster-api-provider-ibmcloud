@@ -1,0 +1,27 @@
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: IBMCloudManagedCluster
+metadata:
+  name: "${CLUSTER_NAME}"
+spec:
+  region: "${IBMCLOUD_REGION}"
+  resourceGroup:
+    id: "${IBMCLOUD_RESOURCE_GROUP_ID}"
+  vpc:                                        # an existing VPC; CAPIBM never creates or deletes VPC resources
+    type: Reference
+    reference:
+      name: "${IBMCLOUD_VPC_NAME}"
+  # IBM's HA topology: three zones of the region, one existing subnet in each ("Plan to have at least two worker nodes
+  # per zone, so six nodes across three zones in total", IBM docs strategy.md, 2026-11-05). Zones can be added later,
+  # never removed. For one zone (development and tests, not HA) use the managed-iks-single-zone or
+  # managed-roks-single-zone flavor.
+  zones:
+  - name: "${IBMCLOUD_ZONE_1}"
+    subnet:
+      name: "${IBMCLOUD_SUBNET_NAME_1}"
+  - name: "${IBMCLOUD_ZONE_2}"
+    subnet:
+      name: "${IBMCLOUD_SUBNET_NAME_2}"
+  - name: "${IBMCLOUD_ZONE_3}"
+    subnet:
+      name: "${IBMCLOUD_SUBNET_NAME_3}"

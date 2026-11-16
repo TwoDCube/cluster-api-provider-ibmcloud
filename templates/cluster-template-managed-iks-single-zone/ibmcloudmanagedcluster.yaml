@@ -1,0 +1,20 @@
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: IBMCloudManagedCluster
+metadata:
+  name: "${CLUSTER_NAME}"
+spec:
+  region: "${IBMCLOUD_REGION}"
+  resourceGroup:
+    id: "${IBMCLOUD_RESOURCE_GROUP_ID}"
+  vpc:                                        # an existing VPC; CAPIBM never creates or deletes VPC resources
+    type: Reference
+    reference:
+      name: "${IBMCLOUD_VPC_NAME}"
+  # Single zone, for development and tests: NOT HA. A zone outage stops every worker, and IBM may report the ingress
+  # as warning or critical (informational, CAPIBM ignores it). Use the managed-iks or managed-roks flavor for IBM's HA
+  # topology.
+  zones:
+  - name: "${IBMCLOUD_ZONE_1}"
+    subnet:
+      name: "${IBMCLOUD_SUBNET_NAME_1}"

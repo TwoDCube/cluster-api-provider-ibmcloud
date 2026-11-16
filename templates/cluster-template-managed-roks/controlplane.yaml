@@ -1,0 +1,14 @@
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1alpha1
+kind: IBMCloudManagedControlPlane
+metadata:
+  name: "${CLUSTER_NAME}-control-plane"
+spec:
+  distribution: OpenShift
+  distributionVersion: "${ROKS_DISTRIBUTION_VERSION:=4.21}"  # MAJOR.MINOR only
+  openShift:
+    imageRegistry:
+      cos:                                    # required: IBM rejects a ROKS VPC create without it (E7278)
+        instanceCRN: "${COS_INSTANCE_CRN}"
+  # Named after the Cluster (admission warning about account-wide uniqueness). To choose a name:
+  # ibmCloudClusterName: my-roks-cluster      # immutable

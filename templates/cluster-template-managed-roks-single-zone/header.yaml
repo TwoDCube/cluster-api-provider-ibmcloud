@@ -1,0 +1,9 @@
+# clusterctl flavor managed-roks-single-zone: a Red Hat OpenShift on IBM Cloud (ROKS) cluster on VPC Gen2 whose
+# control plane IBM manages, with 2 workers in one zone, for development and tests. NOT HA: a zone outage stops every
+# worker, IBM may report the ingress as warning or critical (expected and informational; CAPIBM ignores it), and the
+# router load balancer covers only this zone for the cluster's lifetime, also after zones are added. Use the
+# managed-roks flavor for IBM's HA topology. It reads the first zone and subnet variables of managed-roks, so one set
+# of variables serves all managed flavors. The provider must run with the ManagedKubernetes feature gate
+# (EXP_MANAGED_KUBERNETES=true). The IBM Cloud credentials are the controller's own; this template has no credential
+# variable. templates/README.md lists every variable. Pass --worker-machine-count=2 to clusterctl generate cluster:
+# without the flag or the variable it sets WORKER_MACHINE_COUNT to 0, which the default of 2 below cannot override.
