@@ -17,9 +17,13 @@ limitations under the License.
 package vpc
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
+	"time"
 
 	"github.com/IBM/go-sdk-core/v5/core"
 	"github.com/IBM/vpc-go-sdk/vpcv1"
@@ -40,7 +44,7 @@ func TestNewServiceWithAuthenticator(t *testing.T) {
 		serviceURL string
 		auth       core.Authenticator
 		wantErr    []string // substrings of the error; nil means success
-		notInErr   string   // a substring the error must not contain (secrets)
+		notInErr   []string // substrings the error must not contain (secrets)
 	}{
 		{
 			name:       "regional public endpoint",
@@ -117,7 +121,7 @@ func TestNewServiceWithAuthenticator(t *testing.T) {
 			serviceURL: testVPCURL + "?debug",
 			auth:       validAuth,
 			wantErr:    []string{"must end at the API version path", `after "` + testVPCURL + `"`, testVPCURL + " (the default"},
-			notInErr:   "debug",
+			notInErr:   []string{"debug"},
 		},
 		{
 			name:       "empty query in the URL is rejected",
@@ -130,7 +134,7 @@ func TestNewServiceWithAuthenticator(t *testing.T) {
 			serviceURL: testVPCURL + "#x",
 			auth:       validAuth,
 			wantErr:    []string{"must end at the API version path", `after "` + testVPCURL + `"`},
-			notInErr:   "#x",
+			notInErr:   []string{"#x"},
 		},
 		{
 			// A bare "#" leaves no trace in the parsed URL but still swallows the operation path.
@@ -144,7 +148,29 @@ func TestNewServiceWithAuthenticator(t *testing.T) {
 			serviceURL: "https://user:hunter2@us-south.iaas.cloud.ibm.com/v1",
 			auth:       validAuth,
 			wantErr:    []string{"must not contain user information", "user:xxxxx@"},
-			notInErr:   "hunter2",
+			notInErr:   []string{"hunter2"},
+		},
+		{
+			// The scheme is checked before the query, so this error must not print the query either.
+			name:       "query with a secret in a plain http URL is not printed",
+			serviceURL: "http://us-south.iaas.cloud.ibm.com/v1?apikey=fake-query-key",
+			auth:       validAuth,
+			wantErr:    []string{`"http://us-south.iaas.cloud.ibm.com/v1" is not an absolute https URL`},
+			notInErr:   []string{"apikey", "fake-query-key"},
+		},
+		{
+			name:       "fragment with a secret in a URL without host is not printed",
+			serviceURL: "https:///v1#fake-fragment-token",
+			auth:       validAuth,
+			wantErr:    []string{`"https:///v1" is not an absolute https URL`},
+			notInErr:   []string{"fake-fragment-token"},
+		},
+		{ //nolint:gosec // G101: "hunter2" and the query key are fake; the case proves neither reaches the error.
+			name:       "user information and a query with a secret are neither printed",
+			serviceURL: "https://user:hunter2@us-south.iaas.cloud.ibm.com/v1?apikey=fake-query-key",
+			auth:       validAuth,
+			wantErr:    []string{"must not contain user information", `"https://user:xxxxx@us-south.iaas.cloud.ibm.com/v1"`},
+			notInErr:   []string{"hunter2", "apikey", "fake-query-key"},
 		},
 	}
 
@@ -159,8 +185,8 @@ func TestNewServiceWithAuthenticator(t *testing.T) {
 				for _, want := range tc.wantErr {
 					g.Expect(err.Error()).To(ContainSubstring(want))
 				}
-				if tc.notInErr != "" {
-					g.Expect(err.Error()).ToNot(ContainSubstring(tc.notInErr))
+				for _, secret := range tc.notInErr {
+					g.Expect(err.Error()).ToNot(ContainSubstring(secret))
 				}
 				return
 			}
@@ -170,6 +196,53 @@ func TestNewServiceWithAuthenticator(t *testing.T) {
 			sdk := svc.(*Service).vpcService
 			g.Expect(sdk.GetServiceURL()).To(Equal(tc.serviceURL))
 			g.Expect(sdk.Service.Options.Authenticator).To(BeIdenticalTo(tc.auth))
+		})
+	}
+}
+
+// TestPrintableURL covers the form in which URL errors print a rejected service URL: no password, query or fragment.
+func TestPrintableURL(t *testing.T) {
+	testCases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "URL without anything to drop is unchanged",
+			input: testVPCURL,
+			want:  testVPCURL,
+		},
+		{
+			name:  "query and fragment are dropped",
+			input: testVPCURL + "?apikey=fake-query-key#fake-fragment",
+			want:  testVPCURL,
+		},
+		{
+			name:  "empty query and empty fragment are dropped",
+			input: testVPCURL + "?#",
+			want:  testVPCURL,
+		},
+		{ //nolint:gosec // G101: "hunter2" is a fake password; the case proves it is redacted.
+			name:  "password is redacted and the user name kept",
+			input: "https://user:hunter2@us-south.iaas.cloud.ibm.com/v1?apikey=fake-query-key",
+			want:  "https://user:xxxxx@us-south.iaas.cloud.ibm.com/v1",
+		},
+		{
+			name:  "opaque URL keeps its opaque part",
+			input: "https:us-south.iaas.cloud.ibm.com?apikey=fake-query-key",
+			want:  "https:us-south.iaas.cloud.ibm.com",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			parsed, err := url.Parse(tc.input)
+			g.Expect(err).ToNot(HaveOccurred())
+			before := *parsed
+
+			g.Expect(printableURL(parsed)).To(Equal(tc.want))
+			g.Expect(*parsed).To(Equal(before), "printableURL must not modify its argument")
 		})
 	}
 }
@@ -222,4 +295,164 @@ func TestNewServiceWithAuthenticatorIgnoresEnvironment(t *testing.T) {
 		g.Expect(req.authorization).To(Equal("Bearer explicit-token"))
 		g.Expect(req.path).To(Equal("/v1/vpcs"))
 	})
+}
+
+// TestNewServiceWithAuthenticatorAndTimeout covers the validation of the timeout-capable constructor and the HTTP
+// client it installs. It makes no network call.
+func TestNewServiceWithAuthenticatorAndTimeout(t *testing.T) {
+	validAuth := &core.BearerTokenAuthenticator{BearerToken: "test-token"}
+	var typedNilAuth *core.IamAuthenticator
+
+	testCases := []struct {
+		name       string
+		serviceURL string
+		auth       core.Authenticator
+		timeout    time.Duration
+		wantErr    []string // substrings of the error; nil means success
+	}{
+		{
+			name:       "the managed default timeout is installed",
+			serviceURL: testVPCURL,
+			auth:       validAuth,
+			timeout:    30 * time.Second,
+		},
+		{
+			name:       "a sub-second timeout is kept exactly",
+			serviceURL: testVPCURL,
+			auth:       validAuth,
+			timeout:    250 * time.Millisecond,
+		},
+		{
+			name:       "zero timeout is rejected",
+			serviceURL: testVPCURL,
+			auth:       validAuth,
+			timeout:    0,
+			wantErr:    []string{"VPC client request timeout is 0s", "pass a positive duration, for example 30s"},
+		},
+		{
+			name:       "negative timeout is rejected",
+			serviceURL: testVPCURL,
+			auth:       validAuth,
+			timeout:    -time.Second,
+			wantErr:    []string{"VPC client request timeout is -1s"},
+		},
+		{
+			name:       "nil authenticator is rejected",
+			serviceURL: testVPCURL,
+			auth:       nil,
+			timeout:    30 * time.Second,
+			wantErr:    []string{"authenticator is nil", "never reads credentials from the environment"},
+		},
+		{
+			name:       "typed nil authenticator is rejected",
+			serviceURL: testVPCURL,
+			auth:       typedNilAuth,
+			timeout:    30 * time.Second,
+			wantErr:    []string{"authenticator is nil"},
+		},
+		{
+			// The URL rules are those of NewServiceWithAuthenticator, whose test covers each of them.
+			name:       "plain http URL is rejected",
+			serviceURL: "http://us-south.iaas.cloud.ibm.com/v1",
+			auth:       validAuth,
+			timeout:    30 * time.Second,
+			wantErr:    []string{"is not an absolute https URL"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			svc, err := NewServiceWithAuthenticatorAndTimeout(tc.serviceURL, tc.auth, tc.timeout)
+			if tc.wantErr != nil {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(svc).To(BeNil())
+				for _, want := range tc.wantErr {
+					g.Expect(err.Error()).To(ContainSubstring(want))
+				}
+				return
+			}
+
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(svc).To(BeAssignableToTypeOf(&Service{}))
+			sdk := svc.(*Service).vpcService
+			g.Expect(sdk.GetServiceURL()).To(Equal(tc.serviceURL))
+			g.Expect(sdk.Service.Options.Authenticator).To(BeIdenticalTo(tc.auth))
+
+			httpClient := sdk.Service.GetHTTPClient()
+			g.Expect(httpClient.Timeout).To(Equal(tc.timeout))
+			// With SDK retries on, Service.Client would be a retrying wrapper around the installed client, and the
+			// timeout would bound each attempt instead of the whole call.
+			g.Expect(sdk.Service.Client).To(BeIdenticalTo(httpClient), "SDK retries stay off")
+			// go-sdk-core's pooled transport and its minimum TLS version stay.
+			transport, ok := httpClient.Transport.(*http.Transport)
+			g.Expect(ok).To(BeTrue(), "the transport is go-sdk-core's *http.Transport, got %T", httpClient.Transport)
+			g.Expect(transport.TLSClientConfig).ToNot(BeNil())
+			g.Expect(transport.TLSClientConfig.MinVersion).To(BeNumerically("==", tls.VersionTLS12))
+		})
+	}
+
+	t.Run("every service gets its own HTTP client", func(t *testing.T) {
+		g := NewWithT(t)
+		first, err := NewServiceWithAuthenticatorAndTimeout(testVPCURL, validAuth, time.Second)
+		g.Expect(err).ToNot(HaveOccurred())
+		second, err := NewServiceWithAuthenticatorAndTimeout(testVPCURL, validAuth, time.Minute)
+		g.Expect(err).ToNot(HaveOccurred())
+
+		firstClient := first.(*Service).vpcService.Service.GetHTTPClient()
+		secondClient := second.(*Service).vpcService.Service.GetHTTPClient()
+		g.Expect(firstClient).ToNot(BeIdenticalTo(secondClient))
+		g.Expect(firstClient.Timeout).To(Equal(time.Second))
+		g.Expect(secondClient.Timeout).To(Equal(time.Minute))
+		// No process-wide default was changed: go-sdk-core still hands out clients without a timeout.
+		g.Expect(core.DefaultHTTPClient().Timeout).To(BeZero())
+	})
+}
+
+// TestNewServiceWithAuthenticatorAndTimeoutBoundsHungResponse proves the point of the timeout: against a VPC endpoint
+// that accepts a request and never answers, a call fails soon after the timeout instead of blocking its caller for
+// good.
+func TestNewServiceWithAuthenticatorAndTimeoutBoundsHungResponse(t *testing.T) {
+	g := NewWithT(t)
+	const timeout = 200 * time.Millisecond
+	// margin is generous, so that a loaded machine or the race detector cannot fail the test. Without the timeout the
+	// call would block until the handler is released when the test ends.
+	const margin = 5 * time.Second
+
+	arrived := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewTLSServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case arrived <- struct{}{}:
+		default:
+		}
+		// Never answer: wait until the client gives up (its connection closes) or the test ends.
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	// Cleanups run last-in first-out: the handler is released before Close, which waits for running handlers.
+	t.Cleanup(server.Close)
+	t.Cleanup(func() { close(release) })
+
+	svc, err := NewServiceWithAuthenticatorAndTimeout(server.URL+"/v1", &core.BearerTokenAuthenticator{BearerToken: "explicit-token"}, timeout)
+	g.Expect(err).ToNot(HaveOccurred())
+	// Trust the test server's self-signed certificate in the transport the constructor installed. The http.Client,
+	// and with it the Timeout under test, stays the constructor's.
+	transport, ok := svc.(*Service).vpcService.Service.GetHTTPClient().Transport.(*http.Transport)
+	g.Expect(ok).To(BeTrue())
+	roots := x509.NewCertPool()
+	roots.AddCert(server.Certificate())
+	transport.TLSClientConfig.RootCAs = roots
+
+	start := time.Now()
+	_, _, err = svc.GetVPC(&vpcv1.GetVPCOptions{ID: core.StringPtr("r006-00000000-0000-0000-0000-000000000000")})
+	elapsed := time.Since(start)
+
+	g.Expect(err).To(MatchError(ContainSubstring("Client.Timeout exceeded")))
+	g.Expect(arrived).To(Receive(), "the request reached the server, so the call waited for a response that never came")
+	g.Expect(elapsed).To(BeNumerically(">=", timeout))
+	g.Expect(elapsed).To(BeNumerically("<", timeout+margin))
 }

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/IBM/go-sdk-core/v5/core"
 	"github.com/IBM/vpc-go-sdk/vpcv1"
@@ -656,8 +657,8 @@ func NewService(svcEndpoint string) (Vpc, error) {
 	return service, err
 }
 
-// serviceURLForm names the URL form NewServiceWithAuthenticator accepts; every URL error repeats it so that the
-// operator sees the expected value next to the rejected one.
+// serviceURLForm names the URL form NewServiceWithAuthenticator and NewServiceWithAuthenticatorAndTimeout accept;
+// every URL error repeats it so that the operator sees the expected value next to the rejected one.
 const serviceURLForm = "an absolute https URL of the regional VPC API, for example https://us-south.iaas.cloud.ibm.com/v1 " +
 	"(the default for the region, or the vpc entry of --service-endpoint)"
 
@@ -667,6 +668,9 @@ const serviceURLForm = "an absolute https URL of the regional VPC API, for examp
 // IBMCLOUD_*): the caller owns the credentials and passes them in. That is what lets the managed Kubernetes controllers
 // build every IBM Cloud client from one explicitly resolved credential source, and lets their tests run without
 // IBMCLOUD_* variables. NewService keeps its environment-based behaviour for the existing VPC and PowerVS callers.
+//
+// Its requests use go-sdk-core's default HTTP client, which has no timeout; NewServiceWithAuthenticatorAndTimeout
+// returns the same client with one, and is the form the managed controllers use.
 //
 // Parameters:
 //   - serviceURL is the VPC API endpoint including the API version path, for example
@@ -680,11 +684,62 @@ const serviceURLForm = "an absolute https URL of the regional VPC API, for examp
 // It makes no network call; go-sdk-core validates auth (for example that an IAM authenticator has an API key) but
 // fetches the first token only on the first request.
 func NewServiceWithAuthenticator(serviceURL string, auth core.Authenticator) (Vpc, error) {
+	service, err := newServiceWithAuthenticator(serviceURL, auth)
+	if err != nil {
+		// An explicit nil: a nil *Service inside the Vpc interface would not compare equal to nil.
+		return nil, err
+	}
+	return service, nil
+}
+
+// NewServiceWithAuthenticatorAndTimeout returns a VPC Service like NewServiceWithAuthenticator whose every request,
+// from dialing to reading the whole response body, is aborted after timeout. The managed Kubernetes controllers use
+// this form.
+//
+// Why a timeout: go-sdk-core's default HTTP client (core.DefaultHTTPClient, go-sdk-core v5.25.3
+// base_service.go:782-786) has neither an overall Client.Timeout nor a ResponseHeaderTimeout, and the VPC SDK methods
+// take no context. Without a timeout, one VPC response that never arrives blocks the caller for good; for the managed
+// controllers that caller is the IBMCloudManagedCluster controller, which runs a single worker, so every
+// IBMCloudManagedCluster of the manager would stall.
+//
+// The HTTP client is a fresh core.DefaultHTTPClient() with Timeout set, installed with BaseService.SetHTTPClient
+// (base_service.go:244-256), so go-sdk-core's pooled transport, its dial and TLS handshake limits and its minimum TLS
+// version 1.2 stay as they are. SDK retries stay off, as go-sdk-core leaves them, so timeout bounds the whole call.
+//
+// Parameters:
+//   - serviceURL is the VPC API endpoint, with the rules of NewServiceWithAuthenticator: an absolute https URL that
+//     ends at the API version path, for example https://us-south.iaas.cloud.ibm.com/v1.
+//   - auth authenticates every request, with the rules of NewServiceWithAuthenticator: never nil (also not a typed
+//     nil), and no fallback to the environment.
+//   - timeout bounds each request (http.Client.Timeout) and must be positive. The managed client builder passes
+//     ProdClientBuilderOptions.HTTPTimeout, the same bound its IBM Cloud Kubernetes Service clients use.
+//
+// It makes no network call.
+func NewServiceWithAuthenticatorAndTimeout(serviceURL string, auth core.Authenticator, timeout time.Duration) (Vpc, error) {
+	if timeout <= 0 {
+		return nil, fmt.Errorf("VPC client request timeout is %s: pass a positive duration, for example 30s, so that a "+
+			"VPC response that never arrives cannot block the caller", timeout)
+	}
+	service, err := newServiceWithAuthenticator(serviceURL, auth)
+	if err != nil {
+		return nil, err
+	}
+	// A new client per service: setting Timeout on a shared client would change every other client that uses it.
+	httpClient := core.DefaultHTTPClient()
+	httpClient.Timeout = timeout
+	service.vpcService.Service.SetHTTPClient(httpClient)
+	return service, nil
+}
+
+// newServiceWithAuthenticator validates auth and serviceURL and builds the SDK client over go-sdk-core's default HTTP
+// client. It is the shared part of NewServiceWithAuthenticator and NewServiceWithAuthenticatorAndTimeout, whose
+// documentation states the rules for both arguments.
+func newServiceWithAuthenticator(serviceURL string, auth core.Authenticator) (*Service, error) {
 	// core.IsNil also catches a typed nil inside the interface, which a plain auth == nil check would let through.
 	// go-sdk-core would reject both later, but with a message that does not say what the caller must pass.
 	if core.IsNil(auth) {
 		return nil, errors.New("VPC client authenticator is nil: pass the authenticator of the IBM Cloud credentials " +
-			"the client acts as (NewServiceWithAuthenticator never reads credentials from the environment)")
+			"the client acts as (a VPC client built with an explicit authenticator never reads credentials from the environment)")
 	}
 	if err := validateServiceURL(serviceURL); err != nil {
 		return nil, err
@@ -701,8 +756,8 @@ func NewServiceWithAuthenticator(serviceURL string, auth core.Authenticator) (Vp
 }
 
 // validateServiceURL returns an error unless serviceURL is an absolute https URL with a host, no user information and
-// no query or fragment. The messages print the URL redacted, so a password typed into it never reaches a log or a
-// condition.
+// no query or fragment. The messages print the URL only in the form printableURL returns, so neither a password nor a
+// query or fragment typed into it reaches a log or a condition.
 func validateServiceURL(serviceURL string) error {
 	if serviceURL == "" {
 		return fmt.Errorf("VPC service URL is empty: pass %s", serviceURLForm)
@@ -715,11 +770,11 @@ func validateServiceURL(serviceURL string) error {
 	}
 	if parsed.User != nil {
 		return fmt.Errorf("VPC service URL %q must not contain user information (credentials come only from the authenticator): pass %s",
-			parsed.Redacted(), serviceURLForm)
+			printableURL(parsed), serviceURLForm)
 	}
 	// url.Parse lower-cases the scheme, so "HTTPS://" is accepted; an opaque URL such as "https:host" has no Host.
 	if parsed.Scheme != "https" || parsed.Host == "" {
-		return fmt.Errorf("VPC service URL %q is not %s", parsed.Redacted(), serviceURLForm)
+		return fmt.Errorf("VPC service URL %q is not %s", printableURL(parsed), serviceURLForm)
 	}
 	// go-sdk-core builds each request URL by appending the operation path to the service URL string (go-sdk-core
 	// v5.25.3, core/request_builder.go), so with "https://host/v1?debug" a ListVpcs call would send GET /v1 with the
@@ -727,11 +782,24 @@ func validateServiceURL(serviceURL string) error {
 	// confusing API error, so it is rejected here. A bare trailing "#" leaves no trace in the parsed URL, which is why
 	// the raw string is checked; url.Parse cuts the fragment at the first "#", so any "#" in it starts a fragment.
 	if parsed.RawQuery != "" || parsed.ForceQuery || strings.Contains(serviceURL, "#") {
-		// The query and fragment are not printed: they are arbitrary text that may carry a token.
-		withoutQuery := url.URL{Scheme: parsed.Scheme, Host: parsed.Host, Path: parsed.Path, RawPath: parsed.RawPath}
 		return fmt.Errorf("VPC service URL must end at the API version path: remove the query (?...) or fragment (#...) "+
 			"after %q, because the client appends each operation path (for example /vpcs) to the URL; pass %s",
-			withoutQuery.String(), serviceURLForm)
+			printableURL(parsed), serviceURLForm)
 	}
 	return nil
+}
+
+// printableURL returns the form of a rejected service URL that errors print: the password replaced by "xxxxx"
+// (url.URL.Redacted) and the query and fragment dropped, because both are arbitrary text that may carry a token. The
+// scheme, user name, host and path stay, so the operator still recognizes the value that was rejected.
+//
+// Parameters:
+//   - parsed is the URL as url.Parse returned it; it is not modified.
+func printableURL(parsed *url.URL) string {
+	shown := *parsed
+	shown.RawQuery = ""
+	shown.ForceQuery = false
+	shown.Fragment = ""
+	shown.RawFragment = ""
+	return shown.Redacted()
 }
