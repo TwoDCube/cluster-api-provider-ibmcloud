@@ -642,7 +642,7 @@ func bindingURLHostPort(raw string) (string, bool) {
 		return "", false
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.Hostname() == "" {
+	if err != nil || u.Scheme != httpsScheme || u.Hostname() == "" {
 		return "", false
 	}
 	port := u.Port()
