@@ -41,14 +41,17 @@ import (
 // inputs that may cost a call, the offered versions (VersionsCache) and the worker listing, are asked for only when a
 // row needs them, so that a reconcile that requests nothing makes no IBM call beyond GetCluster. Every version named in
 // a condition comes from masterKubeVersion or targetVersion through ibmversion.Version.WithoutPending, so IBM's
-// " (pending)" marker never reaches status.
+// " (pending)" marker never reaches status. Two answers keep MasterVersionUpToDate from claiming more than CAPIBM
+// knows: a masterKubeVersion that does not parse is Unknown, and masterInputFailure reports a call for an input that
+// IBM refused after a raise of spec.distributionVersion, where the condition of the old minor no longer holds.
 
 // masterEndOfSupportNotice is how long before IBM's versionEOS the MasterVersionUpToDate message mentions the end of
 // support; a CAPIBM choice, not an IBM fact.
 const masterEndOfSupportNotice = 45 * 24 * time.Hour
 
 // masterPermissionDeniedReason is the MasterVersionUpToDate reason of an UpdateMaster 403: the credentials lack the
-// Kubernetes Service role.
+// Kubernetes Service role. A 403 to a call for an input of the decision (masterInputFailure) has it too; only the
+// message tells them apart (masterUpdateDeniedPrefix).
 const masterPermissionDeniedReason = controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDatePermissionDeniedReason
 
 // masterMaxWorkerSkew returns how many minors IBM lets workers run behind the master: 2 for Kubernetes (IKS worker
@@ -148,10 +151,12 @@ type MasterAction struct {
 	UpdatePending bool
 
 	// UpToDate is the MasterVersionUpToDate condition (type, status, reason, message; the caller sets it with
-	// util/conditions, which keeps the transition time).
+	// util/conditions, which keeps the transition time). It is Unknown with the reason UnparsableMasterVersion when IBM's
+	// masterKubeVersion does not parse; no other field is set then.
 	UpToDate metav1.Condition
 
-	// RollingOut is the RollingOut contract condition.
+	// RollingOut is the RollingOut contract condition. Its Type is empty, and the caller leaves the condition as it is,
+	// when the decision does not know whether a master update is in progress (an unparsable masterKubeVersion).
 	RollingOut metav1.Condition
 
 	// RecheckAt is when the decision may change without any watched change: the end of MasterUpdatePendingGrace
@@ -171,6 +176,8 @@ type masterVersions struct {
 	marked bool
 	// observed is the master's minor, parsed from masterKubeVersion.
 	observed ibmversion.Minor
+	// masterParsed is true when masterKubeVersion parsed; master, marked and observed are meaningful only then.
+	masterParsed bool
 	// requested is the minor of status.masterUpdate.version; meaningful only when requestedOK.
 	requested ibmversion.Minor
 	// requestedOK is true when status.masterUpdate names a version.
@@ -180,6 +187,11 @@ type masterVersions struct {
 // DecideMasterAction decides the master minor update by the rows below, in this order (the code and its tests cite the
 // row numbers; the refusal row and row 9 are out of numeric order on purpose, see below):
 //
+//   - IBM's masterKubeVersion does not parse (IBM's form of masterKubeVersion during an update is not yet verified
+//     against IBM Cloud, so a form the parser does not know is possible): CAPIBM cannot tell which minor the master
+//     runs, so MasterVersionUpToDate is Unknown with the reason UnparsableMasterVersion and the version IBM reported,
+//     nothing is requested, and RollingOut is left as it is. A True of an earlier reconcile would claim a minor CAPIBM
+//     no longer knows.
 //   - Row 1. IBM shows an update (IsMasterUpdatePending: " (pending)", state updating, or targetVersion above the
 //     master, including a patch IBM applies on its own): wait, RollingOut=True MasterUpdateInProgress naming the
 //     target.
@@ -211,12 +223,15 @@ type masterVersions struct {
 // Parameters:
 //   - in: the observation; see MasterVersionInput.
 //
-// It returns an error naming the field when in is invalid, and when IBM's masterKubeVersion does not parse (IBM's form
-// of masterKubeVersion during an update is not yet verified against IBM Cloud); no IBM call is then made.
+// It returns an error naming the field when in is invalid: a missing input, or a spec.distributionVersion or
+// status.masterUpdate.version that does not parse; no IBM call is then made.
 func DecideMasterAction(in MasterVersionInput) (MasterAction, error) {
 	v, err := in.parse()
 	if err != nil {
 		return MasterAction{}, err
+	}
+	if !v.masterParsed {
+		return MasterAction{UpToDate: in.unparsableMasterCondition(v)}, nil
 	}
 	if IsMasterUpdatePending(in.Cluster) {
 		return in.decidePending(v), nil
@@ -254,7 +269,9 @@ func DecideMasterAction(in MasterVersionInput) (MasterAction, error) {
 	return in.decideUpdate(v, action), nil
 }
 
-// parse validates in and parses its versions.
+// parse validates in and parses its versions. CAPIBM's own inputs (spec.distributionVersion, status.masterUpdate) are
+// validated first and fail with an error. IBM's masterKubeVersion is parsed last: when it does not parse, the result
+// has masterParsed false and no error, because that is IBM's answer, which DecideMasterAction reports as a condition.
 func (in MasterVersionInput) parse() (masterVersions, error) {
 	switch {
 	case bindingClusterType(in.Distribution) == "":
@@ -274,12 +291,7 @@ func (in MasterVersionInput) parse() (masterVersions, error) {
 	if err != nil {
 		return masterVersions{}, fmt.Errorf("MasterVersionInput.DesiredVersion (spec.distributionVersion): %w", err)
 	}
-	master, err := ibmversion.Parse(in.Cluster.MasterKubeVersion)
-	if err != nil {
-		return masterVersions{}, fmt.Errorf("IBM reports masterKubeVersion %q for cluster %s, which CAPIBM cannot parse, "+
-			"so it requests no master update: %w", in.Cluster.MasterKubeVersion, in.Cluster.ID, err)
-	}
-	v := masterVersions{desired: desired, master: master.WithoutPending(), marked: master.Pending, observed: master.MinorVersion()}
+	v := masterVersions{desired: desired}
 	if in.MasterUpdate.Version != "" {
 		requested, err := ibmversion.Parse(in.MasterUpdate.Version)
 		if err != nil {
@@ -287,7 +299,27 @@ func (in MasterVersionInput) parse() (masterVersions, error) {
 		}
 		v.requested, v.requestedOK = requested.MinorVersion(), true
 	}
+	if master, err := ibmversion.Parse(in.Cluster.MasterKubeVersion); err == nil {
+		v.master, v.marked, v.observed, v.masterParsed = master.WithoutPending(), master.Pending, master.MinorVersion(), true
+	}
 	return v, nil
+}
+
+// unparsableMasterCondition returns MasterVersionUpToDate=Unknown for a masterKubeVersion that does not parse. The
+// message quotes IBM's value, which stays the same while IBM reports it, so a repeated reconcile writes the same
+// condition and no status; the parse error itself is left out, since it only restates the value.
+//
+// Parameters:
+//   - v: the parsed versions; masterParsed is false.
+func (in MasterVersionInput) unparsableMasterCondition(v masterVersions) metav1.Condition {
+	return metav1.Condition{
+		Type:   controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition,
+		Status: metav1.ConditionUnknown,
+		Reason: controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateUnparsableMasterVersionReason,
+		Message: fmt.Sprintf("IBM reports master version %q for IBM cluster %s, which CAPIBM cannot parse, so it cannot tell "+
+			"whether the master runs spec.distributionVersion %s; CAPIBM requests no master update until IBM reports a "+
+			"version it can parse", in.Cluster.MasterKubeVersion, in.Cluster.ID, v.desired),
+	}
 }
 
 // upToDateCondition returns MasterVersionUpToDate=True for a master on the minor of spec.distributionVersion (row 3).
@@ -497,17 +529,44 @@ func (in MasterVersionInput) holdRequest(v masterVersions, action MasterAction) 
 // refusal returns CurrentUpToDate when it records IBM's terminal answer to UpdateMaster for the current generation: a
 // False condition with a Reason that MasterUpdateCallOutcome sets for a Terminal answer. ok is false otherwise. The
 // caller has checked that status.masterUpdate is for the desired version, the version that answer refused.
+//
+// A PermissionDenied counts only when its message starts with masterUpdateDeniedPrefix of that version: a 403 to the
+// ListVersions call of this step has the same reason (masterInputFailure), and taking it for IBM's refusal of
+// UpdateMaster would keep its message, which names a listing that may work again by now, until the retry time, instead
+// of rows 10 and 11. The message is the record because status has no field for IBM's answer, as with the removal
+// runner's refusalRecord.
 func (in MasterVersionInput) refusal() (metav1.Condition, bool) {
 	c := in.CurrentUpToDate
 	if c == nil || c.Status != metav1.ConditionFalse || c.ObservedGeneration != in.Generation {
 		return metav1.Condition{}, false
 	}
 	switch c.Reason {
-	case masterPermissionDeniedReason, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateVersionSkipNotAllowedReason:
+	case masterPermissionDeniedReason:
+		if !strings.HasPrefix(c.Message, masterUpdateDeniedPrefix(in.MasterUpdate.Version)) {
+			return metav1.Condition{}, false
+		}
+		return *c, true
+	case controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateVersionSkipNotAllowedReason:
 		return *c, true
 	default:
 		return metav1.Condition{}, false
 	}
+}
+
+// keptVersionSkip reports whether CurrentUpToDate records IBM's version-skip refusal (ClassVersionSkipNotAllowed, whose
+// IBM error code is not yet verified against IBM Cloud) of the request that status.masterUpdate records for the desired
+// minor: the record the refusal row keeps until the spec changes (holdRequest). The version check is the one
+// decideUpdate makes before it asks refusal; it also tells IBM's refusal apart from row 7's own VersionSkipNotAllowed,
+// which is written for a desired minor CAPIBM never requests. It is pure.
+//
+// Parameters:
+//   - v: the parsed versions; masterParsed is true.
+func (in MasterVersionInput) keptVersionSkip(v masterVersions) bool {
+	if in.MasterUpdate.Version != MasterUpdateVersion(in.Distribution, v.desired) {
+		return false
+	}
+	refusal, ok := in.refusal()
+	return ok && refusal.Reason == controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateVersionSkipNotAllowedReason
 }
 
 // masterRetryTime returns when CAPIBM requests the update of a status.masterUpdate again while the master stays on the
@@ -638,8 +697,8 @@ type MasterUpdateCallResult struct {
 	Class kubernetesservice.ErrorClass
 
 	// Handled is false when the caller applies its common error handling for Class (Transient, RateLimited,
-	// Unauthorized with InvalidateAuthenticator, BadRequest); status.masterUpdate already records the attempt, so the
-	// retry follows the grace and backoff rows of DecideMasterAction.
+	// Unauthorized with InvalidateAuthenticator, BadRequest, NotFound); status.masterUpdate already records the attempt,
+	// so the retry follows the grace and backoff rows of DecideMasterAction.
 	Handled bool
 
 	// Accepted is true when IBM took the request (204) or already had it (409, ClassMasterUpdateAlreadyRequested):
@@ -647,10 +706,12 @@ type MasterUpdateCallResult struct {
 	Accepted bool
 
 	// Terminal is true when a human must act (ClassPermissionDenied, ClassVersionSkipNotAllowed): the caller sets
-	// MasterVersionUpToDate=False with Reason and Message, in place of the UpgradePending of MasterAction.UpToDate, and
-	// rechecks at terminalRecheck. On the next reconciles DecideMasterAction reads that condition back
-	// (MasterVersionInput.CurrentUpToDate) and keeps it: a missing role until the retry time the Message names, a
-	// version skip until the spec changes.
+	// MasterVersionUpToDate=False with Reason and Message in place of the UpgradePending of MasterAction.UpToDate, and
+	// decides again with the request on record. From then on the refusal row of DecideMasterAction reads that condition
+	// back (MasterVersionInput.CurrentUpToDate) and keeps it, with no call: a missing role until the retry time the
+	// Message names, which the decision returns as MasterAction.RecheckAt, so that the control plane is requeued no
+	// later than that time and requests the update again then; a version skip until the spec changes, looked at again
+	// at the control plane's own polls.
 	Terminal bool
 
 	// Reason is the MasterVersionUpToDate reason of a Terminal answer: PermissionDenied for a missing role,
@@ -716,11 +777,10 @@ func masterUpdateOutcome(class kubernetesservice.ErrorClass, err error, request 
 		result.Message = fmt.Sprintf("IBM already has the master update to %s; waiting for it to start", version)
 	case kubernetesservice.ClassPermissionDenied:
 		result.Terminal, result.Reason = true, masterPermissionDeniedReason
-		result.Message = fmt.Sprintf("IBM Cloud Kubernetes Service refused the master update to %s with HTTP 403%s: the "+
-			"credentials of %s need the Administrator platform role and the Manager service role of Kubernetes Service "+
-			"on the cluster's resource group. CAPIBM requests one minor at a time, so this is not IBM's refusal to skip "+
-			"versions; CAPIBM requests the update again at %s", version, masterIBMReference(err), identityDescription,
-			bindingTime(masterRetryTime(request)))
+		result.Message = masterUpdateDeniedPrefix(version) + fmt.Sprintf("%s: the credentials of %s need the Administrator "+
+			"platform role and the Manager service role of Kubernetes Service on the cluster's resource group. CAPIBM "+
+			"requests one minor at a time, so this is not IBM's refusal to skip versions; CAPIBM requests the update "+
+			"again at %s", masterIBMReference(err), identityDescription, bindingTime(masterRetryTime(request)))
 	case kubernetesservice.ClassVersionSkipNotAllowed:
 		result.Terminal = true
 		result.Reason = controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateVersionSkipNotAllowedReason
@@ -731,6 +791,98 @@ func masterUpdateOutcome(class kubernetesservice.ErrorClass, err error, request 
 		result.Handled = false
 	}
 	return result
+}
+
+// masterUpdateDeniedPrefix returns the start of the PermissionDenied message of IBM's 403 to UpdateMaster for version
+// (masterUpdateOutcome). It is the record of that refusal, which the refusal row reads (MasterVersionInput.refusal):
+// a 403 to a call for an input of the decision has the same reason but another message (masterInputFailure).
+//
+// Parameters:
+//   - version: the version UpdateMaster was sent, status.masterUpdate.version.
+func masterUpdateDeniedPrefix(version string) string {
+	return fmt.Sprintf("IBM Cloud Kubernetes Service refused the master update to %s with HTTP 403", version)
+}
+
+// masterCallDefinitive reports whether IBM's answer of class to a call of the master version step is one that a retry
+// with backoff does not fix (a 403, 400 or 404, or a request kubernetesservice refused to send), so that it is reported
+// and looked at again at the next poll. The other classes are retried by their own handling
+// (ControlPlaneScope.masterCallFailed): 401 with a rebuilt authenticator, 429 after Retry-After, and 5xx, network
+// errors and unclassified answers with controller-runtime's backoff. ClassNone is no failure. It is the single rule for
+// both masterCallFailed and masterInputFailure, so the condition and the requeue always agree.
+//
+// Parameters:
+//   - class: kubernetesservice.Classify of the call's error.
+func masterCallDefinitive(class kubernetesservice.ErrorClass) bool {
+	switch class {
+	case kubernetesservice.ClassNone, kubernetesservice.ClassUnauthorized, kubernetesservice.ClassRateLimited,
+		kubernetesservice.ClassTransient, kubernetesservice.ClassUnknown:
+		return false
+	default:
+		return true
+	}
+}
+
+// masterInputFailure returns the MasterVersionUpToDate condition for a call that fetched an input of DecideMasterAction
+// (ListVersions for NeedsOfferedVersions, ListWorkers for NeedsWorkers) and failed with a definitive answer
+// (masterCallDefinitive), and true. DecideMasterAction asks for these inputs only after a raise of
+// spec.distributionVersion, when the condition of an earlier reconcile may still be the True of the old minor ("the
+// master runs ... as spec.distributionVersion asks"), which would stay until the call succeeds. A 403 is
+// PermissionDenied, named like the UpdateMaster 403: the call, the Kubernetes Service roles (the Administrator platform
+// role and the Manager service role) and the identity by its Description. Every other definitive answer (400, 404, a
+// request kubernetesservice refused to send) is IBMAPIError. The messages carry IBM's HTTP status and error code only,
+// never the incident ID or IBM's description (masterIBMReference), and no time, so the same failure writes the same
+// condition on every reconcile and no status; the caller logs IBM's whole answer. It is pure.
+//
+// It returns false, and the caller writes no condition, for:
+//   - an answer that its own handling retries soon (401, 429, 5xx, network errors, unclassified answers): such a blip
+//     says nothing about the update, and a condition written for it would flap;
+//   - a desired minor equal to the observed one: row 3's condition is still accurate. DecideMasterAction asks for no
+//     input then; the check keeps the condition right should that ever change;
+//   - an input that DecideMasterAction itself rejects or reports (parse);
+//   - IBM's version-skip refusal of the request on record, which the refusal row keeps until the spec changes
+//     (keptVersionSkip). The version listing comes before that row (row 8), so a failed listing would otherwise replace
+//     the record: once the listing worked again, the refusal row would no longer find it, and row 11 would send
+//     UpdateMaster once more at its retry time, only for IBM to refuse it again. The failure is still logged
+//     (masterCallFailed), and the call is made again at the next poll.
+//
+// A kept PermissionDenied refusal of UpdateMaster, by contrast, is replaced, and the condition then names the input
+// call that fails now: the refusal row keeps that record only until the retry time of row 11, and once the listing
+// works again rows 10 and 11 hold the request until that same time, so losing the record costs no UpdateMaster.
+//
+// Parameters:
+//   - in: the input of the decision that asked for the call.
+//   - class: kubernetesservice.Classify of the call's error.
+//   - action: what the call did, for example "listing the workers of IBM cluster <id>".
+//   - err: the call's error, for IBM's HTTP status and code.
+//   - identityDescription: credentials.Identity.Description of the identity the call used, for example "the CAPIBM
+//     controller identity".
+func masterInputFailure(in MasterVersionInput, class kubernetesservice.ErrorClass, action string, err error,
+	identityDescription string,
+) (metav1.Condition, bool) {
+	if !masterCallDefinitive(class) {
+		return metav1.Condition{}, false
+	}
+	v, parseErr := in.parse()
+	if parseErr != nil || !v.masterParsed || v.desired == v.observed || in.keptVersionSkip(v) {
+		return metav1.Condition{}, false
+	}
+	const retry = "CAPIBM tries again at the next poll of the control plane"
+	reference := masterIBMReference(err)
+	switch status := cpIBMStatus(err); {
+	case class == kubernetesservice.ClassPermissionDenied:
+		return masterCondition(masterPermissionDeniedReason, fmt.Sprintf("IBM Cloud Kubernetes Service refused %s with "+
+			"HTTP 403%s, so the master update to %s waits: the credentials of %s need %s on the cluster's resource group; %s",
+			action, reference, v.desired, identityDescription, cpKubernetesServiceRoles, retry)), true
+	case status != 0:
+		return masterCondition(controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateIBMAPIErrorReason,
+			fmt.Sprintf("IBM Cloud Kubernetes Service refused %s with HTTP %d%s, so the master update to %s waits; %s, and "+
+				"the controller log has IBM's description", action, status, reference, v.desired, retry)), true
+	default:
+		// A request that kubernetesservice refused to send (ErrInvalidRequest) has no HTTP status.
+		return masterCondition(controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateIBMAPIErrorReason,
+			fmt.Sprintf("CAPIBM could not complete %s, so the master update to %s waits; %s, and the controller log names "+
+				"the cause", action, v.desired, retry)), true
+	}
 }
 
 // masterIBMReference returns " (IBM code <c>)" for an IBM answer that carries a code, else "": the same form as every

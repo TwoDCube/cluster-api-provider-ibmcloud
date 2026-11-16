@@ -19,6 +19,7 @@ package managed
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"os"
@@ -145,6 +146,13 @@ const masterDenied = "IBM Cloud Kubernetes Service refused the master update to 
 	"the CAPIBM controller identity need the Administrator platform role and the Manager service role of Kubernetes " +
 	"Service on the cluster's resource group. CAPIBM requests one minor at a time, so this is not IBM's refusal to skip " +
 	"versions; CAPIBM requests the update again at 2026-11-20T12:45:00Z"
+
+// masterListDenied is the message masterInputFailure writes for a 403 with IBM code E3c1a to the ListVersions call of
+// an IKS control plane whose spec asks for 1.37.
+const masterListDenied = "IBM Cloud Kubernetes Service refused listing the versions IBM Cloud offers in region us-south " +
+	"with HTTP 403 (IBM code E3c1a), so the master update to 1.37 waits: the credentials of the CAPIBM controller identity " +
+	"need the Administrator platform role and the Manager service role of Kubernetes Service on the cluster's resource " +
+	"group; CAPIBM tries again at the next poll of the control plane"
 
 // masterCurrent returns a MasterVersionUpToDate=False condition with reason and message as util/conditions Set stores
 // it for generation, the form MasterVersionInput.CurrentUpToDate takes.
@@ -521,6 +529,37 @@ func TestDecideMasterAction(t *testing.T) {
 				in.CurrentUpToDate, in.Generation = masterCurrent(masterPermissionDeniedReason, masterDenied, masterGeneration), masterGeneration
 				return in
 			}},
+		{name: "ROKS UpdateMaster 403 is kept by its OpenShift version", recheckAt: masterNow.Add(45 * time.Minute),
+			reason:  masterPermissionDeniedReason,
+			message: []string{"refused the master update to 4.22_openshift with HTTP 403"},
+			in: func() MasterVersionInput {
+				in := fx.roks("4.22")
+				in.MasterUpdate = masterRequested("4.22_openshift", 15*time.Minute, 1)
+				refused := masterUpdateOutcome(kubernetesservice.ClassPermissionDenied, nil, in.MasterUpdate, "the CAPIBM controller identity")
+				in.CurrentUpToDate, in.Generation = masterCurrent(refused.Reason, refused.Message, masterGeneration), masterGeneration
+				return in
+			}},
+		// A 403 to the ListVersions call of this step has the reason PermissionDenied too, but it is no record of IBM's
+		// refusal of UpdateMaster: once the listing works again, rows 10 and 11 report the request on record.
+		{name: "a ListVersions 403 is not kept as a refusal after the grace", recheckAt: masterNow.Add(45 * time.Minute),
+			reason:  controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateUpgradeFailedReason,
+			message: []string{"the master update to 1.37 that CAPIBM requested at 2026-11-20T11:45:00Z has not taken effect"},
+			in: func() MasterVersionInput {
+				in := fx.iks("1.37")
+				in.MasterUpdate = masterRequested("1.37", 15*time.Minute, 1)
+				in.CurrentUpToDate, in.Generation = masterCurrent(masterPermissionDeniedReason, masterListDenied, masterGeneration), masterGeneration
+				return in
+			}},
+		{name: "a ListVersions 403 is not kept as a refusal within the grace", rolling: true,
+			recheckAt: masterNow.Add(4 * time.Minute),
+			reason:    controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateUpgradePendingReason,
+			message:   []string{"CAPIBM requested the master update to 1.37 at 2026-11-20T11:59:00Z; waiting for IBM to show it"},
+			in: func() MasterVersionInput {
+				in := fx.iks("1.37")
+				in.MasterUpdate = masterRequested("1.37", time.Minute, 1)
+				in.CurrentUpToDate, in.Generation = masterCurrent(masterPermissionDeniedReason, masterListDenied, masterGeneration), masterGeneration
+				return in
+			}},
 		{name: "version skip refusal is kept until the spec changes",
 			reason:  controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateVersionSkipNotAllowedReason,
 			message: []string{"IBM refused the master update to 1.37 as a version skip"},
@@ -757,10 +796,12 @@ func TestDecideMasterActionValidation(t *testing.T) {
 		{name: "no clock", mutate: func(in *MasterVersionInput) { in.Now = time.Time{} }, want: "MasterVersionInput.Now is not set"},
 		{name: "desired version with a patch", mutate: func(in *MasterVersionInput) { in.DesiredVersion = "1.37.1" },
 			want: "MasterVersionInput.DesiredVersion (spec.distributionVersion): invalid minor version"},
-		{name: "unparseable masterKubeVersion", mutate: func(in *MasterVersionInput) { in.Cluster.MasterKubeVersion = "1.37.1_1517(pending)" },
-			want: `IBM reports masterKubeVersion "1.37.1_1517(pending)" for cluster iksclusterid00000001, which CAPIBM cannot parse`},
 		{name: "unparseable status.masterUpdate", mutate: func(in *MasterVersionInput) { in.MasterUpdate = masterRequested("v1.37", time.Hour, 1) },
 			want: "MasterVersionInput.MasterUpdate.Version (status.masterUpdate.version)"},
+		{name: "CAPIBM's own inputs are checked before IBM's masterKubeVersion", mutate: func(in *MasterVersionInput) {
+			in.MasterUpdate = masterRequested("v1.37", time.Hour, 1)
+			in.Cluster.MasterKubeVersion = "garbage"
+		}, want: "MasterVersionInput.MasterUpdate.Version (status.masterUpdate.version)"},
 		{name: "current condition of another type", mutate: func(in *MasterVersionInput) {
 			in.CurrentUpToDate = masterCurrent(masterPermissionDeniedReason, masterDenied, masterGeneration)
 			in.CurrentUpToDate.Type = controlplanev1.IBMCloudManagedControlPlaneRollingOutCondition
@@ -775,6 +816,244 @@ func TestDecideMasterActionValidation(t *testing.T) {
 			g.Expect(err).To(MatchError(ContainSubstring(tc.want)))
 		})
 	}
+}
+
+// TestDecideMasterActionUnparsableMaster checks that a masterKubeVersion CAPIBM cannot parse (IBM's form during an
+// update is not yet verified against IBM Cloud) makes MasterVersionUpToDate Unknown with the reason
+// UnparsableMasterVersion, whatever IBM's state, status.masterUpdate or the current condition say. Nothing is requested
+// or asked for, and RollingOut is left to the caller as it is (no Type).
+func TestDecideMasterActionUnparsableMaster(t *testing.T) {
+	fx := loadMasterFixtures(t)
+	testCases := []struct {
+		name   string
+		master string
+		// quoted is master as the message quotes it.
+		quoted string
+		mutate func(in *MasterVersionInput)
+	}{
+		{name: "a pending marker without its space", master: "1.37.1_1517(pending)", quoted: `"1.37.1_1517(pending)"`},
+		{name: "no version at all", master: "", quoted: `""`},
+		{name: "IBM shows an update of a version CAPIBM cannot parse", master: "garbage", quoted: `"garbage"`,
+			mutate: func(in *MasterVersionInput) { in.Cluster.State, in.Cluster.TargetVersion = "updating", "1.37.1_1517" }},
+		{name: "a request and a refusal on record", master: "v1.36.5", quoted: `"v1.36.5"`,
+			mutate: func(in *MasterVersionInput) {
+				in.MasterUpdate = masterRequested("1.37", 15*time.Minute, 1)
+				in.CurrentUpToDate, in.Generation = masterCurrent(masterPermissionDeniedReason, masterDenied, masterGeneration), masterGeneration
+			}},
+		{name: "without the inputs that cost a call", master: "1.x", quoted: `"1.x"`,
+			mutate: func(in *MasterVersionInput) { in.Offered, in.Workers, in.WorkersListed = nil, nil, false }},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			in := fx.iks("1.37")
+			in.Cluster.MasterKubeVersion = tc.master
+			if tc.mutate != nil {
+				tc.mutate(&in)
+			}
+			got, err := DecideMasterAction(in)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(got).To(Equal(MasterAction{UpToDate: metav1.Condition{
+				Type:   controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition,
+				Status: metav1.ConditionUnknown,
+				Reason: controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateUnparsableMasterVersionReason,
+				Message: "IBM reports master version " + tc.quoted + " for IBM cluster iksclusterid00000001, which CAPIBM " +
+					"cannot parse, so it cannot tell whether the master runs spec.distributionVersion 1.37; CAPIBM requests no " +
+					"master update until IBM reports a version it can parse",
+			}}), "no other field: no request, no input asked for, RollingOut left as it is")
+		})
+	}
+}
+
+// TestMasterCallDefinitive pins which classes of a failed call of the master version step are reported and looked at
+// again at the next poll, and which ones their own handling retries; masterCallFailed and masterInputFailure both
+// follow it.
+func TestMasterCallDefinitive(t *testing.T) {
+	g := NewWithT(t)
+	for _, class := range []kubernetesservice.ErrorClass{kubernetesservice.ClassNotFound, kubernetesservice.ClassBadRequest,
+		kubernetesservice.ClassPermissionDenied, kubernetesservice.ClassClusterNameExists,
+		kubernetesservice.ClassInfrastructureKeyNotCreatable, kubernetesservice.ClassInfrastructureKeyDenied,
+		kubernetesservice.ClassPoolNameExists, kubernetesservice.ClassOperationInProgress, kubernetesservice.ClassClusterMinimum,
+		kubernetesservice.ClassAutoscaled, kubernetesservice.ClassMasterUpdateAlreadyRequested,
+		kubernetesservice.ClassVersionSkipNotAllowed} {
+		g.Expect(masterCallDefinitive(class)).To(BeTrue(), "class %q", class)
+	}
+	for _, class := range []kubernetesservice.ErrorClass{kubernetesservice.ClassNone, kubernetesservice.ClassUnauthorized,
+		kubernetesservice.ClassRateLimited, kubernetesservice.ClassTransient, kubernetesservice.ClassUnknown} {
+		g.Expect(masterCallDefinitive(class)).To(BeFalse(), "class %q", class)
+	}
+}
+
+// TestMasterInputFailure checks the pure part of the report of a failed input call: after a raise of
+// spec.distributionVersion, a definitive failure of the ListVersions or ListWorkers call of the master version step is
+// MasterVersionUpToDate=False with PermissionDenied (403: the call, the Kubernetes Service roles and the identity, like
+// the UpdateMaster 403) or IBMAPIError (other definitive answers), with IBM's code only; every other answer, a spec on
+// the master's minor, and IBM's version-skip refusal of the request on record (which the refusal row keeps until the
+// spec changes) write nothing, while a kept PermissionDenied of UpdateMaster is replaced.
+func TestMasterInputFailure(t *testing.T) {
+	fx := loadMasterFixtures(t)
+	const (
+		identity     = "the CAPIBM controller identity"
+		versionsCall = "listing the versions IBM Cloud offers in region us-south"
+		workersCall  = "listing the workers of IBM cluster iksclusterid00000001"
+		retry        = "CAPIBM tries again at the next poll of the control plane"
+		roles        = "need the Administrator platform role and the Manager service role of Kubernetes Service on the cluster's resource group"
+		versionSkip  = controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateVersionSkipNotAllowedReason
+		// skipRefused is the message MasterUpdateCallOutcome writes for IBM's version-skip refusal of 1.37.
+		skipRefused = "IBM refused the master update to 1.37 as a version skip; set spec.distributionVersion to the master's " +
+			"next minor; CAPIBM requests no update until the spec changes"
+	)
+	answer := func(op kubernetesservice.Operation, status int, code string) error {
+		return &kubernetesservice.APIError{Operation: op, StatusCode: status, Code: code, IncidentID: "inc-0001",
+			Description: "IBM's own words, which stay in the controller log"}
+	}
+	iks := func() MasterVersionInput { return fx.iks("1.37") }
+	// withRecord returns in at masterGeneration with status.masterUpdate for version (requested 15 minutes before
+	// masterNow, attempt 1; none for "") and a MasterVersionUpToDate=False with reason and message written for
+	// generation.
+	withRecord := func(in MasterVersionInput, version, reason, message string, generation int64) MasterVersionInput {
+		if version != "" {
+			in.MasterUpdate = masterRequested(version, 15*time.Minute, 1)
+		}
+		in.CurrentUpToDate, in.Generation = masterCurrent(reason, message, generation), masterGeneration
+		return in
+	}
+	testCases := []struct {
+		name string
+		in   func() MasterVersionInput
+		op   kubernetesservice.Operation
+		call string
+		err  error
+		// wantReason is the condition's reason; "" when no condition is written.
+		wantReason  string
+		wantMessage string
+	}{
+		{name: "403 to ListVersions is PermissionDenied", in: iks, op: kubernetesservice.OpListVersions, call: versionsCall,
+			err: answer(kubernetesservice.OpListVersions, http.StatusForbidden, "E3c1a"), wantReason: masterPermissionDeniedReason,
+			wantMessage: masterListDenied},
+		{name: "403 without a code to ListWorkers is PermissionDenied", in: iks, op: kubernetesservice.OpListWorkers,
+			call: workersCall, err: answer(kubernetesservice.OpListWorkers, http.StatusForbidden, ""), wantReason: masterPermissionDeniedReason,
+			wantMessage: "IBM Cloud Kubernetes Service refused " + workersCall + " with HTTP 403, so the master update to 1.37 waits: " +
+				"the credentials of " + identity + " " + roles + "; " + retry},
+		{name: "ROKS names the OpenShift minor", in: func() MasterVersionInput { return fx.roks("4.22") },
+			op: kubernetesservice.OpListWorkers, call: workersCall, err: answer(kubernetesservice.OpListWorkers, http.StatusForbidden, "E3c1a"),
+			wantReason: masterPermissionDeniedReason,
+			wantMessage: "IBM Cloud Kubernetes Service refused " + workersCall + " with HTTP 403 (IBM code E3c1a), so the master " +
+				"update to 4.22 waits: the credentials of " + identity + " " + roles + "; " + retry},
+		{name: "404 to ListWorkers is IBMAPIError", in: iks, op: kubernetesservice.OpListWorkers, call: workersCall,
+			err:        answer(kubernetesservice.OpListWorkers, http.StatusNotFound, "G0004"),
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateIBMAPIErrorReason,
+			wantMessage: "IBM Cloud Kubernetes Service refused " + workersCall + " with HTTP 404 (IBM code G0004), so the master " +
+				"update to 1.37 waits; " + retry + ", and the controller log has IBM's description"},
+		{name: "400 to ListVersions is IBMAPIError", in: iks, op: kubernetesservice.OpListVersions, call: versionsCall,
+			err:        answer(kubernetesservice.OpListVersions, http.StatusBadRequest, "E0001"),
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateIBMAPIErrorReason,
+			wantMessage: "IBM Cloud Kubernetes Service refused " + versionsCall + " with HTTP 400 (IBM code E0001), so the master " +
+				"update to 1.37 waits; " + retry + ", and the controller log has IBM's description"},
+		{name: "a request kubernetesservice refused to send is IBMAPIError", in: iks, op: kubernetesservice.OpListWorkers,
+			call: workersCall, err: fmt.Errorf("%w: ListWorkers: the cluster ID is empty", kubernetesservice.ErrInvalidRequest),
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateIBMAPIErrorReason,
+			wantMessage: "CAPIBM could not complete " + workersCall + ", so the master update to 1.37 waits; " + retry +
+				", and the controller log names the cause"},
+		{name: "a 401 is retried with a rebuilt authenticator", in: iks, op: kubernetesservice.OpListVersions, call: versionsCall,
+			err: answer(kubernetesservice.OpListVersions, http.StatusUnauthorized, "")},
+		{name: "credentials IAM rejected are retried with a rebuilt authenticator", in: iks, op: kubernetesservice.OpListVersions,
+			call: versionsCall, err: kubernetesservice.ErrCredentialsRejected},
+		{name: "a 429 is retried after Retry-After", in: iks, op: kubernetesservice.OpListWorkers, call: workersCall,
+			err: answer(kubernetesservice.OpListWorkers, http.StatusTooManyRequests, "")},
+		{name: "a 5xx is retried with backoff", in: iks, op: kubernetesservice.OpListWorkers, call: workersCall,
+			err: answer(kubernetesservice.OpListWorkers, http.StatusServiceUnavailable, "")},
+		{name: "a network error is retried with backoff", in: iks, op: kubernetesservice.OpListVersions, call: versionsCall,
+			err: errors.New("connection reset by peer")},
+		{name: "an unclassified answer is retried with backoff", in: iks, op: kubernetesservice.OpListWorkers, call: workersCall,
+			err: answer(kubernetesservice.OpListWorkers, http.StatusConflict, "")},
+		{name: "a spec on the master's minor keeps its condition", in: func() MasterVersionInput { return fx.iks("1.36") },
+			op: kubernetesservice.OpListVersions, call: versionsCall, err: answer(kubernetesservice.OpListVersions, http.StatusForbidden, "E3c1a")},
+		{name: "a master version that does not parse is the decision's report", op: kubernetesservice.OpListVersions, call: versionsCall,
+			err: answer(kubernetesservice.OpListVersions, http.StatusForbidden, "E3c1a"),
+			in: func() MasterVersionInput {
+				in := fx.iks("1.37")
+				in.Cluster.MasterKubeVersion = "garbage"
+				return in
+			}},
+		{name: "an input the decision rejects", op: kubernetesservice.OpListVersions, call: versionsCall,
+			err: answer(kubernetesservice.OpListVersions, http.StatusForbidden, "E3c1a"),
+			in:  func() MasterVersionInput { return fx.iks("1.37.1") }},
+		{name: "IBM's version-skip refusal of the request on record stays until the spec changes",
+			op: kubernetesservice.OpListVersions, call: versionsCall, err: answer(kubernetesservice.OpListVersions, http.StatusForbidden, "E3c1a"),
+			in: func() MasterVersionInput {
+				return withRecord(iks(), "1.37", versionSkip, skipRefused, masterGeneration)
+			}},
+		{name: "a ROKS version-skip refusal stays whatever the definitive answer", op: kubernetesservice.OpListWorkers,
+			call: workersCall, err: answer(kubernetesservice.OpListWorkers, http.StatusNotFound, "G0004"),
+			in: func() MasterVersionInput {
+				return withRecord(fx.roks("4.22"), "4.22_openshift", versionSkip,
+					"IBM refused the master update to 4.22_openshift as a version skip", masterGeneration)
+			}},
+		{name: "a version-skip refusal of an earlier generation is replaced", op: kubernetesservice.OpListVersions,
+			call: versionsCall, err: answer(kubernetesservice.OpListVersions, http.StatusForbidden, "E3c1a"),
+			in: func() MasterVersionInput {
+				return withRecord(iks(), "1.37", versionSkip, skipRefused, masterGeneration-1)
+			},
+			wantReason: masterPermissionDeniedReason, wantMessage: masterListDenied},
+		{name: "row 7's own version skip without a request for the desired minor is replaced",
+			op: kubernetesservice.OpListVersions, call: versionsCall, err: answer(kubernetesservice.OpListVersions, http.StatusForbidden, "E3c1a"),
+			in: func() MasterVersionInput {
+				// The master moved from 1.35 to 1.36 outside CAPIBM within this generation; the request on record is older.
+				return withRecord(iks(), "1.36", versionSkip, "spec.distributionVersion 1.37 is more than one minor above "+
+					"the master's minor 1.35", masterGeneration)
+			},
+			wantReason: masterPermissionDeniedReason, wantMessage: masterListDenied},
+		{name: "a kept PermissionDenied of UpdateMaster is replaced", op: kubernetesservice.OpListVersions,
+			call: versionsCall, err: answer(kubernetesservice.OpListVersions, http.StatusForbidden, "E3c1a"),
+			in: func() MasterVersionInput {
+				return withRecord(iks(), "1.37", masterPermissionDeniedReason, masterDenied, masterGeneration)
+			},
+			wantReason: masterPermissionDeniedReason, wantMessage: masterListDenied},
+	}
+	identityDetail := regexp.MustCompile(`iam-Service[I]d-|IB[M]id-|KubeCert[#]|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+|([0-9a-f]{2}:){7,}`)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			got, ok := masterInputFailure(tc.in(), kubernetesservice.Classify(tc.op, tc.err), tc.call, tc.err, identity)
+			if tc.wantReason == "" {
+				g.Expect(ok).To(BeFalse())
+				g.Expect(got).To(Equal(metav1.Condition{}))
+				return
+			}
+			g.Expect(ok).To(BeTrue())
+			g.Expect(got).To(Equal(masterCondition(tc.wantReason, tc.wantMessage)))
+			g.Expect(identityDetail.MatchString(got.Message)).To(BeFalse(), got.Message)
+			g.Expect(got.Message).NotTo(ContainSubstring("inc-0001"), "the incident ID goes to the controller log only")
+			g.Expect(got.Message).NotTo(ContainSubstring("IBM's own words"), "IBM's description goes to the controller log only")
+		})
+	}
+
+	t.Run("a new incident ID gives the same condition", func(t *testing.T) {
+		g := NewWithT(t)
+		first := &kubernetesservice.APIError{Operation: kubernetesservice.OpListWorkers, StatusCode: http.StatusForbidden, Code: "E3c1a",
+			IncidentID: "inc-0001"}
+		second := *first
+		second.IncidentID = "inc-0002"
+		a, _ := masterInputFailure(fx.iks("1.37"), kubernetesservice.ClassPermissionDenied, workersCall, first, identity)
+		b, _ := masterInputFailure(fx.iks("1.37"), kubernetesservice.ClassPermissionDenied, workersCall, &second, identity)
+		g.Expect(b).To(Equal(a))
+	})
+}
+
+// TestMasterUpdateDeniedPrefix pins the record of an UpdateMaster 403 that the refusal row reads: the start of the
+// message MasterUpdateCallOutcome writes, which the PermissionDenied of a failed input call never starts with.
+func TestMasterUpdateDeniedPrefix(t *testing.T) {
+	g := NewWithT(t)
+	forbidden := &kubernetesservice.APIError{Operation: kubernetesservice.OpUpdateMaster, StatusCode: http.StatusForbidden, Code: "E3c1a"}
+	for _, version := range []string{"1.37", "4.22_openshift"} {
+		outcome, err := MasterUpdateCallOutcome(forbidden, masterRequested(version, 0, 1), "the CAPIBM controller identity")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(outcome.Message).To(HavePrefix(masterUpdateDeniedPrefix(version)))
+	}
+	g.Expect(masterUpdateDeniedPrefix("1.37")).To(Equal("IBM Cloud Kubernetes Service refused the master update to 1.37 with HTTP 403"))
+	g.Expect(masterListDenied).NotTo(HavePrefix(masterUpdateDeniedPrefix("1.37")))
+	g.Expect(masterDenied).NotTo(HavePrefix(masterUpdateDeniedPrefix("1.3")), "the version is followed by the status")
 }
 
 func TestMasterRetryDelay(t *testing.T) {

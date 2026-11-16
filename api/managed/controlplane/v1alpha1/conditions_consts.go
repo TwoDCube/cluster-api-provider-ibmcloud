@@ -229,7 +229,9 @@ const (
 
 	// IBMCloudManagedControlPlaneMasterVersionUpToDatePermissionDeniedReason surfaces when IBM refused UpdateMaster with
 	// HTTP 403: the credentials lack the Kubernetes Service role (CAPIBM never requests more than one minor step, so a 403
-	// is not a version-skip refusal); the update is requested again on the retry backoff.
+	// is not a version-skip refusal); the update is requested again on the retry backoff. It also surfaces when, after a
+	// raise of spec.distributionVersion, IBM refused with HTTP 403 a call that the update needs before it can be requested
+	// (listing the offered versions or the workers); that call is made again at the next poll of the control plane.
 	IBMCloudManagedControlPlaneMasterVersionUpToDatePermissionDeniedReason = "PermissionDenied"
 )
 

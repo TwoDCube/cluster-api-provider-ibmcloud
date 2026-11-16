@@ -51,6 +51,10 @@ import (
 //   - The decision's RecheckAt (the end of the pending grace, or the retry time a message names) goes to the controller
 //     through MasterVersionRequeueAfter, which requeues no later than it: a refused or failed request is sent again at
 //     that time without a spec change or a manual trigger.
+//   - A call for an input that IBM answers definitively after a raise of spec.distributionVersion (a 403, 400 or 404 to
+//     ListVersions or ListWorkers) sets MasterVersionUpToDate=False with PermissionDenied or IBMAPIError
+//     (masterInputFailure), so the condition no longer says the master runs the minor the spec asks for; the call is
+//     made again at the next poll.
 //
 // The step runs only for an initialized control plane: until then IBM is still creating the master at
 // spec.distributionVersion. It does not run in a reconcile in which IBM answered a call of the access steps with 429
@@ -151,12 +155,14 @@ func (s *ControlPlaneScope) masterInput(c *kubernetesservice.Cluster) MasterVers
 
 // decideMaster runs DecideMasterAction and fetches the inputs it asks for, each followed by a fresh decision: the
 // offered versions through the VersionsCache, then the workers through one ListWorkers. It writes the answers into in,
-// so that a decision after the request sees them. ok is false when the step ends without a decision: an input call
-// failed (failed says how to go on), or DecideMasterAction rejected its input (logged; the step then waits for the next
-// steady poll, because IBM's masterKubeVersion is what does not parse, and only a parser change helps: the forms IBM
-// reports during a master update are not yet verified against IBM Cloud). Neither writes a condition, so the
-// MasterVersionUpToDate of an earlier reconcile stays in place; masterCallFailed names the known limitation that
-// follows.
+// so that a decision after the request sees them. ok is false when the step ends without a decision:
+//
+//   - An input call failed; failed says how to go on, and a definitive answer has set MasterVersionUpToDate
+//     (masterInputFailed).
+//   - DecideMasterAction rejected its input: one of CAPIBM's own (spec.distributionVersion, status.masterUpdate.version)
+//     does not parse, which the webhooks and this step's own writes prevent. It is logged and nothing is written; the
+//     step waits for the next steady poll. A masterKubeVersion of IBM's that does not parse is no error: the decision
+//     reports it as MasterVersionUpToDate=Unknown.
 //
 // Parameters:
 //   - ctx is the reconcile context.
@@ -170,13 +176,13 @@ func (s *ControlPlaneScope) decideMaster(ctx context.Context, in *MasterVersionI
 		}
 		switch {
 		case action.NeedsOfferedVersions && in.Offered == nil:
-			versions, failed, ok := s.masterOfferedVersions(ctx)
+			versions, failed, ok := s.masterOfferedVersions(ctx, *in)
 			if !ok {
 				return MasterAction{}, failed, false
 			}
 			in.Offered = versions
 		case action.NeedsWorkers && !in.WorkersListed:
-			workers, failed, ok := s.masterWorkers(ctx, in.Cluster.ID)
+			workers, failed, ok := s.masterWorkers(ctx, *in)
 			if !ok {
 				return MasterAction{}, failed, false
 			}
@@ -194,11 +200,12 @@ func (s *ControlPlaneScope) decideMaster(ctx context.Context, in *MasterVersionI
 
 // masterOfferedVersions returns IBM's offered versions through the VersionsCache of the identity and region, so that
 // IBM is asked at most once per cache lifetime whatever the number of control planes. ok is false when the list
-// failed; failed then says how to go on (masterCallFailed).
+// failed; failed then says how to go on (masterInputFailed).
 //
 // Parameters:
 //   - ctx is the reconcile context.
-func (s *ControlPlaneScope) masterOfferedVersions(ctx context.Context) (*kubernetesservice.Versions, masterVersionStep, bool) {
+//   - in is the input of the decision that asked for the versions.
+func (s *ControlPlaneScope) masterOfferedVersions(ctx context.Context, in MasterVersionInput) (*kubernetesservice.Versions, masterVersionStep, bool) {
 	clients, err := s.ibm(ctx)
 	if err != nil {
 		return nil, masterVersionStep{outcome: Transient(err)}, false
@@ -206,29 +213,49 @@ func (s *ControlPlaneScope) masterOfferedVersions(ctx context.Context) (*kuberne
 	region := s.InfraCluster.Spec.Region
 	versions, err := s.params.VersionsCache.Get(ctx, clients.identity.Key, region, clients.kubernetes.ListVersions)
 	if err != nil {
-		return nil, masterVersionStep{outcome: s.masterCallFailed(ctx, &controlPlaneCallError{identity: clients.identity,
+		return nil, masterVersionStep{outcome: s.masterInputFailed(ctx, in, &controlPlaneCallError{identity: clients.identity,
 			op: kubernetesservice.OpListVersions, action: "listing the versions IBM Cloud offers in region " + region, err: err})}, false
 	}
 	return versions, masterVersionStep{}, true
 }
 
 // masterWorkers lists every worker of the cluster with one ListWorkers call, for the worker skew guard of
-// DecideMasterAction row 9. ok is false when the list failed; failed then says how to go on (masterCallFailed).
+// DecideMasterAction row 9. ok is false when the list failed; failed then says how to go on (masterInputFailed).
 //
 // Parameters:
 //   - ctx is the reconcile context.
-//   - clusterID is the IBM cluster ID.
-func (s *ControlPlaneScope) masterWorkers(ctx context.Context, clusterID string) ([]kubernetesservice.Worker, masterVersionStep, bool) {
+//   - in is the input of the decision that asked for the workers; in.Cluster.ID is the IBM cluster ID.
+func (s *ControlPlaneScope) masterWorkers(ctx context.Context, in MasterVersionInput) ([]kubernetesservice.Worker, masterVersionStep, bool) {
 	clients, err := s.ibm(ctx)
 	if err != nil {
 		return nil, masterVersionStep{outcome: Transient(err)}, false
 	}
+	clusterID := in.Cluster.ID
 	workers, err := clients.kubernetes.ListWorkers(ctx, clusterID)
 	if err != nil {
-		return nil, masterVersionStep{outcome: s.masterCallFailed(ctx, &controlPlaneCallError{identity: clients.identity,
+		return nil, masterVersionStep{outcome: s.masterInputFailed(ctx, in, &controlPlaneCallError{identity: clients.identity,
 			op: kubernetesservice.OpListWorkers, action: "listing the workers of IBM cluster " + clusterID, err: err})}, false
 	}
 	return workers, masterVersionStep{}, true
+}
+
+// masterInputFailed reports a failed call for an input of DecideMasterAction (ListVersions, ListWorkers) and returns how
+// to go on. A definitive answer after a raise of spec.distributionVersion sets MasterVersionUpToDate from
+// masterInputFailure first, so that the condition no longer says the master runs the minor the spec asks for;
+// masterCallFailed then logs IBM's whole answer and gives the outcome, whose reason is that condition's. The
+// condition's message is the same for the same failure, whatever IBM's incident ID, so a repeated failure writes no
+// status. Every other answer leaves the condition as it is (masterInputFailure).
+//
+// Parameters:
+//   - ctx carries the reconcile's logger.
+//   - in is the input of the decision that asked for the call.
+//   - callErr is the failed call.
+func (s *ControlPlaneScope) masterInputFailed(ctx context.Context, in MasterVersionInput, callErr *controlPlaneCallError) Outcome {
+	class := kubernetesservice.Classify(callErr.op, callErr.err)
+	if condition, ok := masterInputFailure(in, class, callErr.action, callErr.err, callErr.identity.Description); ok {
+		conditions.Set(s.ControlPlane, condition)
+	}
+	return s.masterCallFailed(ctx, callErr)
 }
 
 // requestMasterUpdate is DecideMasterAction row 12: it records the request (status.masterUpdate, MasterVersionUpToDate
@@ -337,8 +364,8 @@ func (s *ControlPlaneScope) applyMasterAction(action MasterAction) {
 // intervals of outcome.go): masterUpdatePoll while IBM shows an update or a request awaits it (row 1, row 10); Done for
 // an up-to-date master; Terminal for what only a human fixes (a spec IBM cannot reach, rows 6-8, and a kept refusal);
 // the CA rotation poll while a rotation blocks the update (row 4); the steady interval for the other holds (rows 5, 9
-// and 11), which change on IBM's schedule. RecheckAt, which the controller applies as well, brings a retry time
-// forward.
+// and 11) and for a master version that does not parse (Unknown), which change on IBM's schedule. RecheckAt, which the
+// controller applies as well, brings a retry time forward.
 //
 // Parameters:
 //   - action is DecideMasterAction's answer; RequestUpdate is false.
@@ -365,46 +392,41 @@ func masterWaitOutcome(action MasterAction) Outcome {
 	}
 }
 
-// masterCallFailed reports a failed IBM call of the master version step (ListVersions, ListWorkers, or an UpdateMaster
-// answer MasterUpdateCallOutcome leaves to the caller) and returns how to go on, by the class that
-// kubernetesservice.Classify gives it. It writes no condition: the step's conditions report the update, not the call,
-// and IBMClusterProvisioned, which reports the calls of the binding, was set True by the GetCluster of this reconcile,
-// so flipping it here would move its transition time on every reconcile. The reasons:
+// masterCallFailed returns how to go on after a failed IBM call of the master version step (ListVersions, ListWorkers,
+// or an UpdateMaster answer MasterUpdateCallOutcome leaves to the caller), by the class that kubernetesservice.Classify
+// gives it. It writes no condition itself: masterInputFailed sets MasterVersionUpToDate for a failed input call before
+// it calls this, the grace and backoff rows report a failed UpdateMaster, and IBMClusterProvisioned, which reports the
+// calls of the binding, was set True by the GetCluster of this reconcile, so flipping it here would move its
+// transition time on every reconcile. The outcome's reason is MasterVersionUpToDate's. The classes:
 //
 //   - 401: only this identity's authenticator is rebuilt; the next attempt follows at the steady interval, about 5
 //     minutes later.
 //   - 429: the rate-limit backoff.
 //   - 5xx, timeouts, connection errors and anything unknown: the error is returned, for controller-runtime's backoff.
-//   - Every other answer (403, 400, 404) is definitive for now: it is logged with IBM's whole answer, incident ID
+//   - Every definitive answer (masterCallDefinitive: 403, 400, 404) is logged with IBM's whole answer, incident ID
 //     included, and the step asks for terminalRecheck. The controller merges that with the flow's requeue
 //     (resultWithMasterVersion), so the step in fact runs again at the next poll of the control plane, usually the
 //     5 m steady poll, and no later than RecheckAt when the decision named one: a failed ListVersions or ListWorkers
 //     is then made again. An UpdateMaster answer of this kind is not sent again then; the grace and backoff rows hold
 //     it, because status.masterUpdate records the attempt.
 //
-// Known limitation: because a failed ListVersions or ListWorkers writes nothing, the MasterVersionUpToDate of an
-// earlier reconcile stays as it is until the call succeeds, at every poll. After a raise of spec.distributionVersion
-// that is a True/UpToDate whose message still says the master runs the minor the spec asks for; only its
-// observedGeneration, older than metadata.generation, and the controller log show that it is stale. A
-// MasterVersionUpToDate reason for a failed input call would need a new API constant and its documentation.
-//
 // Parameters:
 //   - ctx carries the reconcile's logger.
 //   - callErr is the failed call.
 func (s *ControlPlaneScope) masterCallFailed(ctx context.Context, callErr *controlPlaneCallError) Outcome {
 	reason := conditions.GetReason(s.ControlPlane, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition)
-	switch kubernetesservice.Classify(callErr.op, callErr.err) {
-	case kubernetesservice.ClassUnauthorized:
+	switch class := kubernetesservice.Classify(callErr.op, callErr.err); {
+	case class == kubernetesservice.ClassUnauthorized:
 		s.params.ClientBuilder.InvalidateAuthenticator(callErr.identity.Key)
 		logIBMRefusal(ctx, callErr)
 		return NotDone(IntervalSteadyState, reason)
-	case kubernetesservice.ClassRateLimited:
+	case class == kubernetesservice.ClassRateLimited:
 		return RateLimited(kubernetesservice.RateLimitBackoff(callErr.err))
-	case kubernetesservice.ClassTransient, kubernetesservice.ClassUnknown:
-		return Transient(callErr)
-	default:
+	case masterCallDefinitive(class):
 		logIBMRefusal(ctx, callErr)
 		return NotDone(IntervalTerminalRecheck, reason)
+	default:
+		return Transient(callErr)
 	}
 }
 

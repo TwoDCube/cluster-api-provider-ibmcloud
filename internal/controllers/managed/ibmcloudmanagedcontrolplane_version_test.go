@@ -821,38 +821,190 @@ func TestControlPlaneMasterUpdateProgress(t *testing.T) {
 	})
 }
 
+// masterStaleUpToDate is the MasterVersionUpToDate=True of the master's minor 1.36, as it was written for the generation
+// before spec.distributionVersion was raised to 1.37: the stale True that a definitive failure of an input call of the
+// master update must replace.
+const masterStaleUpToDate = "the master runs 1.36.5_1537, minor 1.36 as spec.distributionVersion asks; IBM applies master patches itself"
+
+// withStaleUpToDate gives the control plane the True of masterStaleUpToDate, written for the generation before the
+// raise of spec.distributionVersion.
+func withStaleUpToDate(objs *cpObjects) {
+	objs.cp.Status.Conditions = append(objs.cp.Status.Conditions, metav1.Condition{
+		Type: controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition, Status: metav1.ConditionTrue,
+		Reason: controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateReason, Message: masterStaleUpToDate,
+		ObservedGeneration: masterTestGeneration - 1, LastTransitionTime: metav1.NewTime(cpTestStart.Add(-24 * time.Hour))})
+}
+
+// expectStaleUpToDate checks that the persisted control plane still carries the True of withStaleUpToDate.
+func (f *cpFixture) expectStaleUpToDate(g Gomega) {
+	upToDate, _ := f.masterConditions()
+	g.ExpectWithOffset(1, upToDate).NotTo(BeNil())
+	g.ExpectWithOffset(1, upToDate.Status).To(Equal(metav1.ConditionTrue))
+	g.ExpectWithOffset(1, upToDate.Message).To(Equal(masterStaleUpToDate), "the condition is left as it is")
+	g.ExpectWithOffset(1, upToDate.ObservedGeneration).To(Equal(int64(masterTestGeneration - 1)))
+}
+
+// TestControlPlaneMasterVersionInputFailures runs the failures of the calls for the inputs of the master update
+// (ListVersions, ListWorkers) through Reconcile: after a raise of spec.distributionVersion a definitive answer
+// replaces the stale MasterVersionUpToDate=True of the old minor with False (PermissionDenied for a 403, IBMAPIError
+// for the others) with IBM's code only, writes no status while the same failure repeats, also with a new incident ID,
+// and is looked at again at the next poll; the answers that their own handling retries leave the condition as it is.
+// No UpdateMaster is sent in any of them.
 func TestControlPlaneMasterVersionInputFailures(t *testing.T) {
-	t.Run("a 403 on ListWorkers sends no UpdateMaster and changes no condition", func(t *testing.T) {
+	const workersDenied = "IBM Cloud Kubernetes Service refused listing the workers of IBM cluster iksclusterid00000001 with " +
+		"HTTP 403 (IBM code E3e8a), so the master update to 1.37 waits: the credentials of the CAPIBM controller identity need " +
+		"the Administrator platform role and the Manager service role of Kubernetes Service on the cluster's resource group; " +
+		"CAPIBM tries again at the next poll of the control plane"
+	listWorkersFails := func(f *cpFixture, status int, code, incident string) *gomock.Call {
+		return f.kube.EXPECT().ListWorkers(gomock.Any(), cpIKSClusterID).
+			Return(nil, ibmErrorWithIncident(kubernetesservice.OpListWorkers, status, code, incident))
+	}
+
+	t.Run("a 403 on ListWorkers after a raise is PermissionDenied and settles until the role is granted", func(t *testing.T) {
 		g := NewWithT(t)
-		f := newMasterFixture(t, "1.37", nil)
-		gomock.InOrder(f.expectObserve(cpCluster("normal")), f.expectVersions(),
-			f.kube.EXPECT().ListWorkers(gomock.Any(), cpIKSClusterID).
-				Return(nil, ibmErrorWithIncident(kubernetesservice.OpListWorkers, http.StatusForbidden, "", "incident-a")))
+		f := newMasterFixture(t, "1.37", withStaleUpToDate)
+		normal := cpCluster("normal")
+		gomock.InOrder(f.expectObserve(normal), f.expectVersions(), listWorkersFails(f, http.StatusForbidden, "E3e8a", "incident-a"))
 
 		result, err := f.reconcile()
 
 		g.Expect(err).NotTo(HaveOccurred())
 		expectRequeue(g, result, 5*time.Minute)
 		cp := f.controlPlane()
-		g.Expect(cp.Status.MasterUpdate).To(BeZero())
+		g.Expect(cp.Status.MasterUpdate).To(BeZero(), "no UpdateMaster")
+		upToDate := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition,
+			metav1.ConditionFalse, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDatePermissionDeniedReason)
+		g.Expect(upToDate.Message).To(Equal(workersDenied))
+		g.Expect(upToDate.ObservedGeneration).To(Equal(int64(masterTestGeneration)))
+		expectNoIdentityDetails(g, upToDate.Message)
 		expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, metav1.ConditionTrue,
 			controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedReason)
+		for _, body := range f.patches() {
+			g.Expect(body).NotTo(ContainSubstring("incident-a"), "the incident ID goes to the controller log only")
+		}
+		settled := len(f.patches())
+
+		// The next poll gets the same refusal with a new incident ID: the same condition, so no status write.
+		_, err = f.reconcileAt(5*time.Minute, func() {
+			gomock.InOrder(f.expectObserve(normal), listWorkersFails(f, http.StatusForbidden, "E3e8a", "incident-b"))
+		})
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(f.patches()).To(HaveLen(settled), "a repeated refusal writes no status")
+
+		// The role is granted: the next poll lists the workers and requests the update.
+		_, err = f.reconcileAt(10*time.Minute, func() { f.expectRequest(normal, nil, "1.37", nil) })
+		g.Expect(err).NotTo(HaveOccurred())
+		upToDate, _ = f.masterConditions()
+		g.Expect(upToDate.Reason).To(Equal(controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateUpgradePendingReason))
+		expectMasterUpdate(g, f.controlPlane().Status.MasterUpdate, masterRecorded("1.37", 10*time.Minute, 1))
 	})
 
-	t.Run("a 5xx on ListVersions is returned for the backoff", func(t *testing.T) {
+	t.Run("a 403 on ListVersions after a raise replaces the stale UpToDate", func(t *testing.T) {
 		g := NewWithT(t)
-		f := newMasterFixture(t, "1.37", nil)
+		f := newMasterFixture(t, "1.37", withStaleUpToDate)
+		gomock.InOrder(f.expectObserve(cpCluster("normal")), f.kube.EXPECT().ListVersions(gomock.Any()).
+			Return(nil, ibmErrorWithIncident(kubernetesservice.OpListVersions, http.StatusForbidden, "", "incident-a")))
+
+		result, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		expectRequeue(g, result, 5*time.Minute)
+		upToDate := expectCondition(g, f.controlPlane(), controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition,
+			metav1.ConditionFalse, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDatePermissionDeniedReason)
+		g.Expect(upToDate.Message).To(Equal("IBM Cloud Kubernetes Service refused listing the versions IBM Cloud offers in region " +
+			"us-south with HTTP 403, so the master update to 1.37 waits: the credentials of the CAPIBM controller identity need " +
+			"the Administrator platform role and the Manager service role of Kubernetes Service on the cluster's resource " +
+			"group; CAPIBM tries again at the next poll of the control plane"))
+	})
+
+	t.Run("a 404 on ListWorkers is IBMAPIError with IBM's code only", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newMasterFixture(t, "1.37", withStaleUpToDate)
+		gomock.InOrder(f.expectObserve(cpCluster("normal")), f.expectVersions(),
+			listWorkersFails(f, http.StatusNotFound, "G0004", "incident-a"))
+
+		result, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		expectRequeue(g, result, 5*time.Minute)
+		upToDate := expectCondition(g, f.controlPlane(), controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition,
+			metav1.ConditionFalse, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateIBMAPIErrorReason)
+		g.Expect(upToDate.Message).To(Equal("IBM Cloud Kubernetes Service refused listing the workers of IBM cluster " +
+			"iksclusterid00000001 with HTTP 404 (IBM code G0004), so the master update to 1.37 waits; CAPIBM tries again at the " +
+			"next poll of the control plane, and the controller log has IBM's description"))
+	})
+
+	t.Run("a 400 on ListVersions is IBMAPIError", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newMasterFixture(t, "1.37", withStaleUpToDate)
+		gomock.InOrder(f.expectObserve(cpCluster("normal")), f.kube.EXPECT().ListVersions(gomock.Any()).
+			Return(nil, ibmErrorWithIncident(kubernetesservice.OpListVersions, http.StatusBadRequest, "E0001", "incident-a")))
+
+		_, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		upToDate := expectCondition(g, f.controlPlane(), controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition,
+			metav1.ConditionFalse, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateIBMAPIErrorReason)
+		g.Expect(upToDate.Message).To(HavePrefix("IBM Cloud Kubernetes Service refused listing the versions IBM Cloud offers in " +
+			"region us-south with HTTP 400 (IBM code E0001), so the master update to 1.37 waits"))
+	})
+
+	t.Run("after a ListVersions 403 a recorded request returns to its hold", func(t *testing.T) {
+		g := NewWithT(t)
+		// A request is on record; its retry time is 50 minutes away. The 403 of the listing is no refusal of UpdateMaster,
+		// so once the listing works again the backoff row reports the request, not the listing's refusal.
+		f := newMasterFixture(t, "1.37", func(objs *cpObjects) {
+			objs.cp.Status.MasterUpdate = masterRecorded("1.37", -10*time.Minute, 1)
+		})
+		gomock.InOrder(f.expectObserve(cpCluster("normal")), f.kube.EXPECT().ListVersions(gomock.Any()).
+			Return(nil, ibmErrorWithIncident(kubernetesservice.OpListVersions, http.StatusForbidden, "E3c1a", "incident-a")))
+		_, err := f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+		upToDate, _ := f.masterConditions()
+		g.Expect(upToDate.Reason).To(Equal(controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDatePermissionDeniedReason))
+
+		// No ListWorkers and no UpdateMaster: the backoff row holds the request (gomock fails the test on a call).
+		result, err := f.reconcileAt(time.Minute, func() { gomock.InOrder(f.expectObserve(cpCluster("normal")), f.expectVersions()) })
+
+		g.Expect(err).NotTo(HaveOccurred())
+		expectRequeue(g, result, 5*time.Minute)
+		upToDate, _ = f.masterConditions()
+		g.Expect(upToDate.Reason).To(Equal(controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateUpgradeFailedReason))
+		g.Expect(upToDate.Message).To(Equal("the master update to 1.37 that CAPIBM requested at 2026-11-16T02:55:30Z has not " +
+			"taken effect: the master still runs 1.36.5_1537 and IBM shows no update in progress; CAPIBM requests it again at " +
+			"2026-11-16T03:55:30Z"))
+		expectMasterUpdate(g, f.controlPlane().Status.MasterUpdate, masterRecorded("1.37", -10*time.Minute, 1))
+	})
+
+	t.Run("a 401 on ListWorkers keeps the condition and rebuilds only this identity's authenticator", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newMasterFixture(t, "1.37", withStaleUpToDate)
+		gomock.InOrder(f.expectObserve(cpCluster("normal")), f.expectVersions(),
+			listWorkersFails(f, http.StatusUnauthorized, "", "incident-a"))
+
+		result, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		expectRequeue(g, result, 5*time.Minute)
+		g.Expect(f.builder.invalidated).To(Equal([]credentials.IdentityKey{credentials.ControllerKey()}))
+		f.expectStaleUpToDate(g)
+	})
+
+	t.Run("a 5xx on ListVersions is returned for the backoff and keeps the condition", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newMasterFixture(t, "1.37", withStaleUpToDate)
 		gomock.InOrder(f.expectObserve(cpCluster("normal")),
 			f.kube.EXPECT().ListVersions(gomock.Any()).Return(nil, ibmError(kubernetesservice.OpListVersions, http.StatusInternalServerError, "")))
 
 		_, err := f.reconcile()
 
 		g.Expect(err).To(MatchError(ContainSubstring("listing the versions IBM Cloud offers in region us-south")))
+		f.expectStaleUpToDate(g)
 	})
 
-	t.Run("a 429 on ListVersions waits for Retry-After", func(t *testing.T) {
+	t.Run("a 429 on ListVersions waits for Retry-After and keeps the condition", func(t *testing.T) {
 		g := NewWithT(t)
-		f := newMasterFixture(t, "1.37", nil)
+		f := newMasterFixture(t, "1.37", withStaleUpToDate)
 		gomock.InOrder(f.expectObserve(cpCluster("normal")),
 			f.kube.EXPECT().ListVersions(gomock.Any()).Return(nil, &kubernetesservice.APIError{Operation: kubernetesservice.OpListVersions,
 				StatusCode: http.StatusTooManyRequests, RetryAfter: 3 * time.Minute}))
@@ -861,7 +1013,54 @@ func TestControlPlaneMasterVersionInputFailures(t *testing.T) {
 
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(result.RequeueAfter).To(BeNumerically(">=", 3*time.Minute))
+		f.expectStaleUpToDate(g)
 	})
+}
+
+// TestControlPlaneMasterVersionUnparsable runs a masterKubeVersion CAPIBM cannot parse through Reconcile:
+// MasterVersionUpToDate turns Unknown with the reason UnparsableMasterVersion, no call is made beyond GetCluster,
+// RollingOut is not written, and the next poll writes no status while IBM keeps the value. Once IBM reports a version
+// that parses again, the next poll makes the normal decision: the Unknown holds nothing back, and the raised spec is
+// requested.
+func TestControlPlaneMasterVersionUnparsable(t *testing.T) {
+	g := NewWithT(t)
+	f := newMasterFixture(t, "1.37", withStaleUpToDate)
+	odd := cpCluster("normal")
+	odd.MasterKubeVersion = "1.37.1_1517(pending)"
+	f.expectObserve(odd)
+
+	result, err := f.reconcile()
+
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+	g.Expect(result.RequeueAfter).To(BeNumerically("<=", 5*time.Minute*11/10))
+	cp := f.controlPlane()
+	upToDate := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition,
+		metav1.ConditionUnknown, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateUnparsableMasterVersionReason)
+	g.Expect(upToDate.Message).To(Equal(`IBM reports master version "1.37.1_1517(pending)" for IBM cluster iksclusterid00000001, ` +
+		"which CAPIBM cannot parse, so it cannot tell whether the master runs spec.distributionVersion 1.37; CAPIBM requests " +
+		"no master update until IBM reports a version it can parse"))
+	g.Expect(conditions.Get(cp, controlplanev1.IBMCloudManagedControlPlaneRollingOutCondition)).To(BeNil(), "RollingOut is not written")
+	g.Expect(cp.Status.MasterUpdate).To(BeZero())
+	settled := len(f.patches())
+
+	_, err = f.reconcileAt(5*time.Minute, func() { f.expectObserve(odd) })
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(f.patches()).To(HaveLen(settled), "the same value writes no status")
+
+	// IBM reports 1.36.5_1537 again, one minor below the spec: the next poll lists the versions and the workers and
+	// requests the update (expectUpdateMaster checks that the request is on record first).
+	result, err = f.reconcileAt(10*time.Minute, func() {
+		gomock.InOrder(f.expectObserve(cpCluster("normal")), f.expectVersions(), f.expectWorkers(masterTestWorkers("1.36.5_1540")),
+			f.expectUpdateMaster("1.37", nil))
+	})
+	g.Expect(err).NotTo(HaveOccurred())
+	expectRequeueWithin(g, result, 5*time.Minute)
+	upToDate, rolling := f.masterConditions()
+	g.Expect(upToDate.Status).To(Equal(metav1.ConditionFalse))
+	g.Expect(upToDate.Reason).To(Equal(controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateUpgradePendingReason))
+	g.Expect(rolling.Status).To(Equal(metav1.ConditionTrue))
+	expectMasterUpdate(g, f.controlPlane().Status.MasterUpdate, masterRecorded("1.37", 10*time.Minute, 1))
 }
 
 func TestResultWithMasterVersion(t *testing.T) {
@@ -965,19 +1164,32 @@ func createEnvtestMasterControlPlane(t *testing.T, namespace string) client.Obje
 // TestControlPlaneEnvtestMasterUpdateSettles runs a master update request behind a manager, with the real watches and
 // a real clock, against the envtest API server with the CRD validation of every status write: the request's own status
 // patches re-trigger the controller, which must neither send UpdateMaster again within MasterUpdatePendingGrace nor
-// keep writing status, also when IBM refuses with a new incident ID on every answer.
+// keep writing status, also when IBM refuses with a new incident ID on every answer, and when it refuses the worker
+// listing the request needs first that way.
 func TestControlPlaneEnvtestMasterUpdateSettles(t *testing.T) {
+	answerWorkers := func(int64) ([]kubernetesservice.Worker, error) { return masterTestWorkers("1.36.5_1540"), nil }
 	for _, tc := range []struct {
 		name string
 		// answer is IBM's answer to the n-th UpdateMaster.
-		answer     func(n int64) error
+		answer func(n int64) error
+		// workers is IBM's answer to the n-th ListWorkers.
+		workers    func(n int64) ([]kubernetesservice.Worker, error)
 		wantReason string
+		// wantUpdates is the number of UpdateMaster calls; wantRecorded the status.masterUpdate.version they leave.
+		wantUpdates  int64
+		wantRecorded string
 	}{
-		{name: "accepted_request", answer: func(int64) error { return nil },
-			wantReason: controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateUpgradePendingReason},
+		{name: "accepted_request", answer: func(int64) error { return nil }, workers: answerWorkers,
+			wantReason:  controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateUpgradePendingReason,
+			wantUpdates: 1, wantRecorded: "1.37"},
 		{name: "UpdateMaster_403_with_a_new_incident_ID_on_every_answer", answer: func(n int64) error {
 			return ibmErrorWithIncident(kubernetesservice.OpUpdateMaster, http.StatusForbidden, "E3c1a", fmt.Sprintf("incident-%d", n))
-		}, wantReason: controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDatePermissionDeniedReason},
+		}, workers: answerWorkers, wantReason: controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDatePermissionDeniedReason,
+			wantUpdates: 1, wantRecorded: "1.37"},
+		{name: "ListWorkers_403_with_a_new_incident_ID_on_every_answer", answer: func(int64) error { return nil },
+			workers: func(n int64) ([]kubernetesservice.Worker, error) {
+				return nil, ibmErrorWithIncident(kubernetesservice.OpListWorkers, http.StatusForbidden, "E3e8a", fmt.Sprintf("incident-%d", n))
+			}, wantReason: controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDatePermissionDeniedReason},
 	} {
 		t.Run(tc.name+"_manager_settles", func(t *testing.T) {
 			t.Parallel()
@@ -985,7 +1197,7 @@ func TestControlPlaneEnvtestMasterUpdateSettles(t *testing.T) {
 			namespace := newTestNamespace(t, "cp-master")
 			key := createEnvtestMasterControlPlane(t, namespace)
 
-			var gets, updates atomic.Int64
+			var gets, updates, listings atomic.Int64
 			kube := ksmock.NewMockKubernetesService(gomock.NewController(t))
 			kube.EXPECT().GetCluster(gomock.Any(), cpIKSClusterID, "").DoAndReturn(
 				func(context.Context, string, string) (*kubernetesservice.Cluster, error) {
@@ -993,7 +1205,10 @@ func TestControlPlaneEnvtestMasterUpdateSettles(t *testing.T) {
 					return cpCluster("normal"), nil
 				}).AnyTimes()
 			kube.EXPECT().ListVersions(gomock.Any()).Return(masterTestVersions(), nil).AnyTimes()
-			kube.EXPECT().ListWorkers(gomock.Any(), cpIKSClusterID).Return(masterTestWorkers("1.36.5_1540"), nil).AnyTimes()
+			kube.EXPECT().ListWorkers(gomock.Any(), cpIKSClusterID).DoAndReturn(
+				func(context.Context, string) ([]kubernetesservice.Worker, error) {
+					return tc.workers(listings.Add(1))
+				}).AnyTimes()
 			kube.EXPECT().UpdateMaster(gomock.Any(), cpIKSClusterID, "1.37").DoAndReturn(
 				func(context.Context, string, string) error {
 					return tc.answer(updates.Add(1))
@@ -1007,7 +1222,7 @@ func TestControlPlaneEnvtestMasterUpdateSettles(t *testing.T) {
 				condition := conditions.Get(persisted, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition)
 				g.Expect(condition).NotTo(BeNil())
 				g.Expect(condition.Reason).To(Equal(tc.wantReason), condition.Message)
-				g.Expect(persisted.Status.MasterUpdate.Version).To(Equal("1.37"))
+				g.Expect(persisted.Status.MasterUpdate.Version).To(Equal(tc.wantRecorded))
 			}, 30*time.Second, 100*time.Millisecond).Should(Succeed())
 
 			// The start-up events of the Cluster and the control plane may add a reconcile or two; a hot loop makes
@@ -1021,7 +1236,7 @@ func TestControlPlaneEnvtestMasterUpdateSettles(t *testing.T) {
 			}, 10*time.Second, 500*time.Millisecond).Should(BeTrue(), "GetCluster calls keep growing")
 			g.Expect(settled).To(BeNumerically("<=", 6), "GetCluster calls before the status settled")
 			g.Consistently(gets.Load, noHotLoopWindow, 100*time.Millisecond).Should(Equal(settled))
-			g.Expect(updates.Load()).To(Equal(int64(1)), "exactly one UpdateMaster")
+			g.Expect(updates.Load()).To(Equal(tc.wantUpdates), "UpdateMaster calls")
 			message := conditions.GetMessage(getEnvtestControlPlane(t, key), controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition)
 			g.Expect(message).NotTo(ContainSubstring("incident"))
 		})
