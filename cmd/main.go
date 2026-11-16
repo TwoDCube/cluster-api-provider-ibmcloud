@@ -63,6 +63,7 @@ import (
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/endpoints"
 	managedscope "sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/scope/managed"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/authenticator"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/workloadprobe"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/version"
 	managedwebhooks "sigs.k8s.io/cluster-api-provider-ibmcloud/webhooks/managed/admission"
 	powervs "sigs.k8s.io/cluster-api-provider-ibmcloud/webhooks/powervs/admission"
@@ -458,6 +459,31 @@ func setupManagedReconcilers(ctx context.Context, mgr ctrl.Manager, serviceEndpo
 		WatchFilterValue: watchFilterValue,
 	}).SetupWithManager(ctx, mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "IBMCloudManagedCluster")
+		os.Exit(1)
+	}
+
+	versionsCache, err := managedscope.NewVersionsCache(clock.RealClock{}, time.Hour)
+	if err != nil {
+		setupLog.Error(err, "unable to create the managed Kubernetes versions cache")
+		os.Exit(1)
+	}
+	prober, err := workloadprobe.NewRESTProber(workloadprobe.RESTProberOptions{Timeout: workloadprobe.DefaultTimeout})
+	if err != nil {
+		setupLog.Error(err, "unable to create the workload cluster prober")
+		os.Exit(1)
+	}
+	if err := (&managedcontroller.IBMCloudManagedControlPlaneReconciler{
+		Client:           mgr.GetClient(),
+		APIReader:        mgr.GetAPIReader(),
+		Recorder:         mgr.GetEventRecorderFor("ibmcloudmanagedcontrolplane-controller"),
+		Resolver:         resolver,
+		ClientBuilder:    clientBuilder,
+		Prober:           prober,
+		VersionsCache:    versionsCache,
+		Clock:            clock.RealClock{},
+		WatchFilterValue: watchFilterValue,
+	}).SetupWithManager(ctx, mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "IBMCloudManagedControlPlane")
 		os.Exit(1)
 	}
 }

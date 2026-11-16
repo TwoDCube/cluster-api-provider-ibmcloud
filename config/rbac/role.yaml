@@ -24,6 +24,8 @@ rules:
   - delete
   - get
   - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - apiextensions.k8s.io
@@ -64,6 +66,7 @@ rules:
   resources:
   - clusters
   - clusters/status
+  - machinepools
   - machines
   - machines/status
   verbs:
@@ -76,6 +79,24 @@ rules:
   - ibmcloudmanagedcontrolplanes
   verbs:
   - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - controlplane.cluster.x-k8s.io
+  resources:
+  - ibmcloudmanagedcontrolplanes/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - controlplane.cluster.x-k8s.io
+  resources:
+  - ibmcloudmanagedcontrolplanes/status
+  verbs:
+  - get
+  - patch
+  - update
 - apiGroups:
   - infrastructure.cluster.x-k8s.io
   resources:
@@ -103,6 +124,16 @@ rules:
 - apiGroups:
   - infrastructure.cluster.x-k8s.io
   resources:
+  - ibmcloudmanagedmachinepools
+  - ibmpowervsmachinetemplates
+  - ibmvpcmachinetemplates
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
   - ibmpowervsclusters
   - ibmpowervsimages
   - ibmpowervsmachines
@@ -125,13 +156,4 @@ rules:
   - list
   - patch
   - update
-  - watch
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - ibmpowervsmachinetemplates
-  - ibmvpcmachinetemplates
-  verbs:
-  - get
-  - list
   - watch
