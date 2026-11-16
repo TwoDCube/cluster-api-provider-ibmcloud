@@ -27,6 +27,7 @@ spec:
         - /manager
         args:
         - "--leader-elect"
+        - "--feature-gates=ManagedKubernetes=${EXP_MANAGED_KUBERNETES:=false}"
         - "--diagnostics-address=${CAPIBM_DIAGNOSTICS_ADDRESS:=:8443}"
         - "--insecure-diagnostics=${CAPIBM_INSECURE_DIAGNOSTICS:=false}"
         - "--service-endpoint=${SERVICE_ENDPOINT:=none}"
