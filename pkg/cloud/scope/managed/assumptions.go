@@ -506,8 +506,9 @@ func ClusterMinimumWorkers(d controlplanev1.Distribution) int {
 }
 
 // ClusterMinimumErrorCode is the IBM error code of a resize or pool removal below ClusterMinimumWorkers;
-// kubernetesservice.Classify maps it to ClassClusterMinimum. Observed on IBM Cloud: HTTP 400, synchronous and
-// side-effect free, also for removing the only pool.
+// kubernetesservice.Classify maps it to ClassClusterMinimum, and DisruptionCallOutcome matches it on every removal call,
+// ReplaceWorker included. Observed on IBM Cloud: HTTP 400, synchronous and side-effect free, also for removing the
+// only pool.
 const ClusterMinimumErrorCode = "E1437"
 
 // WorkerStateDeployed is the lifecycle.actualState of a running worker. Observed on IBM Cloud.

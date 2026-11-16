@@ -17,7 +17,12 @@ limitations under the License.
 package managed
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
 	"math/rand/v2"
+	"net/http"
+	"os"
 	"testing"
 	"time"
 
@@ -852,4 +857,125 @@ func TestDecideDisruptionStepSafetyProperties(t *testing.T) {
 		StepHandOver, StepCorrectVictims, StepStop} {
 		g.Expect(steps).To(HaveKeyWithValue(step, BeNumerically(">", 0)), "no generated observation led to %s", step)
 	}
+}
+
+// liveAPIError returns a scrubbed live error capture of kubernetesservice/testdata as the *APIError that the service
+// builds for op's answer with the given status (kubernetesservice newAPIError).
+//
+// Parameters:
+//   - t: the test.
+//   - name: the capture's file name.
+//   - op: the operation that received the answer.
+//   - status: the HTTP status of the answer.
+func liveAPIError(t *testing.T, name string, op kubernetesservice.Operation, status int) *kubernetesservice.APIError {
+	t.Helper()
+	data, err := os.ReadFile(fixturePath(name))
+	if err != nil {
+		t.Fatalf("reading fixture %s: %v", name, err)
+	}
+	var body struct {
+		Code        string `json:"code"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatalf("decoding fixture %s: %v", name, err)
+	}
+	return &kubernetesservice.APIError{Operation: op, StatusCode: status, Code: body.Code, Description: body.Description}
+}
+
+// TestDisruptionCallOutcome feeds DisruptionCallOutcome the errors the service returns for each removal call, so every
+// answer goes through kubernetesservice.Classify as it does in the controller.
+func TestDisruptionCallOutcome(t *testing.T) {
+	// IBM's E1437 answers, observed on IBM Cloud for both flavors, carry ClusterMinimumErrorCode.
+	for _, name := range []string{"error-E1437-iks-resize.json", "error-E1437-roks-resize.json"} {
+		NewWithT(t).Expect(liveAPIError(t, name, kubernetesservice.OpRemoveWorkerPool, http.StatusBadRequest).Code).
+			To(Equal(ClusterMinimumErrorCode), name)
+	}
+	const (
+		replaceCall = kubernetesservice.OpReplaceWorker
+		removeCall  = kubernetesservice.OpRemoveWorkerPool
+
+		waitIBM = infrav1.WorkerDisruptionPhaseWaitingForIBM
+		removal = infrav1.WorkerDisruptionPhaseWaitingForRemoval
+	)
+	apiError := func(op kubernetesservice.Operation, status int, code, description string) error {
+		return &kubernetesservice.APIError{Operation: op, StatusCode: status, Code: code, Description: description}
+	}
+	autoscaledRefusal := "Forbidden. The request will not be permitted."
+	testCases := []struct {
+		name             string
+		call             kubernetesservice.Operation
+		err              error
+		autoscaleEnabled bool
+		want             DisruptionStep
+		wantPhase        infrav1.WorkerDisruptionPhase
+		wantReason       DisruptionReason
+		wantClass        kubernetesservice.ErrorClass
+		wantHandled      bool
+	}{
+		{name: "204 on replaceWorker", call: replaceCall, err: nil,
+			want: StepWaitForRemoval, wantPhase: removal, wantReason: ReasonReplacingWorker, wantClass: kubernetesservice.ClassNone, wantHandled: true},
+		{name: "404 on replaceWorker: the worker is already gone", call: replaceCall, err: apiError(replaceCall, http.StatusNotFound, "", ""),
+			want: StepWaitForRemoval, wantPhase: removal, wantReason: ReasonReplacingWorker, wantClass: kubernetesservice.ClassNotFound, wantHandled: true},
+		{name: "pool removal accepted", call: removeCall, err: nil,
+			want: StepWaitForRemoval, wantPhase: removal, wantReason: ReasonRemovingWorkerPool, wantClass: kubernetesservice.ClassNone, wantHandled: true},
+		{name: "404 on removeWorkerPool: the pool is already gone", call: removeCall, err: apiError(removeCall, http.StatusNotFound, "", ""),
+			want: StepWaitForRemoval, wantPhase: removal, wantReason: ReasonRemovingWorkerPool, wantClass: kubernetesservice.ClassNotFound, wantHandled: true},
+		{name: "live IKS E1437 on removeWorkerPool holds the Nodes cordoned", call: removeCall,
+			err:  liveAPIError(t, "error-E1437-iks-resize.json", removeCall, http.StatusBadRequest),
+			want: StepHold, wantPhase: waitIBM, wantReason: ReasonWaitingForClusterMinimum, wantClass: kubernetesservice.ClassClusterMinimum, wantHandled: true},
+		{name: "live ROKS E1437 on removeWorkerPool holds the Nodes cordoned", call: removeCall,
+			err:  liveAPIError(t, "error-E1437-roks-resize.json", removeCall, http.StatusBadRequest),
+			want: StepHold, wantPhase: waitIBM, wantReason: ReasonWaitingForClusterMinimum, wantClass: kubernetesservice.ClassClusterMinimum, wantHandled: true},
+		{name: "E1437 on replaceWorker holds too, never a terminal BadRequest", call: replaceCall,
+			err:  liveAPIError(t, "error-E1437-iks-resize.json", replaceCall, http.StatusBadRequest),
+			want: StepHold, wantPhase: waitIBM, wantReason: ReasonWaitingForClusterMinimum, wantClass: kubernetesservice.ClassClusterMinimum, wantHandled: true},
+		{name: "409 on replaceWorker waits for IBM", call: replaceCall, err: apiError(replaceCall, http.StatusConflict, "", "operation in progress"),
+			want: StepWaitForIBM, wantPhase: waitIBM, wantReason: ReasonReplacingWorker, wantClass: kubernetesservice.ClassOperationInProgress, wantHandled: true},
+		{name: "409 on removeWorkerPool waits for IBM", call: removeCall, err: apiError(removeCall, http.StatusConflict, "", ""),
+			want: StepWaitForIBM, wantPhase: waitIBM, wantReason: ReasonRemovingWorkerPool, wantClass: kubernetesservice.ClassOperationInProgress, wantHandled: true},
+		{name: "autoscaled refusal of an autoscaled pool holds", call: removeCall, autoscaleEnabled: true,
+			err:  apiError(removeCall, http.StatusForbidden, "", autoscaledRefusal),
+			want: StepHold, wantPhase: waitIBM, wantReason: ReasonExternallyAutoscaled, wantClass: kubernetesservice.ClassAutoscaled, wantHandled: true},
+		{name: "autoscaled refusal of a pool that is not autoscaled is PermissionDenied", call: removeCall,
+			err:  apiError(removeCall, http.StatusForbidden, "", autoscaledRefusal),
+			want: StepHold, wantPhase: waitIBM, wantReason: ReasonRemovingWorkerPool, wantClass: kubernetesservice.ClassPermissionDenied, wantHandled: false},
+		{name: "other 403 on replaceWorker is left to the caller", call: replaceCall, autoscaleEnabled: true,
+			err:  apiError(replaceCall, http.StatusForbidden, "", "Forbidden"),
+			want: StepHold, wantPhase: waitIBM, wantReason: ReasonReplacingWorker, wantClass: kubernetesservice.ClassPermissionDenied, wantHandled: false},
+		{name: "other 400 on replaceWorker is left to the caller", call: replaceCall, err: apiError(replaceCall, http.StatusBadRequest, "E9999", ""),
+			want: StepHold, wantPhase: waitIBM, wantReason: ReasonReplacingWorker, wantClass: kubernetesservice.ClassBadRequest, wantHandled: false},
+		{name: "5xx is left to the caller", call: removeCall, err: apiError(removeCall, http.StatusServiceUnavailable, "", ""),
+			want: StepHold, wantPhase: waitIBM, wantReason: ReasonRemovingWorkerPool, wantClass: kubernetesservice.ClassTransient, wantHandled: false},
+		{name: "401 is left to the caller", call: replaceCall, err: apiError(replaceCall, http.StatusUnauthorized, "", ""),
+			want: StepHold, wantPhase: waitIBM, wantReason: ReasonReplacingWorker, wantClass: kubernetesservice.ClassUnauthorized, wantHandled: false},
+		{name: "429 is left to the caller", call: removeCall, err: apiError(removeCall, http.StatusTooManyRequests, "", ""),
+			want: StepHold, wantPhase: waitIBM, wantReason: ReasonRemovingWorkerPool, wantClass: kubernetesservice.ClassRateLimited, wantHandled: false},
+		{name: "no answer from IBM is left to the caller", call: replaceCall, err: errors.New("connection reset"),
+			want: StepHold, wantPhase: waitIBM, wantReason: ReasonReplacingWorker, wantClass: kubernetesservice.ClassTransient, wantHandled: false},
+		{name: "a request the service refused to send is left to the caller", call: removeCall,
+			err:  fmt.Errorf("%w: RemoveWorkerPool: the pool ID is empty", kubernetesservice.ErrInvalidRequest),
+			want: StepHold, wantPhase: waitIBM, wantReason: ReasonRemovingWorkerPool, wantClass: kubernetesservice.ClassBadRequest, wantHandled: false},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			got, err := DisruptionCallOutcome(tc.call, tc.err, tc.autoscaleEnabled)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(got.Handled).To(Equal(tc.wantHandled))
+			g.Expect(got.Class).To(Equal(tc.wantClass))
+			g.Expect(got.Decision.Step).To(Equal(tc.want))
+			g.Expect(got.Decision.Phase).To(Equal(tc.wantPhase))
+			g.Expect(got.Decision.Reason).To(Equal(tc.wantReason))
+			g.Expect(got.Decision.ReleaseToken).To(BeFalse(), "the token is kept until the removal settled")
+		})
+	}
+}
+
+func TestDisruptionCallOutcomeValidation(t *testing.T) {
+	g := NewWithT(t)
+	_, err := DisruptionCallOutcome(kubernetesservice.OpListWorkers, nil, false)
+	g.Expect(err).To(MatchError(ContainSubstring(`DisruptionCallOutcome call is "ListWorkers"`)))
+	_, err = DisruptionCallOutcome("", nil, false)
+	g.Expect(err).To(MatchError(ContainSubstring(`DisruptionCallOutcome call is ""`)))
 }

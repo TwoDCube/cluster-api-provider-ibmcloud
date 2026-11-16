@@ -19,6 +19,7 @@ package managed
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"slices"
 	"sort"
 	"strings"
@@ -396,8 +397,8 @@ const (
 	StepHold DisruptionStep = "Hold"
 	// StepCallIBM asks the caller to patch status.disruption to phase WaitingForIBM with ibmRequestTime = now, together
 	// with status.lastDisruptionTime = now, and only after that patch succeeded to make the operation's one IBM call
-	// (ReplaceWorker with update=true, ResizeWorkerPool or RemoveWorkerPool). The patch first means a restart never
-	// sends the call twice within DisruptionSettleDelay.
+	// (ReplaceWorker with update=true, ResizeWorkerPool or RemoveWorkerPool) and map its answer with
+	// DisruptionCallOutcome. The patch first means a restart never sends the call twice within DisruptionSettleDelay.
 	StepCallIBM DisruptionStep = "CallIBM"
 	// StepWaitForIBM waits because the IBM call was sent less than DisruptionSettleDelay ago and IBM does not show the
 	// removal yet; the call is never sent again in that time.
@@ -980,6 +981,115 @@ func (o DisruptionObservation) drainFinished() bool {
 // observed over a connected workload cluster.
 func (o DisruptionObservation) detachFinished() bool {
 	return o.Drain.DetachExcluded || o.Drain.DetachTimedOut || (o.WorkloadClusterConnected && o.Drain.VolumesDetached)
+}
+
+// DisruptionCallResult is DisruptionCallOutcome's answer.
+type DisruptionCallResult struct {
+	// Handled is true when Decision is the next step of the removal. When false, the caller applies its common error
+	// handling for Class (Transient, RateLimited, Unauthorized, PermissionDenied, BadRequest) and keeps phase
+	// WaitingForIBM; the next reconcile re-lists the workers before any retry, which DecideDisruptionStep never makes
+	// within DisruptionSettleDelay of the attempt.
+	Handled bool
+
+	// Decision is the next step when Handled; otherwise a hold in phase WaitingForIBM with the flow's reason.
+	Decision DisruptionDecision
+
+	// Class is what IBM's answer means for this removal call: kubernetesservice.Classify, except that E1437 is
+	// ClassClusterMinimum and a 409 is ClassOperationInProgress on every removal call (Classify knows these rows only
+	// for some operations), and that an autoscaled-pool refusal of a pool IBM does not report autoscaled is
+	// ClassPermissionDenied.
+	Class kubernetesservice.ErrorClass
+}
+
+// DisruptionCallOutcome maps IBM's answer to the call of StepCallIBM to the next decision: success and 404 (the worker
+// or pool is already gone) go on to WaitingForRemoval; E1437 holds with the Nodes cordoned (WaitingForClusterMinimum);
+// a 409 (an operation in progress) waits for IBM without a second call within DisruptionSettleDelay; an autoscaled-pool
+// refusal holds as ExternallyAutoscaled when the pool shows autoscaleEnabled. Every other answer is left to the
+// caller's common error handling (DisruptionCallResult.Handled).
+//
+// Parameters:
+//   - call: the IBM call the caller made for the removal: kubernetesservice.OpReplaceWorker (Replace) or
+//     OpRemoveWorkerPool (DeletePool).
+//   - err: the error the call returned; nil for success.
+//   - autoscaleEnabled: the pool's autoscaleEnabled in IBM's latest pool listing (kubernetesservice.WorkerPool).
+//
+// It returns an error naming the call when call is not one of the removal calls.
+func DisruptionCallOutcome(call kubernetesservice.Operation, err error, autoscaleEnabled bool) (DisruptionCallResult, error) {
+	reason, verr := removalCallReason(call)
+	if verr != nil {
+		return DisruptionCallResult{}, verr
+	}
+	class := removalCallClass(call, err, autoscaleEnabled)
+	waitingForIBM := infrav1.WorkerDisruptionPhaseWaitingForIBM
+	result := DisruptionCallResult{Handled: true, Class: class}
+	switch class {
+	case kubernetesservice.ClassNone, kubernetesservice.ClassNotFound:
+		result.Decision = DisruptionDecision{Step: StepWaitForRemoval, Phase: infrav1.WorkerDisruptionPhaseWaitingForRemoval,
+			Reason: reason, Message: "IBM accepted the request; waiting for it to remove the workers"}
+	case kubernetesservice.ClassClusterMinimum:
+		result.Decision = DisruptionDecision{Step: StepHold, Phase: waitingForIBM, Reason: ReasonWaitingForClusterMinimum,
+			Message: fmt.Sprintf("IBM refused the removal because the cluster would fall below its minimum workers (%s); "+
+				"the drained Nodes stay cordoned", ClusterMinimumErrorCode)}
+	case kubernetesservice.ClassOperationInProgress:
+		result.Decision = DisruptionDecision{Step: StepWaitForIBM, Phase: waitingForIBM, Reason: reason,
+			Message: "IBM reports an operation in progress on the workers; waiting before the next attempt"}
+	case kubernetesservice.ClassAutoscaled:
+		result.Decision = DisruptionDecision{Step: StepHold, Phase: waitingForIBM, Reason: ReasonExternallyAutoscaled,
+			Message: "IBM's cluster autoscaler owns this pool; the drained Nodes stay cordoned"}
+	default:
+		result.Handled = false
+		result.Decision = DisruptionDecision{Step: StepHold, Phase: waitingForIBM, Reason: reason}
+	}
+	return result, nil
+}
+
+// removalCallReason returns the flow reason while IBM carries out call, or an error when call is not a removal call.
+//
+// Parameters:
+//   - call: the IBM call of StepCallIBM.
+func removalCallReason(call kubernetesservice.Operation) (DisruptionReason, error) {
+	switch call {
+	case kubernetesservice.OpReplaceWorker:
+		return ReasonReplacingWorker, nil
+	case kubernetesservice.OpRemoveWorkerPool:
+		return ReasonRemovingWorkerPool, nil
+	default:
+		return "", fmt.Errorf("DisruptionCallOutcome call is %q; want the IBM call of StepCallIBM: %q or %q", call,
+			kubernetesservice.OpReplaceWorker, kubernetesservice.OpRemoveWorkerPool)
+	}
+}
+
+// removalCallClass classifies IBM's answer to a removal call. It adds the two answers that kubernetesservice.Classify
+// maps for some operations only (E1437 and a 409), so that the caller never treats them as a terminal BadRequest or an
+// Unknown error, and reports an autoscaled-pool refusal as ExternallyAutoscaled only for a pool IBM reports autoscaled.
+//
+// Parameters:
+//   - call: the IBM call.
+//   - err: its error; nil for success.
+//   - autoscaleEnabled: the pool's autoscaleEnabled.
+func removalCallClass(call kubernetesservice.Operation, err error, autoscaleEnabled bool) kubernetesservice.ErrorClass {
+	var apiErr *kubernetesservice.APIError
+	if errors.As(err, &apiErr) {
+		switch {
+		case apiErr.Code == ClusterMinimumErrorCode:
+			// IBM's minimum applies to every removal, a replace included, while Classify maps E1437 only for
+			// RemoveWorkerPool and ResizeWorkerPool; ReplaceWorker would be a terminal BadRequest.
+			return kubernetesservice.ClassClusterMinimum
+		case apiErr.StatusCode == http.StatusConflict:
+			// A 409 on a removal call means that an operation is in progress: wait and look again. Classify knows a 409
+			// only for CreateWorkerPool and UpdateMaster, and IBM's error code of a 409 on a removal is not yet
+			// verified against IBM Cloud, so the status decides.
+			return kubernetesservice.ClassOperationInProgress
+		}
+	}
+	class := kubernetesservice.Classify(call, err)
+	if class == kubernetesservice.ClassAutoscaled && !autoscaleEnabled {
+		// ExternallyAutoscaled only when IBM reports autoscaleEnabled. The Gated phase already refuses an autoscaled
+		// replace or scale-down, so this 403 most likely means that the credentials lack the Kubernetes Service role
+		// (Administrator platform role and Manager service role).
+		return kubernetesservice.ClassPermissionDenied
+	}
+	return class
 }
 
 // drainingReason returns the flow reason while the victims drain: DrainingNodes for a pool deletion (Deleting
