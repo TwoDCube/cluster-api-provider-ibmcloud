@@ -79,6 +79,30 @@ rules:
 - apiGroups:
   - infrastructure.cluster.x-k8s.io
   resources:
+  - ibmcloudmanagedclusters
+  verbs:
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
+  - ibmcloudmanagedclusters/status
+  - ibmpowervsclusters/status
+  - ibmpowervsimages/status
+  - ibmpowervsmachines/status
+  - ibmpowervsmachinetemplates/status
+  - ibmvpcclusters/status
+  - ibmvpcmachines/status
+  - ibmvpcmachinetemplates/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
   - ibmpowervsclusters
   - ibmpowervsimages
   - ibmpowervsmachines
@@ -92,20 +116,6 @@ rules:
   - patch
   - update
   - watch
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - ibmpowervsclusters/status
-  - ibmpowervsimages/status
-  - ibmpowervsmachines/status
-  - ibmpowervsmachinetemplates/status
-  - ibmvpcclusters/status
-  - ibmvpcmachines/status
-  - ibmvpcmachinetemplates/status
-  verbs:
-  - get
-  - patch
-  - update
 - apiGroups:
   - infrastructure.cluster.x-k8s.io
   resources:

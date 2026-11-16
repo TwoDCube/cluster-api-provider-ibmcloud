@@ -27,6 +27,7 @@ import (
 
 	// +kubebuilder:scaffold:imports
 	"github.com/spf13/pflag"
+	"golang.org/x/time/rate"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -36,6 +37,7 @@ import (
 	"k8s.io/component-base/logs"
 	logsv1 "k8s.io/component-base/logs/api/v1"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/clock"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -54,9 +56,14 @@ import (
 	vpcinfrav1beta1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/vpc/v1beta1"
 	vpcinfrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/vpc/v1beta2"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/feature"
+	managedcontroller "sigs.k8s.io/cluster-api-provider-ibmcloud/internal/controllers/managed"
 	powervscontroller "sigs.k8s.io/cluster-api-provider-ibmcloud/internal/controllers/powervs"
 	vpccontroller "sigs.k8s.io/cluster-api-provider-ibmcloud/internal/controllers/vpc"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/credentials"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/endpoints"
+	managedscope "sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/scope/managed"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/authenticator"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/version"
 	managedwebhooks "sigs.k8s.io/cluster-api-provider-ibmcloud/webhooks/managed/admission"
 	powervs "sigs.k8s.io/cluster-api-provider-ibmcloud/webhooks/powervs/admission"
 	vpc "sigs.k8s.io/cluster-api-provider-ibmcloud/webhooks/vpc/admission"
@@ -81,6 +88,8 @@ var (
 	watchFilterValue       string
 	disableHTTP2           bool
 	skipCRDMigrationPhases []string
+	containersAPIQPS       float64
+	containersAPIBurst     int
 )
 
 func init() {
@@ -163,6 +172,16 @@ func initFlags(fs *pflag.FlagSet) {
 		[]string{},
 		"List of CRD migration phases to skip. Valid values are: StorageVersionMigration, CleanupManagedFields.")
 
+	fs.Float64Var(&containersAPIQPS,
+		"containers-api-qps",
+		10,
+		"Maximum sustained requests per second from this manager to the IBM Cloud Kubernetes Service API (managed Kubernetes only). IBM allows 200 requests per 10 seconds per source IP.")
+
+	fs.IntVar(&containersAPIBurst,
+		"containers-api-burst",
+		20,
+		"Maximum burst of requests from this manager to the IBM Cloud Kubernetes Service API (managed Kubernetes only). IBM allows 200 requests per 10 seconds per source IP.")
+
 	flags.AddManagerOptions(fs, &managerOptions)
 
 	// --feature-gates, e.g. ManagedKubernetes=true (Alpha, off by default; package feature explains the gate).
@@ -173,6 +192,13 @@ func validateFlags() error {
 	if err := logsv1.ValidateAndApply(logOptions, nil); err != nil {
 		setupLog.Error(err, "unable to validate and apply log options")
 		return err
+	}
+
+	if containersAPIQPS <= 0 {
+		return fmt.Errorf("--containers-api-qps must be greater than 0, got %v", containersAPIQPS)
+	}
+	if containersAPIBurst < 1 {
+		return fmt.Errorf("--containers-api-burst must be at least 1, got %d", containersAPIBurst)
 	}
 
 	return nil
@@ -390,6 +416,40 @@ func setupReconcilers(ctx context.Context, mgr ctrl.Manager, serviceEndpoint []e
 		Scheme:          mgr.GetScheme(),
 	}).SetupWithManager(ctx, mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "IBMPowerVSImage")
+		os.Exit(1)
+	}
+
+	if feature.Gates.Enabled(feature.ManagedKubernetes) {
+		setupManagedReconcilers(ctx, mgr, serviceEndpoint, watchFilterValue)
+	}
+}
+
+// setupManagedReconcilers registers the managed Kubernetes (IKS, ROKS) controllers. It runs only with the
+// ManagedKubernetes feature gate on. It is the one place that names the environment-reading controller-identity
+// factory: the managed packages receive it only through the client builder, so that no code on the managed path reads
+// credentials from the environment itself.
+func setupManagedReconcilers(ctx context.Context, mgr ctrl.Manager, serviceEndpoint []endpoints.ServiceEndpoint, watchFilterValue string) {
+	resolver := credentials.ControllerOnly{}
+	clientBuilder, err := managedscope.NewProdClientBuilder(managedscope.ProdClientBuilderOptions{
+		ServiceEndpoints:           serviceEndpoint,
+		Limiter:                    rate.NewLimiter(rate.Limit(containersAPIQPS), containersAPIBurst),
+		HTTPTimeout:                30 * time.Second,
+		UserAgent:                  "cluster-api-provider-ibmcloud/" + version.Get().GitVersion,
+		Clock:                      clock.RealClock{},
+		NewControllerAuthenticator: authenticator.GetAuthenticator,
+	})
+	if err != nil {
+		setupLog.Error(err, "unable to create the managed Kubernetes client builder")
+		os.Exit(1)
+	}
+
+	if err := (&managedcontroller.IBMCloudManagedClusterReconciler{
+		Client:           mgr.GetClient(),
+		Resolver:         resolver,
+		ClientBuilder:    clientBuilder,
+		WatchFilterValue: watchFilterValue,
+	}).SetupWithManager(ctx, mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "IBMCloudManagedCluster")
 		os.Exit(1)
 	}
 }

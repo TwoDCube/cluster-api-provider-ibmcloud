@@ -17,6 +17,7 @@ linters:
     - dogsled
     - errcheck
     - errchkjson
+    - forbidigo
     - goconst
     - gocritic
     - gocyclo
@@ -45,6 +46,33 @@ linters:
     - usestdlibvars
     - whitespace
   settings:
+    forbidigo:
+      analyze-types: true  # match the declared package name, so an import alias cannot hide a forbidden call
+      forbid:
+        - pattern: ^os\.(Getenv|LookupEnv|Setenv|Unsetenv|Environ)$
+          msg: "managed path: no environment reads or writes; pass configuration explicitly"
+        - pattern: ^authenticator\.(GetAuthenticator|GetProperties|GetIAMAuthenticator)$
+          pkg: ^sigs\.k8s\.io/cluster-api-provider-ibmcloud/pkg/cloud/services/authenticator$
+          msg: "managed path: clients come from ClientBuilder for a resolved credentials.Identity"
+        - pattern: ^core\.(GetAuthenticatorFromEnvironment|GetServiceProperties|SetLoggingLevel)$
+          pkg: ^github\.com/IBM/go-sdk-core/v5/core$
+          msg: "managed path: no environment credentials and no process-wide SDK state"
+        - pattern: ^accounts\.GetAccountID(Wrapper|Func)?$
+          pkg: ^sigs\.k8s\.io/cluster-api-provider-ibmcloud/pkg/cloud/services/accounts$
+          msg: "managed path: the account comes from the cluster CRN"
+        - pattern: \.GetResourceGroupByName$
+          msg: "reads the account ID from the environment; use GetResourceGroup by ID"
+        - pattern: UsingExternalConfig$
+          msg: "SDK constructors that read the environment are forbidden; pass an authenticator"
+        - pattern: ^vpc\.NewService$
+          pkg: ^sigs\.k8s\.io/cluster-api-provider-ibmcloud/pkg/cloud/services/vpc$
+          msg: "reads the environment; use ClientBuilder.VPC (vpc.NewServiceWithAuthenticator)"
+        - pattern: ^resourcemanager\.NewService$
+          pkg: ^sigs\.k8s\.io/cluster-api-provider-ibmcloud/pkg/cloud/services/resourcemanager$
+          msg: "falls back to the environment on a nil authenticator; use ClientBuilder.ResourceManager"
+        - pattern: ^endpoints\.ServiceEndpointFormat$
+          pkg: ^sigs\.k8s\.io/cluster-api-provider-ibmcloud/pkg/cloud/endpoints$
+          msg: "process-wide flag state; ProdClientBuilder receives the parsed endpoints"
     gocritic:
       disabled-checks:
         - appendAssign
@@ -117,6 +145,17 @@ linters:
   exclusions:
     generated: lax
     rules:
+      # forbidigo applies only to the managed paths; the VPC and PowerVS code is not changed by this feature.
+      - linters: [forbidigo]
+        path-except: ^(pkg/cloud/credentials|pkg/cloud/scope/managed|internal/controllers/managed|webhooks/managed|pkg/cloud/services/kubernetesservice|pkg/util/(managedkubeconfig|workloadprobe|drain))/
+      # the one guarded call: newResourceManager rejects a nil authenticator before resourcemanager.NewService
+      - linters: [forbidigo]
+        path: ^pkg/cloud/scope/managed/client_builder\.go$
+        text: resourcemanager\.NewService
+      # the GetAdminKubeconfig debug-log test switches go-sdk-core to debug level and restores it in t.Cleanup
+      - linters: [forbidigo]
+        path: _test\.go$
+        text: SetLoggingLevel
       # Exclude some packages or code to require comments, for example test code, or fake clients.
       - linters:
           - revive
