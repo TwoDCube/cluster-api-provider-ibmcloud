@@ -228,6 +228,11 @@ generate-templates: $(KUSTOMIZE) ## Generate cluster templates
 generate-e2e-templates: $(KUSTOMIZE) ## Generate E2E cluster templates
 	$(KUSTOMIZE) build $(E2E_TEMPLATES)/cluster-template-powervs-md-remediation --load-restrictor LoadRestrictionsNone > $(E2E_TEMPLATES)/cluster-template-powervs-md-remediation.yaml
 	$(KUSTOMIZE) build $(E2E_TEMPLATES)/cluster-template-vpc --load-restrictor LoadRestrictionsNone > $(E2E_TEMPLATES)/cluster-template-vpc.yaml
+# The managed (IKS and ROKS) e2e templates are copies of the rendered flavor templates, never kustomize builds:
+# kustomize build drops the YAML comments and the quotes they need (templates/README.md); without its quotes a
+# distributionVersion such as 1.36 becomes a YAML float that the CRD rejects.
+	cp $(TEMPLATES_DIR)/cluster-template-managed-iks.yaml $(E2E_TEMPLATES)/cluster-template-managed-iks.yaml
+	cp $(TEMPLATES_DIR)/cluster-template-managed-roks-single-zone.yaml $(E2E_TEMPLATES)/cluster-template-managed-roks-single-zone.yaml
 
 .PHONY: generate-modules
 generate-modules: ## Runs go mod to ensure modules are up to date
@@ -237,7 +242,10 @@ generate-modules: ## Runs go mod to ensure modules are up to date
 images: docker-build
 
 set-flavor: 
-ifeq ($(findstring vpc,$(E2E_FLAVOR)),vpc)
+# managed is checked first: the managed flavors (managed-iks, managed-roks-single-zone) use their own e2e config.
+ifeq ($(findstring managed,$(E2E_FLAVOR)),managed)
+	 $(eval E2E_CONF_FILE=$(REPO_ROOT)/test/e2e/config/ibmcloud-e2e-managed.yaml)
+else ifeq ($(findstring vpc,$(E2E_FLAVOR)),vpc)
 	 $(eval E2E_CONF_FILE=$(REPO_ROOT)/test/e2e/config/ibmcloud-e2e-vpc.yaml)
 else
 	 $(eval E2E_CONF_FILE=$(REPO_ROOT)/test/e2e/config/ibmcloud-e2e-powervs.yaml)
