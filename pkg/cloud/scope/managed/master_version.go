@@ -659,7 +659,8 @@ type MasterUpdateCallResult struct {
 
 	// Message explains the outcome for the condition message; for a 403 it names the missing Kubernetes Service roles,
 	// the credentials by Identity.Description, never an IAM ID, key or e-mail, and when CAPIBM requests the update
-	// again.
+	// again. It names IBM's error code only, never the incident ID or IBM's description, so that a repeated refusal
+	// gives the same message (masterIBMReference).
 	Message string
 }
 
@@ -698,7 +699,7 @@ func MasterUpdateCallOutcome(err error, request controlplanev1.MasterUpdateReque
 //
 // Parameters:
 //   - class: the class of IBM's answer.
-//   - err: IBM's answer, for the code and incident in the message.
+//   - err: IBM's answer, for its code in the message (masterIBMReference; never the incident ID).
 //   - request: the status.masterUpdate written before the call.
 //   - identityDescription: credentials.Identity.Description of the identity the call used.
 func masterUpdateOutcome(class kubernetesservice.ErrorClass, err error, request controlplanev1.MasterUpdateRequest,
@@ -732,25 +733,14 @@ func masterUpdateOutcome(class kubernetesservice.ErrorClass, err error, request 
 	return result
 }
 
-// masterIBMReference returns " (IBM code <c>, incident <i>)" for an IBM answer, with the parts IBM sent, so that the
-// operator can quote them to IBM support; "" when err is not an IBM answer or carries neither.
+// masterIBMReference returns " (IBM code <c>)" for an IBM answer that carries a code, else "": the same form as every
+// other condition message of the control plane (cpIBMCode). It never names IBM's incident ID: IBM sends a new incident
+// ID with every answer, so a MasterVersionUpToDate message carrying it would change with each refusal and rewrite
+// status, whose own watch event starts the next reconcile. The caller logs IBM's whole answer, incident ID included,
+// for IBM support (ControlPlaneScope.requestMasterUpdate).
 //
 // Parameters:
 //   - err: the error UpdateMaster returned.
 func masterIBMReference(err error) string {
-	var apiErr *kubernetesservice.APIError
-	if !errors.As(err, &apiErr) {
-		return ""
-	}
-	var parts []string
-	if apiErr.Code != "" {
-		parts = append(parts, "IBM code "+apiErr.Code)
-	}
-	if apiErr.IncidentID != "" {
-		parts = append(parts, "incident "+apiErr.IncidentID)
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return " (" + strings.Join(parts, ", ") + ")"
+	return cpIBMCode(err)
 }

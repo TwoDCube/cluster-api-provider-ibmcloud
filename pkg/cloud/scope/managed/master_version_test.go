@@ -827,7 +827,7 @@ func TestMasterUpdateCallOutcome(t *testing.T) {
 			handled: true, accepted: true, message: []string{"IBM already has the master update to 1.37"}},
 		{name: "403 is PermissionDenied even with skip text", err: forbidden, class: kubernetesservice.ClassPermissionDenied,
 			handled: true, terminal: true, reason: masterPermissionDeniedReason,
-			message: []string{"refused the master update to 1.37 with HTTP 403 (IBM code E3c1a, incident inc-0001)",
+			message: []string{"refused the master update to 1.37 with HTTP 403 (IBM code E3c1a):",
 				"the credentials of the CAPIBM controller identity need the Administrator platform role and the Manager service role of Kubernetes Service",
 				"not IBM's refusal to skip versions; CAPIBM requests the update again at 2026-11-20T16:00:00Z"}},
 		{name: "403 without code", class: kubernetesservice.ClassPermissionDenied, handled: true, terminal: true,
@@ -881,9 +881,8 @@ func TestMasterUpdateCallOutcome(t *testing.T) {
 		g.Expect(got.Terminal).To(BeTrue())
 		g.Expect(got.Accepted).To(BeFalse())
 		g.Expect(got.Reason).To(Equal(controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateVersionSkipNotAllowedReason))
-		g.Expect(got.Message).To(Equal("IBM refused the master update to 4.22_openshift as a version skip (IBM code E3c1a, " +
-			"incident inc-0001); set spec.distributionVersion to the master's next minor; CAPIBM requests no update until " +
-			"the spec changes"))
+		g.Expect(got.Message).To(Equal("IBM refused the master update to 4.22_openshift as a version skip (IBM code E3c1a); " +
+			"set spec.distributionVersion to the master's next minor; CAPIBM requests no update until the spec changes"))
 	})
 
 	t.Run("403 names the retry of the first attempt", func(t *testing.T) {
@@ -891,17 +890,35 @@ func TestMasterUpdateCallOutcome(t *testing.T) {
 		got, err := MasterUpdateCallOutcome(forbidden, masterRequested("1.37", 15*time.Minute, 1), identity)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(got.Message).To(Equal("IBM Cloud Kubernetes Service refused the master update to 1.37 with HTTP 403 (IBM code " +
-			"E3c1a, incident inc-0001): the credentials of the CAPIBM controller identity need the Administrator platform " +
-			"role and the Manager service role of Kubernetes Service on the cluster's resource group. CAPIBM requests one " +
-			"minor at a time, so this is not IBM's refusal to skip versions; CAPIBM requests the update again at " +
-			"2026-11-20T12:45:00Z"))
+			"E3c1a): the credentials of the CAPIBM controller identity need the Administrator platform role and the Manager " +
+			"service role of Kubernetes Service on the cluster's resource group. CAPIBM requests one minor at a time, so this " +
+			"is not IBM's refusal to skip versions; CAPIBM requests the update again at 2026-11-20T12:45:00Z"))
 	})
 
-	t.Run("an answer without code or incident", func(t *testing.T) {
+	t.Run("a new incident ID gives the same message", func(t *testing.T) {
+		// IBM sends a new incident ID with every answer. The message names IBM's code only, so the same refusal gives
+		// the same condition and writes no status; the incident ID goes to the controller log.
+		g := NewWithT(t)
+		request := masterRequested("1.37", 0, 1)
+		for _, class := range []kubernetesservice.ErrorClass{kubernetesservice.ClassPermissionDenied, kubernetesservice.ClassVersionSkipNotAllowed} {
+			first := *forbidden
+			second := *forbidden
+			second.IncidentID = "inc-0002"
+			a := masterUpdateOutcome(class, &first, request, identity)
+			b := masterUpdateOutcome(class, &second, request, identity)
+			g.Expect(b.Message).To(Equal(a.Message), "class %s", class)
+			g.Expect(a.Message).To(ContainSubstring("(IBM code E3c1a)"))
+			g.Expect(a.Message).NotTo(ContainSubstring("inc-000"))
+			g.Expect(a.Message).NotTo(ContainSubstring("incident"))
+		}
+	})
+
+	t.Run("the IBM reference is the code only", func(t *testing.T) {
 		g := NewWithT(t)
 		g.Expect(masterIBMReference(&kubernetesservice.APIError{StatusCode: http.StatusForbidden})).To(BeEmpty())
 		g.Expect(masterIBMReference(errors.New("not an IBM answer"))).To(BeEmpty())
-		g.Expect(masterIBMReference(&kubernetesservice.APIError{IncidentID: "inc-2"})).To(Equal(" (incident inc-2)"))
+		g.Expect(masterIBMReference(&kubernetesservice.APIError{IncidentID: "inc-2"})).To(BeEmpty(), "never the incident ID")
+		g.Expect(masterIBMReference(&kubernetesservice.APIError{Code: "E3c1a", IncidentID: "inc-2"})).To(Equal(" (IBM code E3c1a)"))
 	})
 
 	t.Run("validation", func(t *testing.T) {
