@@ -712,3 +712,96 @@ func TestDisruptionDecisionPoints(t *testing.T) {
 	g.Expect(WorkerStuckAfter).To(BeNumerically(">", 6*time.Minute))
 	g.Expect(DisruptionSettleDelay).To(BeNumerically(">", 2*time.Minute))
 }
+
+func TestProviderID(t *testing.T) {
+	// The account is the CRN's "a/<account>" segment, and the result equals Node.spec.providerID, as observed on IKS
+	// and ROKS. The captures are scrubbed, so the IDs below are synthetic.
+	for _, flavor := range []string{"iks", "roks"} {
+		t.Run(flavor, func(t *testing.T) {
+			g := NewWithT(t)
+			cluster := loadCluster(t, flavor+"-getCluster-normal.json")
+			workers := loadWorkers(t, flavor+"-getWorkers-normal.json")
+			g.Expect(workers).NotTo(BeEmpty())
+			segments := strings.Split(cluster.CRN, ":")
+			account := strings.TrimPrefix(segments[6], "a/")
+			got := ProviderID(account, cluster.ID, workers[0].ID)
+			g.Expect(got).To(Equal("ibm://" + account + "///" + cluster.ID + "/" + workers[0].ID))
+			g.Expect(got).To(MatchRegexp(`^ibm://[0-9a-f]{32}///[a-z0-9]{20}/kube-[a-z0-9]{20}-[a-z0-9-]+-[0-9a-f]{8}$`))
+		})
+	}
+	NewWithT(t).Expect(ProviderID("<account-id>", "c0abcdefghijklmnopqr", "kube-c0abcdefghijklmnopqr-pool-default-00000001")).
+		To(Equal("ibm://<account-id>///c0abcdefghijklmnopqr/kube-c0abcdefghijklmnopqr-pool-default-00000001"))
+}
+
+// TestPoolDecisionPoints pins the pool decision points AllowZeroReplicaPools and PoolNameReleasedStates.
+func TestPoolDecisionPoints(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(AllowZeroReplicaPools).To(BeFalse())
+	g.Expect(PoolNameReleasedStates()).To(Equal([]string{"deleting", "deleted"}))
+}
+
+func TestWorkerHasNewerFixPack(t *testing.T) {
+	steady := loadWorkers(t, "iks-getWorkers-normal.json")[0]
+	roks := loadWorkers(t, "roks-getWorkers-normal.json")[0]
+	with := func(w kubernetesservice.Worker, actual, target string) kubernetesservice.Worker {
+		w.KubeVersionActual, w.KubeVersionTarget = actual, target
+		return w
+	}
+	testCases := []struct {
+		name   string
+		worker kubernetesservice.Worker
+		want   bool
+	}{
+		{name: "IKS live capture: target equals actual", worker: steady, want: false},
+		{name: "ROKS live capture: target equals actual", worker: roks, want: false},
+		{name: "newer build of the same patch", worker: with(steady, "1.36.5_1540", "1.36.5_1545"), want: true},
+		{name: "newer patch", worker: with(steady, "1.36.5_1540", "1.36.6_1541"), want: true},
+		{name: "ROKS newer fix pack", worker: with(roks, "4.21.40_1540_openshift", "4.21.41_1545_openshift"), want: true},
+		{name: "IBM targets an older fix pack: still another fix pack", worker: with(steady, "1.36.6_1541", "1.36.5_1540"), want: true},
+		{name: "provisioning worker without an actual version", worker: with(steady, "", "1.36.5_1540"), want: false},
+		{name: "no target", worker: with(steady, "1.36.5_1540", ""), want: false},
+		{name: "target on the next minor is not a fix pack", worker: with(steady, "1.35.9_1530", "1.36.5_1540"), want: false},
+		{name: "unparseable actual", worker: with(steady, "v1.36.5", "1.36.5_1540"), want: false},
+		{name: "unparseable target", worker: with(steady, "1.36.5_1540", "latest"), want: false},
+		{name: "minor-only target names no fix pack", worker: with(steady, "1.36.5_1540", "1.36"), want: false},
+		{name: "OpenShift target for a Kubernetes worker", worker: with(steady, "1.36.5_1540", "1.36.5_1540_openshift"), want: false},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(WorkerHasNewerFixPack(tc.worker)).To(Equal(tc.want))
+		})
+	}
+}
+
+func TestPoolMutationAllowed(t *testing.T) {
+	all := []PoolOperation{PoolOperationCreate, PoolOperationGrow, PoolOperationShrink, PoolOperationReplace, PoolOperationRemove}
+	testCases := []struct {
+		name    string
+		state   string
+		allowed []PoolOperation
+	}{
+		{name: "unsupported_blocks_create_grow_and_replace_but_allows_shrink", state: "unsupported", allowed: []PoolOperation{PoolOperationShrink, PoolOperationRemove}},
+		{name: "unavailable_blocks_every_mutation", state: "unavailable", allowed: nil},
+		{name: "scaled_down_blocks_every_mutation", state: "scaled_down", allowed: nil},
+		{name: "normal allows everything", state: "normal", allowed: all},
+		{name: "deployed allows everything", state: "deployed", allowed: all},
+		{name: "pending allows everything", state: "pending", allowed: all},
+		{name: "warning allows everything", state: "warning", allowed: all},
+		{name: "update_canceled allows everything", state: "update_canceled", allowed: all},
+		{name: "an unknown state allows everything (forward compatible)", state: "something_new", allowed: all},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			for _, op := range all {
+				want := false
+				for _, allowed := range tc.allowed {
+					want = want || allowed == op
+				}
+				g.Expect(PoolMutationAllowed(tc.state, op)).To(Equal(want), "operation %s in state %s", op, tc.state)
+			}
+		})
+	}
+	NewWithT(t).Expect(PoolMutationAllowed("normal", "Reboot")).To(BeFalse(), "an unknown operation is never allowed")
+}

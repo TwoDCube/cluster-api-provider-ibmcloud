@@ -588,3 +588,110 @@ const ReplacementNotCreatedAfter = 30 * time.Minute
 // of cloud load balancer pools. Not yet verified against IBM Cloud: whether the IBM VPC load balancer honours the
 // label, and how fast; fallback: false.
 const ExcludeFromLoadBalancersDuringDrain = true
+
+// Pool and worker states.
+
+// ProviderID returns the Node spec.providerID of an IBM worker: ibm://<account>///<clusterID>/<workerID>.
+// Observed on IBM Cloud: on IKS and on ROKS the derivation from getWorkers, with the account from the cluster CRN,
+// equals Node.spec.providerID exactly. The account comes from the cluster CRN, never from process-wide credentials,
+// so that per-cluster credentials would need no change here.
+//
+// Parameters:
+//   - accountID: the account segment of the cluster CRN.
+//   - clusterID: the IBM cluster ID.
+//   - workerID: the worker ID from ListWorkers.
+func ProviderID(accountID, clusterID, workerID string) string {
+	return "ibm://" + accountID + "///" + clusterID + "/" + workerID
+}
+
+// AllowZeroReplicaPools allows MachinePool replicas 0, a pool without workers. Not yet verified against IBM Cloud:
+// whether IBM accepts resizing a pool that is not the last one to 0; default false (ZeroReplicasNotSupported);
+// fallback: true behind the cluster minimum guard.
+const AllowZeroReplicaPools = false
+
+// PoolNameReleasedStates returns the pool lifecycle.actualState values of a pool IBM is still removing: its name is not
+// free yet (409 E0d39, reason PoolNameBeingReleased). Not yet verified against IBM Cloud: how long IBM lists a deleted
+// pool and when it releases the name; default {deleting, deleted}; fallback: a longer wait.
+func PoolNameReleasedStates() []string {
+	return []string{"deleting", "deleted"}
+}
+
+// WorkerHasNewerFixPack reports whether IBM offers a worker another fix pack of its minor: kubeVersion.target is set
+// and differs from kubeVersion.actual within the same minor, so a replace with update=true would install it
+// (PatchAvailable). A worker without an actual version (still provisioning), with a version that does not parse, or
+// with a target on another minor has none here: a minor behind the master is decided from the master's minor
+// (MinorBehind). Not yet verified against IBM Cloud: the live probes showed kubeVersion{desired, actual, target} with
+// target equal to actual on steady workers, and worker fix packs independent of the master's; how target moves when
+// IBM publishes a fix pack is open; fallback: compare actual with the newest fix pack of getVersions.
+//
+// Parameters:
+//   - w: the worker as ListWorkers returned it.
+func WorkerHasNewerFixPack(w kubernetesservice.Worker) bool {
+	if w.KubeVersionActual == "" || w.KubeVersionTarget == "" {
+		return false
+	}
+	actual, err := ibmversion.Parse(w.KubeVersionActual)
+	if err != nil {
+		return false
+	}
+	target, err := ibmversion.Parse(w.KubeVersionTarget)
+	if err != nil || target.MinorVersion() != actual.MinorVersion() {
+		return false
+	}
+	order, err := target.CompareFixPack(actual)
+	return err == nil && order != 0
+}
+
+// PoolOperation is a change to an IBM worker pool that the cluster state may forbid (PoolMutationAllowed).
+// Not yet verified against IBM Cloud (see PoolMutationAllowed).
+type PoolOperation string
+
+const (
+	// PoolOperationCreate creates a pool. Not yet verified against IBM Cloud.
+	PoolOperationCreate PoolOperation = "Create"
+	// PoolOperationGrow resizes a pool up. Not yet verified against IBM Cloud.
+	PoolOperationGrow PoolOperation = "Grow"
+	// PoolOperationShrink resizes a pool down. Not yet verified against IBM Cloud.
+	PoolOperationShrink PoolOperation = "Shrink"
+	// PoolOperationReplace replaces a worker. Not yet verified against IBM Cloud.
+	PoolOperationReplace PoolOperation = "Replace"
+	// PoolOperationRemove removes a pool. Not yet verified against IBM Cloud.
+	PoolOperationRemove PoolOperation = "Remove"
+)
+
+// The cluster states that limit pool mutations and master updates. IBM documents them
+// (https://cloud.ibm.com/docs/containers?topic=containers-cluster-states-reference); none was observed in the live
+// probes.
+const (
+	// clusterStateUnavailable blocks every pool mutation. Not yet verified against IBM Cloud.
+	clusterStateUnavailable = "unavailable"
+	// clusterStateScaledDown blocks every pool mutation. Not yet verified against IBM Cloud.
+	clusterStateScaledDown = "scaled_down"
+	// clusterStateUnsupported blocks adding and reloading workers. Not yet verified against IBM Cloud.
+	clusterStateUnsupported = "unsupported"
+)
+
+// PoolMutationAllowed reports whether CAPIBM may send a pool operation in a cluster state: no operation in unavailable
+// or scaled_down; in unsupported no create, grow or replace (IBM: "you can't add or reload worker nodes"), while
+// shrink and remove stay allowed so a user can still reduce cost; every other state allows everything. An unknown
+// operation is never allowed. Without this gate IBM's refusal would be classified as an invalid configuration.
+// Not yet verified against IBM Cloud: the update and failure states; fallback: adjust the table.
+//
+// Parameters:
+//   - state: the IBM cluster state (IBMCloudManagedControlPlane status.state).
+//   - op: the operation.
+func PoolMutationAllowed(state string, op PoolOperation) bool {
+	switch op {
+	case PoolOperationCreate, PoolOperationGrow, PoolOperationShrink, PoolOperationReplace, PoolOperationRemove:
+	default:
+		return false
+	}
+	switch state {
+	case clusterStateUnavailable, clusterStateScaledDown:
+		return false
+	case clusterStateUnsupported:
+		return op == PoolOperationShrink || op == PoolOperationRemove
+	default:
+		return true
+	}
+}
