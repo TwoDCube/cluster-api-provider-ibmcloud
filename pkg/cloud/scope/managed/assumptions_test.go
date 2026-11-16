@@ -17,15 +17,20 @@ limitations under the License.
 package managed
 
 import (
+	"encoding/json"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	. "github.com/onsi/gomega"
+
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
 )
 
 // The tests of this file pin every value of assumptions.go to its source, so that switching a decision point after a
@@ -141,4 +146,103 @@ func TestDrainCadence(t *testing.T) {
 	g.Expect(DrainRetryInterval).To(Equal(20 * time.Second))
 	g.Expect(EvictionBudgetPerReconcile).To(Equal(10 * time.Second))
 	g.Expect(DrainBlockedEventInterval).To(Equal(30 * time.Minute))
+}
+
+// fixturePath returns the path of a scrubbed live fixture (probes of 2026-11-16) that the kubernetesservice package
+// keeps in its testdata: the assumptions are tested against the same captures the service layer decodes.
+func fixturePath(name string) string {
+	return filepath.Join("..", "..", "services", "kubernetesservice", "testdata", name)
+}
+
+// clusterFixture holds the fields of a getCluster capture that the assumptions read.
+type clusterFixture struct {
+	ID                string `json:"id"`
+	CRN               string `json:"crn"`
+	State             string `json:"state"`
+	CreatedDate       string `json:"createdDate"`
+	MasterKubeVersion string `json:"masterKubeVersion"`
+	TargetVersion     string `json:"targetVersion"`
+	MasterURL         string `json:"masterURL"`
+	Lifecycle         struct {
+		MasterState  string `json:"masterState"`
+		MasterHealth string `json:"masterHealth"`
+		MasterStatus string `json:"masterStatus"`
+	} `json:"lifecycle"`
+	CACertRotationStatus struct {
+		Status string `json:"status"`
+	} `json:"caCertRotationStatus"`
+}
+
+// loadCluster decodes a getCluster capture into the domain type, the way kubernetesservice.GetCluster fills it.
+func loadCluster(t *testing.T, name string) kubernetesservice.Cluster {
+	t.Helper()
+	data, err := os.ReadFile(fixturePath(name))
+	if err != nil {
+		t.Fatalf("reading fixture %s: %v", name, err)
+	}
+	var f clusterFixture
+	if err := json.Unmarshal(data, &f); err != nil {
+		t.Fatalf("decoding fixture %s: %v", name, err)
+	}
+	return kubernetesservice.Cluster{
+		ID:                f.ID,
+		CRN:               f.CRN,
+		State:             f.State,
+		CreatedDate:       f.CreatedDate,
+		MasterKubeVersion: f.MasterKubeVersion,
+		TargetVersion:     f.TargetVersion,
+		MasterURL:         f.MasterURL,
+		MasterState:       f.Lifecycle.MasterState,
+		MasterHealth:      f.Lifecycle.MasterHealth,
+		MasterStatus:      strings.TrimSpace(f.Lifecycle.MasterStatus),
+		CARotationStatus:  f.CACertRotationStatus.Status,
+	}
+}
+
+func TestParseCreatedDate(t *testing.T) {
+	ibmLayout := loadCluster(t, "iks-getCluster-deployed.json").CreatedDate
+	testCases := []struct {
+		name        string
+		createdDate string
+		want        time.Time
+		wantErr     bool
+	}{
+		{name: "the layout of the live capture", createdDate: ibmLayout, want: time.Date(2026, 11, 16, 3, 5, 33, 0, time.UTC)},
+		{name: "IBM layout with a non-UTC offset", createdDate: "2026-11-16T04:05:33+0100", want: time.Date(2026, 11, 16, 3, 5, 33, 0, time.UTC)},
+		{name: "RFC 3339 with Z", createdDate: "2026-11-16T03:05:33Z", want: time.Date(2026, 11, 16, 3, 5, 33, 0, time.UTC)},
+		{name: "RFC 3339 with an offset", createdDate: "2026-11-16T05:05:33+02:00", want: time.Date(2026, 11, 16, 3, 5, 33, 0, time.UTC)},
+		{name: "empty", createdDate: "", wantErr: true},
+		{name: "date only", createdDate: "2026-11-16", wantErr: true},
+		{name: "free text", createdDate: "yesterday", wantErr: true},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			got, err := ParseCreatedDate(tc.createdDate)
+			if tc.wantErr {
+				g.Expect(err).To(MatchError(ContainSubstring("known layouts are RFC 3339")))
+				g.Expect(err.Error()).To(ContainSubstring("%q", tc.createdDate))
+				return
+			}
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(got.Equal(tc.want)).To(BeTrue(), "got %s, want %s", got, tc.want)
+		})
+	}
+}
+
+// TestBindingWindows pins the binding decision points: the createdDate layouts, the adoption and grace windows, and
+// AdoptByEndpointMatch.
+func TestBindingWindows(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(CreatedDateLayouts()).To(Equal([]string{time.RFC3339, "2006-01-02T15:04:05-0700"}))
+	g.Expect(CreatedDateSkew).To(Equal(2 * time.Minute))
+	g.Expect(CreatedDateSlack).To(Equal(10 * time.Minute))
+	g.Expect(CreateGracePeriod).To(Equal(5 * time.Minute))
+	g.Expect(DeleteLookupGracePeriod).To(Equal(30 * time.Minute))
+	g.Expect(AdoptByEndpointMatch).To(BeFalse())
+
+	// A caller that modifies the returned list does not change the next caller's.
+	layouts := CreatedDateLayouts()
+	layouts[0] = "changed"
+	g.Expect(CreatedDateLayouts()[0]).To(Equal(time.RFC3339))
 }

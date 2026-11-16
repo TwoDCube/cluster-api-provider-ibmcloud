@@ -17,6 +17,7 @@ limitations under the License.
 package managed
 
 import (
+	"fmt"
 	"time"
 )
 
@@ -52,3 +53,60 @@ const EvictionBudgetPerReconcile = 10 * time.Second
 // (core/reconcilers/machine/machine_controller.go:930-948). CAPIBM adds the Warning so that a drain blocked for hours
 // shows up in events, and bounds it to one per interval so that it does not flood them.
 const DrainBlockedEventInterval = 30 * time.Minute
+
+// Binding: which IBM cluster a control plane stands for (DecideBinding).
+
+// createdDateLayout is the layout of IBM's createdDate. Observed on IBM Cloud: "2026-11-16T03:05:33+0000", a numeric
+// zone without a colon, which time.RFC3339 does not accept.
+const createdDateLayout = "2006-01-02T15:04:05-0700"
+
+// CreatedDateLayouts returns the layouts that parse IBM's cluster createdDate, in the order ParseCreatedDate tries
+// them: RFC 3339 first, in case IBM switches to it, then the layout IBM returned in the probes. Observed on IBM Cloud
+// (see createdDateLayout). The read-after-create lag that the binding windows below allow for is not yet verified
+// against IBM Cloud.
+func CreatedDateLayouts() []string {
+	return []string{time.RFC3339, createdDateLayout}
+}
+
+// ParseCreatedDate parses IBM's createdDate with CreatedDateLayouts. Observed on IBM Cloud (see createdDateLayout).
+// The binding rules treat a cluster whose createdDate does not parse as one CAPIBM did not create (a name conflict),
+// so the error names the value and the accepted forms.
+//
+// Parameters:
+//   - createdDate: kubernetesservice.Cluster.CreatedDate as IBM returned it.
+func ParseCreatedDate(createdDate string) (time.Time, error) {
+	for _, layout := range CreatedDateLayouts() {
+		if parsed, err := time.Parse(layout, createdDate); err == nil {
+			return parsed, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("IBM createdDate %q has an unknown layout; known layouts are RFC 3339 "+
+		"(2026-11-16T03:05:33Z) and %q (2026-11-16T03:05:33+0000)", createdDate, createdDateLayout)
+}
+
+// CreatedDateSkew is how much earlier than CAPIBM's first create attempt of unknown outcome IBM's createdDate may be
+// for the cluster to still count as that attempt's (CAPIBM's own create whose response was lost): IBM's clock and the
+// controller's may differ. Not yet verified against IBM Cloud: default 2 minutes; fallback: a wider window once the
+// skew is measured.
+const CreatedDateSkew = 2 * time.Minute
+
+// CreatedDateSlack is how much later than CAPIBM's last create attempt of unknown outcome IBM's createdDate may be
+// (the same window as CreatedDateSkew): IBM stamps the cluster after it accepted the request.
+// Not yet verified against IBM Cloud: default 10 minutes; fallback: adjust once the lag is measured.
+const CreatedDateSlack = 10 * time.Minute
+
+// CreateGracePeriod is how long after a create attempt of unknown outcome a 404 still means "IBM does not list it yet"
+// rather than "it does not exist", for a lookup by ID and by name alike. Not yet verified against IBM Cloud: default 5
+// minutes; fallback: longer once the read-after-create lag is measured.
+const CreateGracePeriod = 5 * time.Minute
+
+// DeleteLookupGracePeriod replaces CreateGracePeriod while a control plane with a create intent is deleted and the
+// lookup by name finds nothing: the finalizer stays this long, so that a cluster IBM lists late is still found and
+// deleted. Not yet verified against IBM Cloud: default 30 minutes; fallback: longer.
+const DeleteLookupGracePeriod = 30 * time.Minute
+
+// AdoptByEndpointMatch lets DecideBinding adopt a same-named cluster whose master URL matches
+// spec.controlPlaneEndpoint, still only after the ownership proof. Not yet verified against IBM Cloud: default false,
+// because it is open whether a master URL is unique per cluster and stable over master updates (the two clusters of
+// the live probes had distinct URLs); switch to true once both are confirmed.
+const AdoptByEndpointMatch = false
