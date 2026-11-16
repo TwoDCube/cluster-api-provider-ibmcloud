@@ -48,10 +48,8 @@ import (
 const masterEndOfSupportNotice = 45 * 24 * time.Hour
 
 // masterPermissionDeniedReason is the MasterVersionUpToDate reason of an UpdateMaster 403: the credentials lack the
-// Kubernetes Service role. The API package has no MasterVersionUpToDate PermissionDenied reason yet; once
-// controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDatePermissionDeniedReason is added, it replaces this
-// literal.
-const masterPermissionDeniedReason = "PermissionDenied"
+// Kubernetes Service role.
+const masterPermissionDeniedReason = controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDatePermissionDeniedReason
 
 // masterMaxWorkerSkew returns how many minors IBM lets workers run behind the master: 2 for Kubernetes (IKS worker
 // nodes may be up to two minors behind the master) and 1 for OpenShift (ROKS: one minor), so a master update to target

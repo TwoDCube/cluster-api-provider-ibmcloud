@@ -185,8 +185,9 @@ const (
 	// flight at IBM.
 	IBMCloudManagedControlPlaneMasterVersionUpToDateUpgradePendingReason = "UpgradePending"
 
-	// IBMCloudManagedControlPlaneMasterVersionUpToDateUpgradeFailedReason surfaces when IBM returned the master to the old
-	// minor after an update; the message names the retry time.
+	// IBMCloudManagedControlPlaneMasterVersionUpToDateUpgradeFailedReason surfaces when a requested minor update has not
+	// taken effect (the master is still on the old minor and IBM shows no update in progress); the message names the retry
+	// time.
 	IBMCloudManagedControlPlaneMasterVersionUpToDateUpgradeFailedReason = "UpgradeFailed"
 
 	// IBMCloudManagedControlPlaneMasterVersionUpToDateVersionSkipNotAllowedReason surfaces when spec.distributionVersion is
@@ -212,6 +213,11 @@ const (
 	// IBMCloudManagedControlPlaneMasterVersionUpToDateBlockedByClusterStateReason surfaces while the IBM cluster state
 	// blocks master updates.
 	IBMCloudManagedControlPlaneMasterVersionUpToDateBlockedByClusterStateReason = "BlockedByClusterState"
+
+	// IBMCloudManagedControlPlaneMasterVersionUpToDatePermissionDeniedReason surfaces when IBM refused UpdateMaster with
+	// HTTP 403: the credentials lack the Kubernetes Service role (CAPIBM never requests more than one minor step, so a 403
+	// is not a version-skip refusal); the update is requested again on the retry backoff.
+	IBMCloudManagedControlPlaneMasterVersionUpToDatePermissionDeniedReason = "PermissionDenied"
 )
 
 // RollingOut is the CAPI contract condition that CAPI aggregates into the Cluster's RollingOut.

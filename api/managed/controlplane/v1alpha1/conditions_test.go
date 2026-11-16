@@ -126,6 +126,7 @@ func TestConditionCatalogueIsValid(t *testing.T) {
 				controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateBlockedByCARotationReason,
 				controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateBlockedByWorkerSkewReason,
 				controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateBlockedByClusterStateReason,
+				controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDatePermissionDeniedReason,
 			},
 		},
 		{
