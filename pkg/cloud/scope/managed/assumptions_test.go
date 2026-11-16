@@ -812,3 +812,24 @@ func TestScaleDownDecisionPoint(t *testing.T) {
 	g.Expect(ScaleDownMode).To(Equal(ScaleDownPredictThenResize))
 	g.Expect(ScaleDownResizeOnly).NotTo(Equal(ScaleDownPredictThenResize))
 }
+
+func TestMasterUpdateVersion(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(MasterUpdateVersion(controlplanev1.DistributionKubernetes, ibmversion.Minor{Major: 1, Minor: 36}.Next())).To(Equal("1.37"))
+	g.Expect(MasterUpdateVersion(controlplanev1.DistributionOpenShift, ibmversion.Minor{Major: 4, Minor: 21}.Next())).To(Equal("4.22_openshift"))
+	g.Expect(MasterUpdateVersion("Other", ibmversion.Minor{Major: 1, Minor: 37})).To(BeEmpty(), "an unknown distribution sends nothing")
+}
+
+// TestMasterUpdateDecisionPoints pins the master update decision points: the pending grace, the retry backoff and
+// the cluster states that block an update.
+func TestMasterUpdateDecisionPoints(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(MasterUpdatePendingGrace).To(Equal(5 * time.Minute))
+	g.Expect(MasterUpdateRetryAfter).To(Equal(time.Hour))
+	g.Expect(MasterUpdateRetryMax).To(Equal(24 * time.Hour))
+	blocked := MasterUpdateBlockedStates()
+	g.Expect(blocked).To(ConsistOf("requested", "deploying", "updating", "update_failed", "scaled_down", "unavailable",
+		"critical", "deleting", "deleted", "aborted", "delete_failed", "deploy_failed", "create_failed"))
+	// IBM says the master must be updated in these states, so they never block.
+	g.Expect(blocked).NotTo(ContainElements("unsupported", "update_canceled", "normal", "warning", "pending", "deployed"))
+}

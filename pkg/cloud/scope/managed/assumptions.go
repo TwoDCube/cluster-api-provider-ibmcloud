@@ -715,3 +715,40 @@ const (
 // resizeWorkerPool removes exactly the predicted victims, and whether a cordon changes IBM's ranking; default
 // ScaleDownPredictThenResize; fallback: ScaleDownResizeOnly.
 const ScaleDownMode = ScaleDownPredictThenResize
+
+// Master minor update.
+
+// MasterUpdateVersion returns the version CAPIBM sends to updateMaster for the next minor: "1.37" for Kubernetes and
+// "4.22_openshift" for OpenShift. Not yet verified against IBM Cloud: whether updateMaster accepts a minor-only
+// version; fallback: the newest patch of that minor from getVersions. An unknown distribution returns "", which
+// kubernetesservice.UpdateMaster rejects before sending anything.
+//
+// Parameters:
+//   - d: the control plane's spec.distribution.
+//   - minor: the minor to update to (the observed minor's Next()).
+func MasterUpdateVersion(d controlplanev1.Distribution, minor ibmversion.Minor) string {
+	return ibmMinorVersion(d, minor)
+}
+
+// MasterUpdatePendingGrace is how long after an updateMaster request CAPIBM sends no second one while IBM does not
+// show the update pending yet (UpgradePending). Not yet verified against IBM Cloud: the lag before IBM shows
+// " (pending)"; default 5 minutes; fallback: longer.
+const MasterUpdatePendingGrace = 5 * time.Minute
+
+// MasterUpdateRetryAfter is the first wait before CAPIBM requests a master update again after IBM returned the master
+// to the old minor; it doubles with every attempt up to MasterUpdateRetryMax (UpgradeFailed).
+// Not yet verified against IBM Cloud: the state after a failed update; default 1 hour; fallback: adjust.
+const MasterUpdateRetryAfter = time.Hour
+
+// MasterUpdateRetryMax caps the doubling of MasterUpdateRetryAfter. Not yet verified against IBM Cloud: default
+// 24 hours; fallback: adjust.
+const MasterUpdateRetryMax = 24 * time.Hour
+
+// MasterUpdateBlockedStates returns the cluster states in which CAPIBM sends no updateMaster (BlockedByClusterState).
+// unsupported and update_canceled are not in it: in both IBM says the master must be updated.
+// Not yet verified against IBM Cloud: the update and failure states; fallback: adjust the list.
+func MasterUpdateBlockedStates() []string {
+	return []string{"requested", "deploying", clusterStateUpdating, "update_failed", clusterStateScaledDown,
+		clusterStateUnavailable, "critical", "deleting", "deleted", "aborted", "delete_failed", "deploy_failed",
+		"create_failed"}
+}
