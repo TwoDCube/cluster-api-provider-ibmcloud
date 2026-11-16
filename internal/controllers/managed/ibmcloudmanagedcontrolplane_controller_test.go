@@ -822,28 +822,27 @@ func TestControlPlaneReconcileMakesNoIBMCall(t *testing.T) {
 	t.Run("a deleting control plane whose IBMCloudManagedCluster is gone keeps its finalizer and reports Deleting", func(t *testing.T) {
 		g := NewWithT(t)
 		objs := newCPObjects()
-		objs.cp.Spec.ControlPlaneEndpoint = controlplanev1.APIEndpoint{Host: "c111.us-south.containers.cloud.ibm.com", Port: 30101}
+		objs.cp.Status.ClusterID = cpIKSClusterID
 		objs.cp.DeletionTimestamp = ptr.To(metav1.NewTime(cpTestStart))
+		objs.cluster.Spec.InfrastructureRef.Name = "gone"
 		f := newNoCallFixture(t, objs)
-		f.r.Resolver, f.r.ClientBuilder = f.resolver, f.builder
-		f.kube.EXPECT().GetCluster(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().
-			Return(nil, ibmError(kubernetesservice.OpGetCluster, http.StatusNotFound, ""))
 
 		_, err := f.reconcile()
 
 		g.Expect(err).NotTo(HaveOccurred())
-		if cp := f.controlPlane(); cp != nil {
-			condition := conditions.Get(cp, controlplanev1.IBMCloudManagedControlPlaneDeletingCondition)
-			g.Expect(condition).NotTo(BeNil())
-			g.Expect(condition.Status).To(Equal(metav1.ConditionTrue), "Deleting is True with a specific reason while deleting")
-			g.Expect(condition.Reason).NotTo(Equal(controlplanev1.IBMCloudManagedControlPlaneNotDeletingReason))
-		}
+		cp := f.controlPlane()
+		g.Expect(cp).NotTo(BeNil(), "the finalizer stays while an IBM cluster may exist")
+		expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneDeletingCondition, metav1.ConditionTrue,
+			controlplanev1.IBMCloudManagedControlPlaneDeletingWaitingForInfrastructureReason)
+		expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionFalse,
+			controlplanev1.IBMCloudManagedControlPlaneAvailableDeletingReason)
 	})
 
-	t.Run("a deleting control plane that cannot have an IBM cluster loses its finalizer", func(t *testing.T) {
+	t.Run("a deleting control plane without an IBM cluster or IBMCloudManagedCluster loses its finalizer", func(t *testing.T) {
 		g := NewWithT(t)
 		objs := newCPObjects()
 		objs.cp.DeletionTimestamp = ptr.To(metav1.NewTime(cpTestStart))
+		objs.cluster.Spec.InfrastructureRef.Name = "gone"
 		f := newNoCallFixture(t, objs)
 
 		_, err := f.reconcile()
@@ -994,6 +993,19 @@ func TestControlPlaneConditionsIgnoreTheIncident(t *testing.T) {
 			},
 			wantCondition: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition,
 			wantReason:    controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason,
+		},
+		{
+			name: "403_on_GetCluster_while_deleting",
+			setup: func(objs *cpObjects) {
+				objs.cp.Status.ClusterID = cpIKSClusterID
+				objs.cp.DeletionTimestamp = ptr.To(metav1.NewTime(cpTestStart.Add(-time.Minute)))
+			},
+			expect: func(f *cpFixture, incident string) {
+				f.kube.EXPECT().GetCluster(gomock.Any(), cpIKSClusterID, "").
+					Return(nil, ibmErrorWithIncident(kubernetesservice.OpGetCluster, http.StatusForbidden, "", incident))
+			},
+			wantCondition: controlplanev1.IBMCloudManagedControlPlaneDeletingCondition,
+			wantReason:    controlplanev1.IBMCloudManagedControlPlaneDeletingPermissionDeniedReason,
 		},
 	}
 	for _, tc := range testCases {
@@ -1232,6 +1244,9 @@ func TestControlPlaneEnvtestIncidentSettles(t *testing.T) {
 		{name: "400_on_GetCluster", status: http.StatusBadRequest, code: "E1234", prepare: pauseAtCleanup,
 			wantCondition: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition,
 			wantReason:    controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason},
+		{name: "403_on_GetCluster_while_deleting", status: http.StatusForbidden, prepare: deleteEnvtestControlPlaneWithItsCluster,
+			wantCondition: controlplanev1.IBMCloudManagedControlPlaneDeletingCondition,
+			wantReason:    controlplanev1.IBMCloudManagedControlPlaneDeletingPermissionDeniedReason},
 	} {
 		t.Run(tc.name+"_manager_settles", func(t *testing.T) {
 			t.Parallel()
@@ -1279,6 +1294,33 @@ func TestControlPlaneEnvtestIncidentSettles(t *testing.T) {
 			g.Consistently(gets.Load, noHotLoopWindow, 100*time.Millisecond).Should(Equal(settled))
 		})
 	}
+}
+
+// deleteEnvtestControlPlaneWithItsCluster deletes the control plane key as a Cluster deletion would: the Cluster is
+// deleted first, held by a test finalizer, which the webhook requires for a bound control plane (it rejects deleting
+// one on its own while its Cluster lives). Cleanups, registered before the manager starts, release both objects once
+// the manager has stopped.
+func deleteEnvtestControlPlaneWithItsCluster(t *testing.T, cluster *clusterv1.Cluster, key client.ObjectKey) {
+	t.Helper()
+	g := NewWithT(t)
+	const holdCluster = "test.cluster.x-k8s.io/hold"
+	cluster.Finalizers = []string{holdCluster}
+	g.Expect(testEnv.Update(ctx, cluster)).To(Succeed())
+	g.Expect(testEnv.Delete(ctx, cluster)).To(Succeed())
+	g.Eventually(func() error { return testEnv.Delete(ctx, getEnvtestControlPlane(t, key)) }, 10*time.Second, 100*time.Millisecond).Should(Succeed())
+	t.Cleanup(func() {
+		release := func(obj client.Object) {
+			g.Eventually(func() error {
+				if err := testEnv.GetAPIReader().Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+					return client.IgnoreNotFound(err)
+				}
+				obj.SetFinalizers(nil)
+				return testEnv.Update(ctx, obj)
+			}, 10*time.Second, 100*time.Millisecond).Should(Succeed())
+		}
+		release(&controlplanev1.IBMCloudManagedControlPlane{ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name}})
+		release(&clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Namespace: cluster.Namespace, Name: cluster.Name}})
+	})
 }
 
 func TestControlPlaneReconcilerSetupWithManager(t *testing.T) {

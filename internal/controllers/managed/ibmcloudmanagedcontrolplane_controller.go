@@ -24,7 +24,6 @@ import (
 	"github.com/IBM/go-sdk-core/v5/core"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
@@ -33,11 +32,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
-	clusterctlv1 "sigs.k8s.io/cluster-api/cmd/clusterctl/api/v1alpha3"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/finalizers"
@@ -165,27 +162,6 @@ func (r *IBMCloudManagedControlPlaneReconciler) reconcileNormal(ctx context.Cont
 	return resultFor(outcome, managedscope.IntervalSteadyState)
 }
 
-// reconcileDelete removes the finalizer when the deletion cannot leave an IBM cluster behind: clusterctl move deletes
-// the source copy (the target takes over the IBM cluster), or no IBM cluster can exist for this control plane (no
-// status.clusterID, no spec.controlPlaneEndpoint and no create intent). Every other deletion keeps the finalizer,
-// because this build does not delete IBM clusters. Neither path makes an IBM call. scope is this reconcile's scope.
-func (r *IBMCloudManagedControlPlaneReconciler) reconcileDelete(_ context.Context, scope *managedscope.ControlPlaneScope) (ctrl.Result, error) {
-	cp := scope.ControlPlane
-	if controlPlaneBeingMoved(cp) || managedscope.NoIBMClusterCanExist(cp) {
-		controllerutil.RemoveFinalizer(cp, controlplanev1.IBMCloudManagedControlPlaneFinalizer)
-		return ctrl.Result{}, nil
-	}
-	conditions.Set(cp, metav1.Condition{
-		Type:   controlplanev1.IBMCloudManagedControlPlaneDeletingCondition,
-		Status: metav1.ConditionTrue,
-		Reason: controlplanev1.IBMCloudManagedControlPlaneDeletingWaitingForIBMDeletionReason,
-		Message: fmt.Sprintf("this CAPIBM build does not delete IBM clusters; delete IBM cluster %s in IBM Cloud, then remove "+
-			"the finalizer %s by hand", cp.Status.ClusterID, controlplanev1.IBMCloudManagedControlPlaneFinalizer),
-	})
-	return resultFor(managedscope.NotDone(managedscope.IntervalTerminalRecheck,
-		controlplanev1.IBMCloudManagedControlPlaneDeletingWaitingForIBMDeletionReason), managedscope.IntervalSteadyState)
-}
-
 // scopeParams returns the reconciler's dependencies as the scope's parameters.
 func (r *IBMCloudManagedControlPlaneReconciler) scopeParams() *managedscope.ScopeParams {
 	return &managedscope.ScopeParams{
@@ -209,14 +185,6 @@ func logControlPlaneTerminal(ctx context.Context, outcome managedscope.Outcome) 
 	if outcome.Kind == managedscope.OutcomeTerminal {
 		ctrl.LoggerFrom(ctx).Info("The control plane needs a human", "reason", outcome.Reason, "message", outcome.Message)
 	}
-}
-
-// controlPlaneBeingMoved reports whether clusterctl move is deleting cp from the source management cluster:
-// clusterctl sets the delete-for-move annotation on every object it moves before it deletes it there, and the copy on
-// the target takes over the IBM cluster, so the source must make no IBM call. cp is the control plane.
-func controlPlaneBeingMoved(cp *controlplanev1.IBMCloudManagedControlPlane) bool {
-	_, ok := cp.Annotations[clusterctlv1.DeleteForMoveAnnotation]
-	return ok
 }
 
 // controlPlaneOwnedConditions are the conditions the control plane controller writes; the patch helper resolves
