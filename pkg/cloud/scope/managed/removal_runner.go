@@ -46,6 +46,11 @@ import (
 // cluster that turned unavailable during a long drain. The runner is parameterised by what differs between the flows:
 // the operation and its victims, the one IBM call, how the flow reports a step on its condition, and where it records
 // IBM's refusal of the call.
+//
+// The two removals that can be given up before their IBM call, the scale-down and the worker replacement, also share
+// how they observe the drain without evicting (checkDrain), announce a drain that leaves Draining on its time limit
+// (announceTimeout), run the drain step (drainVictims) and revert their cordons when they give up (uncordon). The pool
+// deletion never gives up, so it evicts while it observes and keeps its own drain step.
 
 // removalCall is the one IBM call of a removal (StepCallIBM): RemoveWorkerPool for a pool deletion, ResizeWorkerPool for
 // a scale-down, ReplaceWorker for a replace.
@@ -57,7 +62,8 @@ type removalCall struct {
 	op kubernetesservice.Operation
 
 	// action says what the call does, for the condition and the error of a failed call, for example "removing worker
-	// pool default of IBM cluster c1".
+	// pool default of IBM cluster c1". Required: the report of a failed call names it, and that is how the runner finds
+	// the report again (removalRunner.recordedCallError).
 	action string
 
 	// send makes the call and returns IBM's error; nil for success.
@@ -139,12 +145,18 @@ type removalRunner struct {
 	refusal refusalRecord
 	// reportFlow reports a decision on the flow's condition, in the flow's words.
 	reportFlow func(d DisruptionDecision)
+	// reportCallError reports IBM's answer to a call that DisruptionCallOutcome leaves to the common error handling on
+	// the flow's condition (removalRunnerInput.reportCallError).
+	reportCallError func(reason, message string)
 	// drainsNothing is true for a removal that drains no Node at all (a scale-down in ScaleDownResizeOnly mode): it
 	// builds no drain step, announces no drain and keeps Draining False.
 	drainsNothing bool
 
 	// knobs are the pool's drain settings, read in this reconcile.
 	knobs DrainKnobs
+	// workload is the workload cluster's client from ClusterCache; nil while it is not connected. uncordon reverts the
+	// cordons through it.
+	workload client.Client
 	// drain is the drain step; nil while the workload cluster is not connected and for a removal that drains nothing.
 	drain *DrainStep
 	// victimNodes are the Nodes of the victims, sorted by name; none while the workload cluster is not connected.
@@ -181,6 +193,16 @@ type removalRunnerInput struct {
 	refusal refusalRecord
 	// report reports a decision on the flow's condition. Required.
 	report func(d DisruptionDecision)
+	// reportCallError reports IBM's answer to the call that DisruptionCallOutcome leaves to the common error handling
+	// (MachinePoolScope.ibmProblemOn: a 401, a 403 that is no refusal of an autoscaled pool, a 400 other than E1437) on
+	// the condition named by refusal, from the reason (IBMAPIError) and ibmProblemOn's message, which carries IBM's code
+	// only, never the incident ID that changes with every answer. The flow may add its own words, but the message it
+	// writes must keep ibmProblemOn's, which names call.action: refusalHold finds the report that way and keeps it for
+	// the rest of DisruptionSettleDelay. Optional: nil reports with MachinePoolScope.report (WorkerPoolReady, or
+	// Deleting while the pool is deleted), which is the condition of the pool deletion and the scale-down. A replace
+	// reports on WorkersUpToDate and must pass its own: WorkerPoolReady is reported afresh from IBM's pool on every
+	// reconcile, which would hide the answer at once.
+	reportCallError func(reason, message string)
 	// drainsNothing is true for a removal that drains no Node at all (ScaleDownResizeOnly).
 	drainsNothing bool
 	// workload is the workload cluster's client from ClusterCache; nil while it is not connected.
@@ -220,6 +242,9 @@ func newRemovalRunner(in removalRunnerInput) (*removalRunner, error) {
 		// mutation and fail afterwards, once every DisruptionSettleDelay.
 		problems = append(problems, "call.op: "+err.Error())
 	}
+	if in.call.action == "" {
+		problems = append(problems, `call.action is ""; say what the call does, for example "removing worker pool p of IBM cluster c"`)
+	}
 	if in.refusal.condition == "" || in.refusal.status == "" {
 		problems = append(problems, "refusal needs the condition type and status the flow reports on")
 	}
@@ -230,8 +255,12 @@ func newRemovalRunner(in removalRunnerInput) (*removalRunner, error) {
 		return nil, errors.New("managed: removal runner: " + strings.Join(problems, "; "))
 	}
 	r := &removalRunner{s: in.scope, clients: in.clients, pool: in.pool, operation: in.operation, victims: in.victims,
-		clusterState: in.clusterState, call: in.call, refusal: in.refusal, reportFlow: in.report, drainsNothing: in.drainsNothing,
-		knobs: DrainKnobsFor(in.scope.MachinePool, in.scope.Pool), victimNodes: in.victimNodes}
+		clusterState: in.clusterState, call: in.call, refusal: in.refusal, reportFlow: in.report, reportCallError: in.reportCallError,
+		drainsNothing: in.drainsNothing, knobs: DrainKnobsFor(in.scope.MachinePool, in.scope.Pool), workload: in.workload,
+		victimNodes: in.victimNodes}
+	if r.reportCallError == nil {
+		r.reportCallError = in.scope.report
+	}
 	if in.workload == nil || in.drainsNothing {
 		return r, nil
 	}
@@ -279,13 +308,15 @@ func removalNoun(op infrav1.WorkerDisruptionOperation) string {
 // clusterStateCheck is the pool's cluster-state gate for this removal, as a DisruptionCheckResult so that it can head
 // the pre-call gate: allowed, or WaitingForClusterState with the IBM cluster and its state in the message
 // (PoolMutationAllowed). Without it IBM's documented refusal would look like an invalid configuration. The flows read
-// it at the Gated step (DisruptionGates.ClusterStateAllows), before a call without victims, and in preCallGate.
+// it at the Gated step (DisruptionGates.ClusterStateAllows), before a call without victims, and in preCallGate. The
+// message is the one every cluster-state gate of the pool writes (clusterStateMessage): only a replace is ever refused
+// on an unsupported cluster, and that message names the master upgrade it needs.
 func (r *removalRunner) clusterStateCheck() DisruptionCheckResult {
 	if PoolMutationAllowed(r.clusterState, removalPoolOperation(r.operation)) {
 		return DisruptionCheckResult{Allowed: true}
 	}
-	return DisruptionCheckResult{Reason: ReasonWaitingForClusterState, Message: fmt.Sprintf("IBM cluster %s is %s; IBM "+
-		"accepts no worker pool change in that state", r.s.ControlPlane.Status.ClusterID, r.clusterState)}
+	return DisruptionCheckResult{Reason: ReasonWaitingForClusterState,
+		Message: clusterStateMessage(r.s.ControlPlane.Status.ClusterID, r.clusterState)}
 }
 
 // preCallGate is the pre-call gate for this removal (DisruptionObservation.PreCallGate): the IBM cluster state of this
@@ -344,6 +375,126 @@ func (r *removalRunner) runDrain(ctx context.Context, evict bool) error {
 	return nil
 }
 
+// checkDrain observes the drain for the effective phase of o, for a removal that can still be given up before its IBM
+// call (a scale-down whose MachinePool went back up, a replace whose worker is no longer due): in every phase before the
+// call it checks the victims without evicting (DrainStep.Check), and the gates read only the exclusions. Evicting while
+// observing would only move pods for nothing when the decision then aborts the removal; the eviction runs once the
+// decision is StepDrain (drainVictims). Nothing is cordoned or evicted before this pool holds the disruption token.
+// A removal that drains nothing counts its drain and detach wait as excluded. The pool deletion, which never gives up,
+// evicts while it observes instead (poolRemoval.drainProgress).
+//
+// Parameters:
+//   - ctx is the reconcile context.
+//   - o is the observation so far.
+func (r *removalRunner) checkDrain(ctx context.Context, o DisruptionObservation) (DrainProgress, error) {
+	knobsOnly := DrainProgress{Excluded: r.knobs.ExcludeDraining || r.drainsNothing,
+		DetachExcluded: r.knobs.ExcludeVolumeDetachWait || r.drainsNothing}
+	phase := o.Phase
+	if phase == "" && o.ResumeFromNodeMarkers {
+		phase = infrav1.WorkerDisruptionPhaseDraining
+	}
+	if r.drainsNothing || o.Token != TokenHeld || !isPreCallPhase(phase) {
+		return knobsOnly, nil
+	}
+	if r.drain == nil {
+		return r.disconnectedProgress(), nil
+	}
+	if r.drainResult == nil {
+		if err := r.runDrain(ctx, false); err != nil {
+			return DrainProgress{}, err
+		}
+	}
+	return r.drainResult.Progress, nil
+}
+
+// announceTimeout emits DrainTimeoutExceeded when the drain leaves phase Draining because its time limit ran out: the
+// observation only checked the Nodes (checkDrain), and Evict is what names the pods left on a timed-out Node (it sends
+// no eviction there). It runs once, on the step out of Draining. ctx is the reconcile context.
+func (r *removalRunner) announceTimeout(ctx context.Context) error {
+	from := r.s.Pool.Status.Disruption.Phase
+	leavesDraining := from == infrav1.WorkerDisruptionPhaseDraining || (from == "" && r.resumed)
+	if !leavesDraining || r.drain == nil || r.evicted || r.drainResult == nil || !r.drainResult.Progress.TimedOut {
+		return nil
+	}
+	return r.runDrain(ctx, true)
+}
+
+// drainVictims carries out StepDrain for a removal that observes with checkDrain: cordon every victim Node, then evict
+// (every victim is cordoned before the first eviction, so that evicted pods never land on another victim), record the
+// decision's phase and wait drainRetryInterval. A removal that drains nothing only moves on. The first eviction of a
+// removal runs after the decision, so its refusals are reported at once (DrainBlocked): the next reconcile then sees
+// DrainBlocked as the previous reason and does not announce it again.
+//
+// Parameters:
+//   - ctx is the reconcile context.
+//   - d is the decision.
+func (r *removalRunner) drainVictims(ctx context.Context, d DisruptionDecision) Outcome {
+	if !r.evicted && !r.drainsNothing {
+		if err := r.runDrain(ctx, true); err != nil {
+			return Transient(err)
+		}
+	}
+	if r.drainResult != nil && r.drainResult.Progress.Blocked {
+		d.DrainingReason = ReasonDrainBlocked
+	}
+	r.record(d.Phase)
+	return r.wait(d, IntervalDrainRetry)
+}
+
+// uncordon reverts CAPIBM's cordon of the Nodes of the workers when a removal is given up: drain.Helper.Uncordon
+// reverts only CAPIBM's own changes, so a Node a human cordoned before stays cordoned. It returns how many of those
+// Nodes carried this pool's drain-owner marker, for the NodeUncordoned event. While the workload cluster is not
+// connected it returns a hold, and true: the Nodes cannot be uncordoned yet, so nothing is given up, unless the flow
+// can give up without it (withoutWorkload: nothing of the removal touched the workload cluster). A removal that
+// drains nothing, and an empty set of workers, uncordon nothing.
+//
+// Parameters:
+//   - ctx is the reconcile context.
+//   - account is the IBM account of the cluster (AccountIDFromCRN), which the Nodes' provider IDs carry.
+//   - workerIDs are the workers whose Nodes to uncordon.
+//   - phase is the phase to keep while holding; "" records none.
+//   - withoutWorkload is true when the flow may give up without the workload cluster.
+func (r *removalRunner) uncordon(ctx context.Context, account string, workerIDs []string, phase infrav1.WorkerDisruptionPhase,
+	withoutWorkload bool) (int, Outcome, bool) {
+	if r.drainsNothing || len(workerIDs) == 0 {
+		return 0, Outcome{}, false
+	}
+	if r.workload == nil {
+		if withoutWorkload {
+			return 0, Outcome{}, false
+		}
+		hold := DisruptionDecision{Step: StepHold, Phase: phase, Reason: ReasonWaitingForWorkloadCluster,
+			Message: "the workload cluster is not connected; CAPIBM uncordons the Nodes it cordoned once it is"}
+		if phase != "" {
+			r.record(phase)
+		}
+		return 0, r.wait(hold, IntervalGuarded), true
+	}
+	helper := &drain.Helper{Client: r.workload, Clock: r.s.params.Clock, EvictionBudget: EvictionBudgetPerReconcile,
+		AnnotationPrefix: infrav1.NodeAnnotationPrefix}
+	// The victims' Nodes as this reconcile last wrote them: Uncordon patches with the Node's resourceVersion.
+	nodes := VictimNodes(r.victimNodes, account, r.s.ControlPlane.Status.ClusterID, workerIDs)
+	reverted := 0
+	for i := range nodes {
+		if hasDrainOwner(&nodes[i], r.s.Pool) {
+			reverted++
+		}
+		if err := helper.Uncordon(ctx, &nodes[i]); err != nil {
+			return 0, Transient(err), true
+		}
+	}
+	return reverted, Outcome{}, false
+}
+
+// hasDrainOwner reports whether node carries pool's drain-owner marker, which CAPIBM writes with every cordon.
+//
+// Parameters:
+//   - node is the Node.
+//   - pool is the IBMCloudManagedMachinePool.
+func hasDrainOwner(node *corev1.Node, pool *infrav1.IBMCloudManagedMachinePool) bool {
+	return node.Annotations[infrav1.NodeAnnotationPrefix+drain.MarkerDrainOwner] == DrainOwner(pool)
+}
+
 // record writes status.disruption for phase: the runner's operation and victims, and the drain start, kept, or taken
 // from this reconcile's drain (whose start comes from the Node markers of a drain that started before) or now.
 // ibmRequestTime is kept. The drain events of the phase change are emitted here.
@@ -396,12 +547,16 @@ func (r *removalRunner) drainEvents(from, to infrav1.WorkerDisruptionPhase) {
 
 // report reports the decision: on the flow's condition in the flow's words (reportFlow), then on Draining from its
 // DrainingReason, with the drain message of this reconcile (deterministic, at most 3 pods per category, so that a
-// repeated reconcile writes nothing). A removal that drains nothing keeps Draining False.
+// repeated reconcile writes nothing). A removal that drains nothing keeps Draining False. The hold of a recorded call
+// error (keepsCallError) leaves the flow's condition as reportCallError wrote it: reporting it again in the flow's
+// words would wrap the message once more on every reconcile.
 //
 // Parameters:
 //   - d is the decision.
 func (r *removalRunner) report(d DisruptionDecision) {
-	r.reportFlow(d)
+	if !keepsCallError(d) {
+		r.reportFlow(d)
+	}
 	draining := metav1.Condition{
 		Type:   infrav1.IBMCloudManagedMachinePoolDrainingCondition,
 		Status: metav1.ConditionFalse,
@@ -461,8 +616,8 @@ func (r *removalRunner) callIBM(ctx context.Context, d DisruptionDecision) Outco
 // so that a restart never sends a call twice within DisruptionSettleDelay: the caller has set ibmRequestTime or
 // lastDisruptionTime before; when the persist fails, no call is sent. It returns the handled answer, or the outcome to
 // return and true when call is not a removal call (then nothing is persisted or sent), the persist failed, or IBM's
-// answer is left to the common error handling (ibmProblem). A call without victims (a pool without workers, a resize
-// that removes none) uses it directly.
+// answer is left to the common error handling (ibmProblemOn), which reports it on the flow's condition through
+// reportCallError. A call without victims (a pool without workers, a resize that removes none) uses it directly.
 //
 // Parameters:
 //   - ctx is the reconcile context.
@@ -484,9 +639,34 @@ func (r *removalRunner) sendCall(ctx context.Context, call removalCall) (Disrupt
 	case verr != nil:
 		return DisruptionCallResult{}, Transient(verr), true
 	case !result.Handled:
-		return DisruptionCallResult{}, r.s.ibmProblem(r.clients, call.op, call.action, err), true
+		return DisruptionCallResult{}, r.s.ibmProblemOn(r.reportCallError, r.clients, call.op, call.action, err), true
 	}
 	return result, Outcome{}, false
+}
+
+// recordedCallError returns the message of the report of IBM's answer to the runner's call that the flow's condition
+// records, and true: the condition named by refusal, with its status, the reason IBMAPIError, and a message that names
+// call.action, which only ibmProblemOn's report of this call writes (reportCallError). A failed listing or credential
+// resolution reports IBMAPIError too, but names another action, and a step that reports anything else replaces the
+// record. It returns "" and false when the condition records no such answer.
+func (r *removalRunner) recordedCallError() (string, bool) {
+	recorded := conditions.Get(r.s.Pool, r.refusal.condition)
+	if recorded == nil || recorded.Status != r.refusal.status || recorded.Reason != MachinePoolIBMAPIErrorReason ||
+		!strings.Contains(recorded.Message, r.call.action) {
+		return "", false
+	}
+	return recorded.Message, true
+}
+
+// keepsCallError reports whether d is the hold of a recorded call error that refusalHold returned: its reason is
+// IBMAPIError, which no step of DecideDisruptionStep reports, and the flow's condition already carries the report as
+// reportCallError wrote it. A flow that reports a decision without the runner (report) must leave the condition as it
+// is for such a decision too.
+//
+// Parameters:
+//   - d is the decision.
+func keepsCallError(d DisruptionDecision) bool {
+	return d.Reason == DisruptionReason(MachinePoolIBMAPIErrorReason)
 }
 
 // recordedRefusal returns the reason of IBM's synchronous refusal of the latest call as the flow's condition records it
@@ -499,23 +679,29 @@ func (r *removalRunner) recordedRefusal() DisruptionReason {
 // refusalHold keeps the hold of a refused call while the call waits out DisruptionSettleDelay. It returns d with the
 // reason and message of the refusal the flow's condition records (WaitingForClusterMinimum for E1437, which IBM
 // refuses synchronously and without side effects; ExternallyAutoscaled for the 403 of an autoscaled pool), and true.
-// Otherwise it returns d and false. The flow asks only while its latest call is less than DisruptionSettleDelay old
-// (StepWaitForIBM, or the gate of a call without victims), and every call reports its own answer first (callIBM), so
-// the condition names the answer to that call.
+// It does the same for IBM's answer that the common error handling reported (recordedCallError: a 403 for a missing
+// Kubernetes Service role, a 401, a 400), with the reason IBMAPIError, which report leaves on the condition as written
+// (keepsCallError). Otherwise it returns d and false. The flow asks only while its latest call is less than
+// DisruptionSettleDelay old (StepWaitForIBM, or the gate of a call without victims), and every call reports its own
+// answer first (callIBM), so the condition names the answer to that call.
 //
 // The wait itself stays: ibmRequestTime and lastDisruptionTime keep the retry out of the delay, also in the reconcile
 // that this pool's own status patch triggers at once (the For watch has no generation predicate); taking them back would
 // retry the refused call in a loop. Only the report changes: DecideDisruptionStep's wait after a call ("the IBM call was
 // sent at ...") would otherwise replace the hold for the delay after each refusal, so that the reason flips back and
-// forth and every reconcile rewrites status.
+// forth and status is rewritten on every reconcile, and the operator would never see the cause of a refusal they must
+// fix, such as a missing role, while the Nodes stay cordoned and the Cluster's disruption token stays held.
 //
 // Parameters:
 //   - d is the decision of a wait after a call.
 func (r *removalRunner) refusalHold(d DisruptionDecision) (DisruptionDecision, bool) {
-	reason, message := r.refusal.read(r.s.Pool)
-	if reason == "" {
-		return d, false
+	if reason, message := r.refusal.read(r.s.Pool); reason != "" {
+		d.Reason, d.Message, d.DrainingReason = reason, message, ""
+		return d, true
 	}
-	d.Reason, d.Message, d.DrainingReason = reason, message, ""
-	return d, true
+	if message, recorded := r.recordedCallError(); recorded {
+		d.Reason, d.Message, d.DrainingReason = DisruptionReason(MachinePoolIBMAPIErrorReason), message, ""
+		return d, true
+	}
+	return d, false
 }

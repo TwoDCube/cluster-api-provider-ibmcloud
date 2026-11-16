@@ -23,7 +23,9 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clocktesting "k8s.io/utils/clock/testing"
 	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -33,6 +35,7 @@ import (
 	infrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/v1alpha1"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/credentials"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/drain"
 
 	. "github.com/onsi/gomega"
 )
@@ -129,6 +132,15 @@ func TestNewRemovalRunner(t *testing.T) {
 			g.Expect(f.persisted).To(BeEmpty(), "nothing is persisted")
 		})
 	}
+	t.Run("a call without its action gives no runner", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRunnerFixture(t)
+		in := f.input()
+		in.call.action = ""
+		r, err := newRemovalRunner(in)
+		g.Expect(r).To(BeNil())
+		g.Expect(err).To(MatchError(ContainSubstring(`managed: removal runner: call.action is ""; say what the call does`)))
+	})
 	t.Run("a drain step that cannot be built gives no runner", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newRunnerFixture(t)
@@ -208,10 +220,18 @@ func TestRemovalRunnerClusterStateCheck(t *testing.T) {
 				g.Expect(got).To(Equal(DisruptionCheckResult{Allowed: true}))
 				return
 			}
+			// The message is every cluster-state gate's: on unsupported it names the master upgrade a replace needs.
 			g.Expect(got).To(Equal(DisruptionCheckResult{Reason: ReasonWaitingForClusterState,
-				Message: "IBM cluster " + poolTestClusterID + " is " + tc.state + "; IBM accepts no worker pool change in that state"}))
+				Message: clusterStateMessage(poolTestClusterID, tc.state)}))
 		})
 	}
+	t.Run("the_unsupported_message_of_a_replace_asks_for_a_master_upgrade", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRunnerFixture(t)
+		r := f.runner(func(in *removalRunnerInput) { in.operation, in.clusterState = replace, "unsupported" })
+		g.Expect(r.clusterStateCheck().Message).To(Equal("IBM cluster " + poolTestClusterID + " runs an unsupported version: " +
+			"IBM does not add or reload workers on an unsupported version; upgrade the master first"))
+	})
 }
 
 func TestRemovalRunnerPreCallGate(t *testing.T) {
@@ -323,6 +343,50 @@ func TestRemovalRunnerRefusalHold(t *testing.T) {
 		g.Expect(hold).To(Equal(waitForIBM))
 		g.Expect(r.recordedRefusal()).To(BeEmpty())
 	})
+	// IBM's answer that the common error handling reported (a 403 for a missing role) is held like a refusal, so that
+	// the wait after the call does not hide it; it is no refusal for LastCallRefused, which stays fail-closed: only
+	// IBM's synchronous refusals count there.
+	callError := "IBM Cloud refused the test identity (HTTP 403, code E3e8a) while removing worker pool workers of IBM cluster " +
+		poolTestClusterID + "; grant it the roles"
+	for _, tc := range []struct {
+		name     string
+		recorded metav1.Condition
+		wantHeld bool
+	}{
+		{name: "a recorded call error keeps the hold as IBMAPIError", wantHeld: true,
+			recorded: metav1.Condition{Status: metav1.ConditionTrue, Reason: MachinePoolIBMAPIErrorReason, Message: callError}},
+		{name: "an IBMAPIError of another call is no record",
+			recorded: metav1.Condition{Status: metav1.ConditionTrue, Reason: MachinePoolIBMAPIErrorReason,
+				Message: "IBM Cloud refused the test identity (HTTP 403, code E3e8a) while listing the workers of IBM cluster " + poolTestClusterID}},
+		{name: "a call error under another status is no record",
+			recorded: metav1.Condition{Status: metav1.ConditionFalse, Reason: MachinePoolIBMAPIErrorReason, Message: callError}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			f := newRunnerFixture(t)
+			tc.recorded.Type = infrav1.IBMCloudManagedMachinePoolDeletingCondition
+			f.pool.Status.Conditions = []metav1.Condition{tc.recorded}
+			r := f.runner(nil)
+			hold, held := r.refusalHold(waitForIBM)
+			g.Expect(held).To(Equal(tc.wantHeld))
+			g.Expect(r.recordedRefusal()).To(BeEmpty(), "a call error is no synchronous refusal")
+			if !tc.wantHeld {
+				g.Expect(hold).To(Equal(waitForIBM))
+				return
+			}
+			g.Expect(hold).To(Equal(DisruptionDecision{Step: StepWaitForIBM, Phase: infrav1.WorkerDisruptionPhaseWaitingForIBM,
+				Reason: DisruptionReason(MachinePoolIBMAPIErrorReason), Message: callError}))
+			g.Expect(keepsCallError(hold)).To(BeTrue())
+		})
+	}
+}
+
+func TestKeepsCallError(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(keepsCallError(DisruptionDecision{Reason: DisruptionReason(MachinePoolIBMAPIErrorReason)})).To(BeTrue())
+	for _, reason := range []DisruptionReason{"", ReasonWaitingForClusterMinimum, ReasonExternallyAutoscaled, ReasonRemovingWorkerPool} {
+		g.Expect(keepsCallError(DisruptionDecision{Reason: reason})).To(BeFalse(), string(reason))
+	}
 }
 
 func TestRemovalRunnerRecord(t *testing.T) {
@@ -503,6 +567,15 @@ func TestRemovalRunnerReport(t *testing.T) {
 		r.report(decision)
 		g.Expect(drainingCondition(f).Status).To(Equal(metav1.ConditionFalse))
 	})
+	t.Run("the hold of a recorded call error leaves the flow's condition as written", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRunnerFixture(t)
+		r := f.runner(nil)
+		hold := DisruptionDecision{Step: StepWaitForIBM, Reason: DisruptionReason(MachinePoolIBMAPIErrorReason), Message: "as written"}
+		g.Expect(r.wait(hold, IntervalGuarded)).To(Equal(NotDone(IntervalGuarded, MachinePoolIBMAPIErrorReason)))
+		g.Expect(f.reported).To(BeEmpty(), "the flow does not report it again")
+		g.Expect(drainingCondition(f).Status).To(Equal(metav1.ConditionFalse))
+	})
 }
 
 // TestRemovalRunnerCallIBM checks the call-and-hold step: status first, then the call, once.
@@ -566,6 +639,43 @@ func TestRemovalRunnerCallIBM(t *testing.T) {
 		g.Expect(condition(f.pool, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCondition).Message).
 			To(ContainSubstring("while removing worker pool workers of IBM cluster " + poolTestClusterID))
 	})
+	t.Run("a flow's reportCallError gets the answer instead of the pool's own report", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRunnerFixture(t)
+		f.sendErr = apiError(kubernetesservice.OpRemoveWorkerPool, http.StatusForbidden, "E3e8a")
+		var got []string
+		r := f.runner(func(in *removalRunnerInput) {
+			in.reportCallError = func(reason, message string) { got = append(got, reason+": "+message) }
+		})
+		g.Expect(r.callIBM(context.Background(), callDecision).Kind).To(Equal(OutcomeTerminal))
+		g.Expect(got).To(ConsistOf(MachinePoolIBMAPIErrorReason + ": IBM Cloud refused the test identity (HTTP 403, code E3e8a) " +
+			"while removing worker pool workers of IBM cluster " + poolTestClusterID + "; grant it " + poolKubernetesServiceRoles +
+			" (the IAM roles of the managed Kubernetes book)"))
+		g.Expect(condition(f.pool, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCondition)).To(BeNil())
+	})
+	t.Run("a 403 stays on the flow's condition while the call waits out DisruptionSettleDelay", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRunnerFixture(t)
+		f.sendErr = apiError(kubernetesservice.OpRemoveWorkerPool, http.StatusForbidden, "E3e8a")
+		r := f.runner(nil)
+		// A deleted pool: MachinePoolScope.report, the default reportCallError, writes Deleting, the condition the pool
+		// deletion reports its steps and records refusals on.
+		f.pool.DeletionTimestamp = ptr.To(metav1.NewTime(poolTestNow))
+		g.Expect(r.callIBM(context.Background(), callDecision).Kind).To(Equal(OutcomeTerminal))
+		refused := condition(f.pool, infrav1.IBMCloudManagedMachinePoolDeletingCondition).DeepCopy()
+		g.Expect(refused.Reason).To(Equal(MachinePoolIBMAPIErrorReason))
+		g.Expect(refused.Message).To(ContainSubstring("(HTTP 403, code E3e8a) while removing worker pool workers of IBM cluster"))
+
+		// The reconcile that the status patch triggers a second later waits for IBM (StepWaitForIBM) and keeps the report.
+		f.clock.Step(time.Second)
+		next := f.runner(nil)
+		wait := DisruptionDecision{Step: StepWaitForIBM, Phase: infrav1.WorkerDisruptionPhaseWaitingForIBM,
+			Reason: ReasonRemovingWorkerPool, Message: "the IBM call was sent at ..."}
+		hold, held := next.refusalHold(wait)
+		g.Expect(held).To(BeTrue())
+		g.Expect(next.wait(hold, IntervalGuarded)).To(Equal(NotDone(IntervalGuarded, MachinePoolIBMAPIErrorReason)))
+		g.Expect(condition(f.pool, infrav1.IBMCloudManagedMachinePoolDeletingCondition)).To(Equal(refused), "a repeated refusal writes nothing new")
+	})
 }
 
 // TestRemovalRunnerSendCall checks the call of a removal without victims, which persists and sends without recording a
@@ -597,5 +707,221 @@ func TestRemovalRunnerSendCall(t *testing.T) {
 			`not sending the IBM call of the removal of pool workers: DisruptionCallOutcome call is "ListWorkers"`)))
 		g.Expect(f.sent).To(BeZero(), "no IBM call is sent")
 		g.Expect(f.persisted).To(BeEmpty(), "nothing is persisted")
+	})
+}
+
+// cordonAt cordons the Nodes of the workers for the fixture's pool as a drain that started at start would have, with the
+// drain-start-time, drain-owner and cordoned markers.
+func (f *runnerFixture) cordonAt(start time.Time, workerIDs ...string) {
+	f.t.Helper()
+	helper := &drain.Helper{Client: f.workload, Clock: clocktesting.NewFakeClock(start), EvictionBudget: time.Second,
+		AnnotationPrefix: infrav1.NodeAnnotationPrefix}
+	nodes := VictimNodes(readNodes(f.t, f.workload), poolTestAccount, poolTestClusterID, workerIDs)
+	for i := range nodes {
+		NewWithT(f.t).Expect(helper.Cordon(context.Background(), &nodes[i], drain.CordonOptions{Owner: DrainOwner(f.pool)})).To(Succeed())
+	}
+	f.calls.all()
+}
+
+// TestRemovalRunnerCheckDrain checks the drain observation of a removal that can still be given up (the scale-down and
+// the replace): it never evicts, reads the Nodes only while this pool holds the token in a phase before the IBM call,
+// and falls back to the exclusions and the recorded drain start without the workload cluster.
+func TestRemovalRunnerCheckDrain(t *testing.T) {
+	draining := infrav1.WorkerDisruptionPhaseDraining
+	knobs := DrainProgress{}
+	for _, tc := range []struct {
+		name       string
+		o          DisruptionObservation
+		modify     func(in *removalRunnerInput)
+		want       *DrainProgress
+		wantChecks int
+	}{
+		{name: "without the token only the exclusions are read", o: DisruptionObservation{Phase: draining, Token: TokenNotHeld}, want: &knobs},
+		{name: "before the first cordon only the exclusions are read", o: DisruptionObservation{Token: TokenHeld}, want: &knobs},
+		{name: "after the IBM call only the exclusions are read",
+			o: DisruptionObservation{Phase: infrav1.WorkerDisruptionPhaseWaitingForRemoval, Token: TokenHeld}, want: &knobs},
+		{name: "a removal that drains nothing counts as excluded", o: DisruptionObservation{Phase: draining, Token: TokenHeld},
+			modify: func(in *removalRunnerInput) { in.drainsNothing = true }, want: &DrainProgress{Excluded: true, DetachExcluded: true}},
+		{name: "without the workload cluster the recorded start decides", o: DisruptionObservation{Phase: draining, Token: TokenHeld},
+			modify: disconnected, want: &DrainProgress{}},
+		{name: "a drain in flight is checked once, without evicting", o: DisruptionObservation{Phase: draining, Token: TokenHeld},
+			wantChecks: 1},
+		{name: "a drain resumed from the Node markers is checked", o: DisruptionObservation{ResumeFromNodeMarkers: true, Token: TokenHeld},
+			wantChecks: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			f := newRunnerFixture(t)
+			r := f.runner(tc.modify)
+			got, err := r.checkDrain(context.Background(), tc.o)
+			g.Expect(err).NotTo(HaveOccurred())
+			if tc.want != nil {
+				g.Expect(got).To(Equal(*tc.want))
+			}
+			again, err := r.checkDrain(context.Background(), tc.o)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(again).To(Equal(got), "the observation of this reconcile is kept")
+			g.Expect(f.calls.count("list pods")).To(Equal(2*tc.wantChecks), "one pod listing per victim Node per check")
+			g.Expect(f.calls.count("evict")).To(BeZero())
+			g.Expect(f.calls.count("cordon")).To(BeZero())
+			g.Expect(r.evicted).To(BeFalse())
+		})
+	}
+}
+
+// TestRemovalRunnerAnnounceTimeout checks that a drain that leaves Draining on its time limit names the pods left on
+// the Nodes in DrainTimeoutExceeded, once, and sends no eviction there.
+func TestRemovalRunnerAnnounceTimeout(t *testing.T) {
+	timedOut := func(t *testing.T) (*runnerFixture, *removalRunner) {
+		t.Helper()
+		f := newRunnerFixture(t)
+		f.machinePool.Spec.Template.Spec.Deletion.NodeDrainTimeoutSeconds = ptr.To[int32](60)
+		f.pool.Status.Disruption = infrav1.WorkerDisruptionStatus{Operation: infrav1.WorkerDisruptionOperationScaleDown,
+			Phase: infrav1.WorkerDisruptionPhaseDraining, WorkerIDs: []string{"w0", "w1"}}
+		f.cordonAt(poolTestNow.Add(-2*time.Minute), "w0", "w1")
+		r := f.runner(func(in *removalRunnerInput) {
+			in.operation = infrav1.WorkerDisruptionOperationScaleDown
+			in.victimNodes = VictimNodes(readNodes(f.t, f.workload), poolTestAccount, poolTestClusterID, []string{"w0", "w1"})
+		})
+		_, err := r.checkDrain(context.Background(), DisruptionObservation{Phase: infrav1.WorkerDisruptionPhaseDraining, Token: TokenHeld})
+		NewWithT(t).Expect(err).NotTo(HaveOccurred())
+		NewWithT(t).Expect(r.drainResult.Progress.TimedOut).To(BeTrue())
+		f.calls.all()
+		return f, r
+	}
+	t.Run("the_pods_left_are_named_once_without_an_eviction", func(t *testing.T) {
+		g := NewWithT(t)
+		f, r := timedOut(t)
+		g.Expect(r.announceTimeout(context.Background())).To(Succeed())
+		g.Expect(f.calls.count("evict")).To(BeZero(), "no eviction after the limit")
+		events := f.events()
+		g.Expect(events).To(HaveLen(2), "one Warning per Node")
+		g.Expect(events).To(HaveEach(HavePrefix("Warning DrainTimeoutExceeded the drain time limit of 60s")))
+		g.Expect(r.announceTimeout(context.Background())).To(Succeed())
+		g.Expect(f.events()).To(BeEmpty(), "announced once per reconcile")
+	})
+	t.Run("not when the drain stays in Draining", func(t *testing.T) {
+		g := NewWithT(t)
+		f, r := timedOut(t)
+		f.pool.Status.Disruption.Phase = infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach
+		g.Expect(r.announceTimeout(context.Background())).To(Succeed())
+		g.Expect(f.events()).To(BeEmpty())
+	})
+	t.Run("not for a drain that has not timed out", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRunnerFixture(t)
+		f.pool.Status.Disruption = infrav1.WorkerDisruptionStatus{Operation: infrav1.WorkerDisruptionOperationDeletePool,
+			Phase: infrav1.WorkerDisruptionPhaseDraining, WorkerIDs: []string{"w0", "w1"}}
+		r := f.runner(nil)
+		g.Expect(r.runDrain(context.Background(), false)).To(Succeed())
+		g.Expect(r.announceTimeout(context.Background())).To(Succeed())
+		g.Expect(f.events()).To(BeEmpty())
+		g.Expect(f.calls.count("evict")).To(BeZero())
+	})
+}
+
+func TestRemovalRunnerDrainVictims(t *testing.T) {
+	drainDecision := DisruptionDecision{Step: StepDrain, Phase: infrav1.WorkerDisruptionPhaseDraining, Reason: ReasonDrainingNode,
+		DrainingReason: ReasonDrainingNode, Message: "cordoning every victim Node, then evicting their pods"}
+	scaleDown := func(in *removalRunnerInput) { in.operation = infrav1.WorkerDisruptionOperationScaleDown }
+	t.Run("cordons every victim, evicts, records Draining and waits drainRetryInterval", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRunnerFixture(t)
+		r := f.runner(scaleDown)
+		g.Expect(r.drainVictims(context.Background(), drainDecision)).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNode))))
+		g.Expect(f.calls.all()).To(Equal([]string{"cordon 10.0.0.1", "cordon 10.0.0.2",
+			"list pods 10.0.0.1", "evict apps/web-w0", "list pods 10.0.0.2", "evict apps/web-w1"}))
+		g.Expect(f.pool.Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseDraining))
+		g.Expect(condition(f.pool, infrav1.IBMCloudManagedMachinePoolDrainingCondition).Reason).To(Equal(string(ReasonDrainingNode)))
+	})
+	t.Run("a budget's refusal is reported at once", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRunnerFixture(t)
+		f.workload = newWorkloadClient(t, f.calls, map[string]error{"web-w0": pdbRefusal()}, victimNode("10.0.0.1", "w0"),
+			workloadPod("web-w0", "10.0.0.1"), victimNode("10.0.0.2", "w1"), workloadPod("web-w1", "10.0.0.2"))
+		r := f.runner(scaleDown)
+		g.Expect(r.drainVictims(context.Background(), drainDecision)).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNode))))
+		g.Expect(condition(f.pool, infrav1.IBMCloudManagedMachinePoolDrainingCondition).Reason).To(Equal(string(ReasonDrainBlocked)))
+	})
+	t.Run("an observation that already evicted is not repeated", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRunnerFixture(t)
+		r := f.runner(scaleDown)
+		g.Expect(r.runDrain(context.Background(), true)).To(Succeed())
+		f.calls.all()
+		r.drainVictims(context.Background(), drainDecision)
+		g.Expect(f.calls.all()).To(BeEmpty())
+	})
+	t.Run("a removal that drains nothing only moves on", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRunnerFixture(t)
+		r := f.runner(func(in *removalRunnerInput) { scaleDown(in); in.drainsNothing = true })
+		r.drainVictims(context.Background(), drainDecision)
+		g.Expect(f.calls.all()).To(BeEmpty())
+		g.Expect(f.pool.Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseDraining))
+		g.Expect(condition(f.pool, infrav1.IBMCloudManagedMachinePoolDrainingCondition).Status).To(Equal(metav1.ConditionFalse))
+	})
+}
+
+// TestRemovalRunnerUncordon checks the revert of an abort: only CAPIBM's cordon is reverted, a human's stays, and
+// without the workload cluster nothing is given up unless the flow allows it.
+func TestRemovalRunnerUncordon(t *testing.T) {
+	draining := infrav1.WorkerDisruptionPhaseDraining
+	t.Run("only_CAPIBM's_cordon_and_load_balancer_label_are_reverted", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRunnerFixture(t)
+		// A human cordoned w1's Node before the removal, so CAPIBM's cordon flipped nothing there.
+		node := &corev1.Node{}
+		g.Expect(f.workload.Get(context.Background(), client.ObjectKey{Name: "10.0.0.2"}, node)).To(Succeed())
+		node.Spec.Unschedulable = true
+		g.Expect(f.workload.Update(context.Background(), node)).To(Succeed())
+		helper := &drain.Helper{Client: f.workload, Clock: f.clock, EvictionBudget: time.Second, AnnotationPrefix: infrav1.NodeAnnotationPrefix}
+		for _, n := range VictimNodes(readNodes(t, f.workload), poolTestAccount, poolTestClusterID, []string{"w0", "w1"}) {
+			g.Expect(helper.Cordon(context.Background(), &n, drain.CordonOptions{Owner: DrainOwner(f.pool),
+				ExcludeFromLoadBalancers: true})).To(Succeed())
+		}
+		r := f.runner(nil)
+		reverted, _, held := r.uncordon(context.Background(), poolTestAccount, []string{"w0", "w1"}, draining, false)
+		g.Expect(held).To(BeFalse())
+		g.Expect(reverted).To(Equal(2))
+		for _, n := range readNodes(t, f.workload) {
+			g.Expect(n.Spec.Unschedulable).To(Equal(n.Name == "10.0.0.2"), "the human's cordon stays: "+n.Name)
+			g.Expect(n.Labels).NotTo(HaveKey(corev1.LabelNodeExcludeBalancers), n.Name)
+			g.Expect(hasDrainOwner(&n, f.pool)).To(BeFalse(), n.Name)
+		}
+	})
+	t.Run("without the workload cluster the removal holds with its Nodes cordoned", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRunnerFixture(t)
+		f.pool.Status.Disruption = infrav1.WorkerDisruptionStatus{Operation: infrav1.WorkerDisruptionOperationReplace, Phase: draining,
+			WorkerIDs: []string{"w0"}, DrainStartTime: metav1.NewTime(poolTestNow.Add(-time.Minute))}
+		r := f.runner(func(in *removalRunnerInput) {
+			disconnected(in)
+			in.operation, in.victims = infrav1.WorkerDisruptionOperationReplace, []string{"w0"}
+		})
+		_, outcome, held := r.uncordon(context.Background(), poolTestAccount, []string{"w0"}, draining, false)
+		g.Expect(held).To(BeTrue())
+		g.Expect(outcome).To(Equal(NotDone(IntervalGuarded, string(ReasonWaitingForWorkloadCluster))))
+		g.Expect(f.pool.Status.Disruption.Phase).To(Equal(draining), "nothing is given up")
+		g.Expect(f.reported[0].Message).To(Equal("the workload cluster is not connected; CAPIBM uncordons the Nodes it cordoned once it is"))
+	})
+	t.Run("a flow that touched nothing gives up without the workload cluster", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRunnerFixture(t)
+		r := f.runner(disconnected)
+		reverted, _, held := r.uncordon(context.Background(), poolTestAccount, []string{"w0"}, draining, true)
+		g.Expect(held).To(BeFalse())
+		g.Expect(reverted).To(BeZero())
+	})
+	t.Run("no workers and a removal that drains nothing uncordon nothing", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRunnerFixture(t)
+		r := f.runner(nil)
+		_, _, held := r.uncordon(context.Background(), poolTestAccount, nil, draining, false)
+		g.Expect(held).To(BeFalse())
+		r = f.runner(func(in *removalRunnerInput) { disconnected(in); in.drainsNothing = true })
+		_, _, held = r.uncordon(context.Background(), poolTestAccount, []string{"w0"}, draining, false)
+		g.Expect(held).To(BeFalse())
+		g.Expect(f.calls.all()).To(BeEmpty())
 	})
 }
