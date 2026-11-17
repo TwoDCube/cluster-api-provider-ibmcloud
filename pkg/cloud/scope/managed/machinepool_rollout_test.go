@@ -489,11 +489,13 @@ func (f *rolloutFixture) lease() *coordinationv1.Lease {
 	return lease
 }
 
-// inPhase records a replace of w0 in phase whose drain started ten minutes ago, with the token held.
+// inPhase records a replace of w0 in phase whose drain started ten minutes ago, with the token held; past Draining its
+// volume detach wait began five minutes ago (detachWaitBegan).
 func (f *rolloutFixture) inPhase(phase infrav1.WorkerDisruptionPhase) {
 	f.others = append(f.others, heldLease(DisruptionTokenHolder(f.pool)))
 	f.pool.Status.Disruption = infrav1.WorkerDisruptionStatus{Operation: infrav1.WorkerDisruptionOperationReplace, Phase: phase,
-		WorkerIDs: []string{"w0"}, DrainStartTime: metav1.NewTime(poolTestNow.Add(-10 * time.Minute))}
+		WorkerIDs: []string{"w0"}, DrainStartTime: metav1.NewTime(poolTestNow.Add(-10 * time.Minute)),
+		VolumeDetachStartTime: detachWaitBegan(phase)}
 }
 
 // drainedVictim cordons w0's Node for the pool as an earlier reconcile would have and removes its pod.
