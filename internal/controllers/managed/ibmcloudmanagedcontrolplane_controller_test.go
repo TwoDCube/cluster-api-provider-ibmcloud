@@ -721,9 +721,9 @@ func TestControlPlaneReconcileCredentials(t *testing.T) {
 		g.Expect(f.builder.invalidated).To(Equal([]credentials.IdentityKey{credentials.ControllerKey()}))
 		condition := expectCondition(g, f.controlPlane(), controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition,
 			metav1.ConditionFalse, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason)
-		g.Expect(condition.Message).To(Equal("IBM Cloud rejected the credentials of the CAPIBM controller identity while getting " +
-			"IBM cluster iksclusterid00000001; CAPIBM rebuilds its authenticator and retries in about 5 minutes; check that the " +
-			"API key of the CAPIBM controller identity is valid and not deleted"))
+		g.Expect(condition.Message).To(Equal("IBM Cloud rejected the credentials of the CAPIBM controller identity with HTTP 401 " +
+			"while getting IBM cluster iksclusterid00000001; CAPIBM rebuilds its authenticator and retries in about 5 minutes; " +
+			"check that the API key of the CAPIBM controller identity is valid and not deleted"))
 		expectNoIdentityDetails(g, condition.Message)
 	})
 

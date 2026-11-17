@@ -194,12 +194,27 @@ func TestControlPlaneClassifyCall(t *testing.T) {
 		{name: "401", err: apiError(http.StatusUnauthorized, ""),
 			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason, wantKind: OutcomeNotDone,
 			wantInterval: IntervalSteadyState, wantInvalidate: true,
-			wantMessage: "IBM Cloud rejected the credentials of the CAPIBM controller identity while getting IBM cluster dev; CAPIBM " +
-				"rebuilds its authenticator and retries in about 5 minutes; check that the API key of the CAPIBM controller " +
-				"identity is valid and not deleted"},
-		{name: "IAM refused the credentials before the request", err: kubernetesservice.ErrCredentialsRejected,
+			wantMessage: "IBM Cloud rejected the credentials of the CAPIBM controller identity with HTTP 401 while getting IBM " +
+				"cluster dev; CAPIBM rebuilds its authenticator and retries in about 5 minutes; check that the API key of the " +
+				"CAPIBM controller identity is valid and not deleted"},
+		{name: "IAM refused the credentials before the request", err: iamRejected(kubernetesservice.OpGetCluster),
 			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason, wantKind: OutcomeNotDone,
-			wantInterval: IntervalSteadyState, wantInvalidate: true},
+			wantInterval: IntervalSteadyState, wantInvalidate: true,
+			wantMessage: "The IAM token service of IBM Cloud rejected the credentials of the CAPIBM controller identity with HTTP " +
+				"400 while getting IBM cluster dev, so the request was not sent; CAPIBM rebuilds its authenticator and retries " +
+				"in about 5 minutes; check that the API key of the CAPIBM controller identity is valid and not deleted"},
+		{name: "IAM refused the credentials, status not known", err: fmt.Errorf("%w: GetCluster", kubernetesservice.ErrCredentialsRejected),
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason, wantKind: OutcomeNotDone,
+			wantInterval: IntervalSteadyState, wantInvalidate: true,
+			wantMessage: "The IAM token service of IBM Cloud rejected the credentials of the CAPIBM controller identity while " +
+				"getting IBM cluster dev, so the request was not sent; CAPIBM rebuilds its authenticator and retries in about " +
+				"5 minutes; check that the API key of the CAPIBM controller identity is valid and not deleted"},
+		{name: "IAM refused the credentials, status zero", err: &kubernetesservice.CredentialsRejectedError{Operation: kubernetesservice.OpGetCluster},
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason, wantKind: OutcomeNotDone,
+			wantInterval: IntervalSteadyState, wantInvalidate: true,
+			wantMessage: "The IAM token service of IBM Cloud rejected the credentials of the CAPIBM controller identity while " +
+				"getting IBM cluster dev, so the request was not sent; CAPIBM rebuilds its authenticator and retries in about " +
+				"5 minutes; check that the API key of the CAPIBM controller identity is valid and not deleted"},
 		{name: "403", err: apiError(http.StatusForbidden, ""),
 			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason, wantKind: OutcomeTerminal,
 			wantMessage: "IBM Cloud refused getting IBM cluster dev with HTTP 403: the credentials of the CAPIBM " +
@@ -247,6 +262,13 @@ func TestControlPlaneClassifyCall(t *testing.T) {
 			}
 		})
 	}
+}
+
+// iamRejected returns the error of a call of op that the IAM token service refused before it was sent, as
+// kubernetesservice returns it: IAM answers 400 for a deleted API key. op is the operation.
+func iamRejected(op kubernetesservice.Operation) error {
+	return &kubernetesservice.CredentialsRejectedError{Operation: op, IAMStatus: http.StatusBadRequest,
+		Err: errors.New("Provided API key could not be found")}
 }
 
 func TestControlPlaneScopeLoadsTheInfraClusterOnce(t *testing.T) {

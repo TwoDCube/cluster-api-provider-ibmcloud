@@ -546,7 +546,8 @@ func (s *ControlPlaneScope) classifyCall(callErr *controlPlaneCallError, resourc
 	case kubernetesservice.ClassUnauthorized:
 		s.params.ClientBuilder.InvalidateAuthenticator(callErr.identity.Key)
 		reason := controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason
-		return cpProblem{reason: reason, message: cpUnauthorizedMessage(identity, callErr.action), outcome: NotDone(IntervalSteadyState, reason)}
+		return cpProblem{reason: reason, message: cpUnauthorizedMessage(identity, callErr.action, callErr.err),
+			outcome: NotDone(IntervalSteadyState, reason)}
 	case kubernetesservice.ClassPermissionDenied, kubernetesservice.ClassInfrastructureKeyDenied:
 		reason := controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason
 		message := cpPermissionDeniedMessage(identity, callErr.action, reference, resourceGroupID)
@@ -569,15 +570,33 @@ func (s *ControlPlaneScope) classifyCall(callErr *controlPlaneCallError, resourc
 	}
 }
 
-// cpUnauthorizedMessage is the condition message of an IBM 401: only the identity's authenticator is rebuilt, and the
-// next attempt follows at the steady interval.
+// cpUnauthorizedMessage is the condition message of a call of class kubernetesservice.ClassUnauthorized: only the
+// identity's authenticator is rebuilt, and the next attempt follows at the steady interval. The class has two
+// answers, and the message names which one IBM gave and its HTTP status: IBM Cloud Kubernetes Service answered 401,
+// or the IAM token service refused the API key before the request was sent (ErrCredentialsRejected; IAM answers 400
+// for a deleted or unknown key). The message names the IAM token service for the second, so that its status is not
+// read as an answer of IBM Cloud Kubernetes Service. kubernetesservice keeps IAM's status in a
+// *kubernetesservice.CredentialsRejectedError; an ErrCredentialsRejected without it gets the message without a status.
+// The status is the same while the same key is refused, so the message does not change between attempts.
 //
 // Parameters:
 //   - identity is the Description of the identity IBM rejected.
 //   - action says what the call did.
-func cpUnauthorizedMessage(identity, action string) string {
-	return fmt.Sprintf("IBM Cloud rejected the credentials of %s while %s; CAPIBM rebuilds its authenticator and retries "+
-		"in about 5 minutes; check that the API key of %s is valid and not deleted", identity, action, identity)
+//   - err is the error of the call.
+func cpUnauthorizedMessage(identity, action string, err error) string {
+	fix := fmt.Sprintf("CAPIBM rebuilds its authenticator and retries in about 5 minutes; check that the API key of %s is "+
+		"valid and not deleted", identity)
+	if errors.Is(err, kubernetesservice.ErrCredentialsRejected) {
+		status := ""
+		var rejected *kubernetesservice.CredentialsRejectedError
+		if errors.As(err, &rejected) && rejected.IAMStatus != 0 {
+			status = fmt.Sprintf(" with HTTP %d", rejected.IAMStatus)
+		}
+		return fmt.Sprintf("The IAM token service of IBM Cloud rejected the credentials of %s%s while %s, so the request was "+
+			"not sent; %s", identity, status, action, fix)
+	}
+	// Classify puts an answer of IBM Cloud Kubernetes Service into this class only for HTTP 401.
+	return fmt.Sprintf("IBM Cloud rejected the credentials of %s with HTTP 401 while %s; %s", identity, action, fix)
 }
 
 // cpPermissionDeniedMessage is the condition message of an IBM 403 outside CreateCluster: it names the missing roles
