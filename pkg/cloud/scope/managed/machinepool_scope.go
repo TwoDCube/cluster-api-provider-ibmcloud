@@ -720,10 +720,14 @@ func (s *MachinePoolScope) masterMinor() ibmversion.Minor {
 // before the pool grows; so does a removal whose status was lost, which this pool's drain-owner markers on its Nodes
 // reveal, unless the marked Node is the one worker a lost replace was draining (workerRollout.chooseVictim). An
 // autoscaled pool is never resized, while a replace in flight on it runs on and a new one waits in its
-// ExternallyAutoscaled gate. Growth is requested at once, also while a replace is in flight (it removes nothing, so it
-// is not disruptive); a smaller MachinePool starts the scale-down unless a replace is in flight. Otherwise the rollout
-// runs, after WorkerPoolReady reports the pool's readiness. WorkersUpToDate is reported in every case: the rollout's
-// step, or why it waits.
+// ExternallyAutoscaled gate. Growth is requested at once (it removes nothing, so it is not disruptive); a replace in
+// flight runs on in the same reconcile (workerRollout.growWhileReplacing), so that a growth IBM refuses or the cluster
+// state forbids never holds the replace, its cordon and the Cluster's disruption token, and a growth IBM refused is not
+// sent again at the replace's cadence (growthRetryDelay), while a new replace waits until the pool has grown. A smaller
+// MachinePool starts the scale-down unless a replace is in flight. Otherwise the rollout runs, after WorkerPoolReady
+// reports the pool's readiness. WorkersUpToDate is reported in every case: the rollout's step, or why it waits. A pool
+// that grows without a replace in flight, like an idle rollout, releases a disruption token it kept from a removal that
+// never recorded itself (releaseIdleToken).
 //
 // Parameters:
 //   - ctx is the reconcile context.
@@ -757,6 +761,8 @@ func (s *MachinePoolScope) reconcileSize(ctx context.Context, clients *poolClien
 			return Done()
 		}
 		return outcome
+	case desired > pool.SizePerZone && replacing:
+		return rollout.growWhileReplacing(ctx, clients, desired)
 	case desired > pool.SizePerZone:
 		if err := s.releaseIdleToken(ctx, input.workload, input.marked); err != nil {
 			return Transient(err)

@@ -210,7 +210,8 @@ type ReplaceProgressResult struct {
 	ReadyAt time.Time
 
 	// Waiting are the workers of the pool, sorted, that keep ReplacementReady false: not deployed and normal (in the
-	// victim's zone), or without a Node that has been Ready for minReadySeconds. The condition message names them.
+	// victim's zone), or without a Node that has been Ready for minReadySeconds. The condition message names them. Before
+	// the replace starts they are the workers that keep it from starting (DisruptionGates.OthersAvailable).
 	Waiting []string
 }
 
@@ -366,6 +367,8 @@ type workerRollout struct {
 	workers []kubernetesservice.Worker
 	// workload is the workload cluster's Nodes; no client while not connected.
 	workload workloadNodes
+	// marked are the pool's workers whose Nodes carry this pool's drain-owner marker (scaleDownInput.marked).
+	marked []string
 	// account is the IBM account of the cluster, for provider IDs.
 	account string
 	// summary is SummarizeRollout's answer of this reconcile.
@@ -392,6 +395,9 @@ type workerRollout struct {
 	runner *removalRunner
 	// preCall is the pre-call gate of this reconcile, which the report reads to tell the settle delay between workers.
 	preCall DisruptionCheckResult
+	// calledIBM is true once this reconcile's step went for the replace's IBM call (StepCallIBM), whether or not IBM
+	// answered: growWhileReplacing then sends no growth in the same reconcile.
+	calledIBM bool
 }
 
 // newWorkerRollout observes the worker rollout of the pool: the Nodes of the pool's workers when a decision needs
@@ -404,7 +410,7 @@ type workerRollout struct {
 //   - triggerGone treats the replace in flight as no longer wanted: a failing pool guard leaves the pool without a valid
 //     spec, and every failing guard forbids an IBM mutation.
 func (s *MachinePoolScope) newWorkerRollout(ctx context.Context, in scaleDownInput, triggerGone bool) (*workerRollout, error) {
-	ro := &workerRollout{s: s, clients: in.clients, pool: in.pool, workers: in.workers, workload: in.workload}
+	ro := &workerRollout{s: s, clients: in.clients, pool: in.pool, workers: in.workers, workload: in.workload, marked: in.marked}
 	var err error
 	if ro.account, err = AccountIDFromCRN(s.ControlPlane.Status.ClusterCRN); err != nil {
 		return nil, fmt.Errorf("finding the Nodes of pool %s: %w", s.Pool.Spec.PoolName, err)
@@ -422,6 +428,12 @@ func (s *MachinePoolScope) newWorkerRollout(ctx context.Context, in scaleDownInp
 	if ro.victim == "" {
 		ro.recordRecheck(time.Time{})
 		return ro, nil
+	}
+	if !ro.nodesRead && ro.workload.client != nil && s.Pool.Status.Disruption.Operation == "" && !ro.resumed {
+		// A replace starts only while every other worker of the pool has a Node that is Ready for minReadySeconds
+		// (DisruptionGates.OthersAvailable), so its Gated step needs their Nodes too. The listing of every Node of this
+		// reconcile (readWorkloadNodes) has them, so no further workload-cluster read is made.
+		nodes, ro.nodesRead = ro.listedPoolNodes(), true
 	}
 	ro.triggerActive = ro.triggerActive && !triggerGone
 	if err := ro.observeReplace(nodes); err != nil {
@@ -460,6 +472,31 @@ func (ro *workerRollout) readNodes(ctx context.Context) (map[string]*corev1.Node
 	}
 	ro.nodesRead = true
 	return nodes, nil
+}
+
+// listedPoolNodes returns the Node of every worker of the pool that IBM does not list as deleted, by worker ID, from the
+// Nodes this reconcile listed (workloadNodes.nodes), with the same answer workerNodes gives through the provider ID
+// index: a worker without a Node has no entry, and of two Nodes with one provider ID the first by name is taken.
+func (ro *workerRollout) listedPoolNodes() map[string]*corev1.Node {
+	clusterID := ro.s.ControlPlane.Status.ClusterID
+	byProviderID := map[string]string{}
+	for _, w := range ro.workers {
+		if w.PoolID == ro.pool.ID && w.ActualState != WorkerStateDeleted {
+			byProviderID[ProviderID(ro.account, clusterID, w.ID)] = w.ID
+		}
+	}
+	nodes := map[string]*corev1.Node{}
+	for i := range ro.workload.nodes {
+		node := &ro.workload.nodes[i]
+		id, found := byProviderID[node.Spec.ProviderID]
+		if !found || node.Spec.ProviderID == "" {
+			continue
+		}
+		if first, seen := nodes[id]; !seen || node.Name < first.Name {
+			nodes[id] = node
+		}
+	}
+	return nodes
 }
 
 // workerNodes finds the Node of each worker by its provider ID through ClusterCache's NodeProviderIDIndex (the index
@@ -633,7 +670,8 @@ func (ro *workerRollout) observeReplace(nodes map[string]*corev1.Node) error {
 }
 
 // recordRecheck records on the scope the earliest time at which the rollout decision changes without a watched
-// change: spec.rollout.after while it is ahead (the rollout starts then), or the end of a replacement's soak.
+// change: spec.rollout.after while it is ahead (the rollout starts then), or the end of the soak of a Node the replace
+// waits for (ReplaceProgressResult.ReadyAt), before it starts or for its replacement.
 //
 // Parameters:
 //   - soakEnds is ReplaceProgressResult.ReadyAt; zero for none.
@@ -692,13 +730,137 @@ func (ro *workerRollout) reportCallError(reason, message string) {
 // reconcile runs the rollout once: one step of the replace in flight or of the next due worker, or, when no worker is
 // due, the WorkersUpToDate report. ctx is the reconcile context; readiness is the WorkerPoolReady outcome of this
 // reconcile, which is returned when the rollout has nothing to wait for, and when it requeues sooner than a rollout
-// that only waits (rolloutOutcome).
+// that only waits (rolloutOutcome). Without a worker to replace the pool is idle, and a disruption token it kept from a
+// removal that never recorded itself is released (MachinePoolScope.releaseIdleToken): no other step of the pool would
+// release it.
 func (ro *workerRollout) reconcile(ctx context.Context, readiness Outcome) Outcome {
 	if ro.victim == "" {
+		if err := ro.s.releaseIdleToken(ctx, ro.workload, ro.marked); err != nil {
+			return Transient(err)
+		}
 		ro.reportIdle()
 		return readiness
 	}
 	return rolloutOutcome(ro.run(ctx), readiness)
+}
+
+// growthRetryDelay is how long CAPIBM waits before it asks IBM again for a growth that IBM refused (a 400, or a 403 for
+// a missing role) while a replace of the pool runs. It is the 15 minutes after which the controllers recheck a condition
+// that needs a human (IntervalTerminalRecheck), so that a refused growth is asked again as often with a replace in
+// flight as without one. Without a replace the Terminal outcome alone spaces the calls; with one the reconciles come at
+// the replace's cadence (every drainRetryInterval while it drains), and each of them would send the refused resize again.
+const growthRetryDelay = 15 * time.Minute
+
+// growthRetryNote is the end of the WorkerPoolReady message of a growth that IBM refused while a replace of the pool
+// runs: it says when CAPIBM asks IBM again. Status has no field for IBM's answer to a call (no API change), so the
+// condition is the record, as for the refused call of a removal (refusalRecord), and heldGrowth reads the time back
+// (growthRetryTime). The note names the size per zone asked for, so that a request for another size is not held by it,
+// and gives the time in RFC 3339 UTC, the form the operator reads too.
+//
+// Parameters:
+//   - desired is the size per zone that IBM refused.
+//   - at is when CAPIBM asks again.
+func growthRetryNote(desired int64, at time.Time) string {
+	return "; while a worker of the pool is replaced, " + growthRetryMarker(desired) + bindingTime(at)
+}
+
+// growthRetryMarker is the part of growthRetryNote that precedes the retry time; growthRetryTime looks for it.
+//
+// Parameters:
+//   - desired is the size per zone that IBM refused.
+func growthRetryMarker(desired int64) string {
+	return fmt.Sprintf("CAPIBM asks IBM again for %d workers per zone at ", desired)
+}
+
+// growthRetryTime returns the retry time that growthRetryNote wrote into message for desired, and true. It returns the
+// zero time and false when message carries no note for desired or its time does not parse, so that a damaged record
+// never holds a growth.
+//
+// Parameters:
+//   - message is the WorkerPoolReady message; notes of the reconcile may follow the note.
+//   - desired is the size per zone the MachinePool asks for now.
+func growthRetryTime(message string, desired int64) (time.Time, bool) {
+	_, rest, found := strings.Cut(message, growthRetryMarker(desired))
+	if !found {
+		return time.Time{}, false
+	}
+	if end := strings.IndexAny(rest, "; "); end >= 0 {
+		rest = rest[:end]
+	}
+	at, err := time.Parse(time.RFC3339, rest)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return at, true
+}
+
+// heldGrowth returns the outcome of a growth to desired that IBM refused less than growthRetryDelay ago while a replace
+// of the pool ran, and true, when WorkerPoolReady still records that refusal as it was written: status False, reason
+// IBMAPIError, the growthRetryNote of desired with a time still ahead, and the pool's current generation. An edit of the
+// pool's spec, such as the spec.flavor or spec.zones that a 400 asks to check, changes the generation and asks again at
+// once; a MachinePool that asks for another size does too, since the note names the size. The condition is left as it
+// was written. Otherwise it returns false and the growth is asked for.
+//
+// Parameters:
+//   - desired is the size per zone the MachinePool asks for.
+func (ro *workerRollout) heldGrowth(desired int64) (Outcome, bool) {
+	recorded := conditions.Get(ro.s.Pool, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCondition)
+	if recorded == nil || recorded.Status != metav1.ConditionFalse || recorded.Reason != MachinePoolIBMAPIErrorReason ||
+		recorded.ObservedGeneration != ro.s.Pool.Generation {
+		return Outcome{}, false
+	}
+	retryAt, found := growthRetryTime(recorded.Message, desired)
+	if !found || !ro.s.params.Clock.Now().Before(retryAt) {
+		return Outcome{}, false
+	}
+	return Terminal(recorded.Reason, recorded.Message), true
+}
+
+// growWhileReplacing runs the replace in flight and the growth the MachinePool asks for in the same reconcile. Growth is
+// requested at once, and the replace must keep running meanwhile: IBM may refuse the growth (a 400, or a 403 for a
+// missing role) or the cluster state may forbid it (an unsupported cluster takes no growth), and a replace that waited
+// for the growth would then never complete, with its Node cordoned and the Cluster's disruption token held, so that
+// every other pool's scale-down, replace and deletion would wait too. The replace goes first: its steps after the IBM
+// call only observe and wait, and when its step goes for the IBM call (ReplaceWorker), the growth waits for the next
+// reconcile, so that a reconcile still sends at most one IBM mutation.
+//
+// A growth that IBM refuses is a Terminal outcome, which the controller would recheck after IntervalTerminalRecheck, but
+// the replace keeps the reconciles at its own cadence. So while the replace stays in flight, the refusal's message ends
+// with when CAPIBM asks again (growthRetryNote), and the growth is not sent before then (heldGrowth). Returning the
+// Terminal outcome instead would slow the replace's drain and waits to the terminal recheck.
+//
+// An error or IBM's rate limit (Transient, RateLimited) of either is returned, the replace's first, so that its error
+// and backoff reach the controller. Otherwise the outcome is the replace's while it runs, or the growth's when the
+// replace is done or the growth requeues sooner (rolloutOutcome); a refused growth is thus returned once the replace is
+// done.
+//
+// Parameters:
+//   - ctx is the reconcile context.
+//   - clients are this reconcile's IBM clients.
+//   - desired is the size per zone the MachinePool asks for; larger than the pool's.
+func (ro *workerRollout) growWhileReplacing(ctx context.Context, clients *poolClients, desired int64) Outcome {
+	replace := ro.run(ctx)
+	if ro.calledIBM {
+		return replace
+	}
+	grow, held := ro.heldGrowth(desired)
+	if !held {
+		grow = ro.s.growPool(ctx, clients, ro.pool, desired)
+		// A replace that completed in this reconcile needs no hold: the next reconcile grows without one, and the note
+		// would name a replace that is over.
+		if grow.Kind == OutcomeTerminal && grow.Reason == MachinePoolIBMAPIErrorReason &&
+			ro.s.Pool.Status.Disruption.Operation == infrav1.WorkerDisruptionOperationReplace {
+			grow.Message += growthRetryNote(desired, ro.s.params.Clock.Now().Add(growthRetryDelay))
+			ro.s.report(grow.Reason, grow.Message)
+		}
+	}
+	switch {
+	case replace.Kind == OutcomeTransient || replace.Kind == OutcomeRateLimited:
+		return replace
+	case grow.Kind == OutcomeTransient || grow.Kind == OutcomeRateLimited:
+		return grow
+	}
+	return rolloutOutcome(replace, grow)
 }
 
 // rolloutOutcome returns the outcome of a pool reconcile that ran a step of the rollout. A step that is done leaves the
@@ -760,6 +922,12 @@ func (ro *workerRollout) observation(ctx context.Context) (DisruptionObservation
 	if err != nil {
 		return DisruptionObservation{}, err
 	}
+	// The drain-owner markers of a pool that no longer exists hold no drain: they are left out of the gate, and the drain
+	// step takes them over on the victim's Node.
+	owners, err := ro.runner.drainingPools(ctx, ro.token, ro.workload.nodes)
+	if err != nil {
+		return DisruptionObservation{}, err
+	}
 	gate, err := ro.check(false)
 	if err != nil {
 		return DisruptionObservation{}, err
@@ -787,7 +955,12 @@ func (ro *workerRollout) observation(ctx context.Context) (DisruptionObservation
 			Disruption:         gate,
 			Autoscaled:         ro.pool.AutoscaleEnabled,
 			AutobalanceEnabled: zoneAutobalance(ro.pool, victim.Zone),
-			OtherDrainOwners:   OtherDrainOwners(ro.workload.nodes, DrainOwner(ro.s.Pool)),
+			// Before the replace, ReplaceProgress's waiting workers are the other workers of the pool that are not yet
+			// what the replace waits for before it completes. Without the Nodes (not connected) nothing is known, which
+			// fails closed.
+			OthersAvailable:    ro.nodesRead && len(ro.replacement.Waiting) == 0,
+			UnavailableWorkers: ro.replacement.Waiting,
+			OtherDrainOwners:   owners,
 		},
 		PreCallGate: ro.preCall,
 		IBM:         ro.replacement.Progress,
@@ -905,6 +1078,7 @@ func (ro *workerRollout) apply(ctx context.Context, d DisruptionDecision) Outcom
 	case StepCallIBM:
 		// ReplaceWorker(update=true); IBM's E1437 holds as WaitingForClusterMinimum with the Node cordoned, and the call
 		// is repeated at most once per DisruptionSettleDelay (DisruptionCallOutcome).
+		ro.calledIBM = true
 		return runner.callIBM(ctx, d)
 	case StepWaitForIBM:
 		runner.record(d.Phase)
@@ -1142,9 +1316,9 @@ func (s *MachinePoolScope) settleReplace(ctx context.Context, in scaleDownInput,
 }
 
 // RolloutRecheckAt returns the time at which the worker rollout of this reconcile may decide differently without any
-// watched change: spec.rollout.after while it lies ahead (the replacements start then), or the end of a replacement
-// Node's minReadySeconds; zero when neither applies. The controller requeues no later than that. Call it after
-// ReconcileNormal.
+// watched change: spec.rollout.after while it lies ahead (the replacements start then), or the end of the
+// minReadySeconds of a Node the replace waits for (its replacement's, or, before a replace starts, another worker's);
+// zero when neither applies. The controller requeues no later than that. Call it after ReconcileNormal.
 func (s *MachinePoolScope) RolloutRecheckAt() time.Time {
 	return s.rolloutRecheckAt
 }

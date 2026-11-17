@@ -705,9 +705,35 @@ func TestMachinePoolScopeRolloutGates(t *testing.T) {
 				"removal runs at a time"},
 		{name: "another pool's drain-owner marker on a Node", wantReason: string(ReasonWaitingForDisruptionToken),
 			modify: func(f *rolloutFixture) {
+				f.others = append(f.others, poolObject("other", "other"))
 				helper := &drain.Helper{Client: f.workload, Clock: f.clock, EvictionBudget: time.Second, AnnotationPrefix: infrav1.NodeAnnotationPrefix}
 				nodes := VictimNodes(readNodes(f.t, f.workload), poolTestAccount, poolTestClusterID, []string{"o0"})
 				NewWithT(f.t).Expect(helper.Cordon(context.Background(), &nodes[0], drain.CordonOptions{Owner: poolTestNamespace + "/other"})).To(Succeed())
+			}},
+		// A worker IBM failed to provision has no Node and no version, so it is never due; a replace that started next to
+		// it would wait for it after its IBM call for as long as it stays broken, holding the Cluster's token.
+		{name: "a_worker_IBM_failed_to_provision_holds_the_rollout_of_its_pool", wantReason: string(ReasonWorkersNotReady),
+			modify: func(f *rolloutFixture) {
+				f.workers = withState(f.workers, "provision_failed", "w3")
+				f.workers[3].KubeVersionActual, f.workers[3].KubeVersionTarget = "", ""
+				NewWithT(f.t).Expect(f.workload.Delete(context.Background(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: sdNodeName("w3")}})).To(Succeed())
+			},
+			// w3 is not due, so the progress counts it as up to date.
+			wantMessage: "replaced 1 of 4; worker w0 (MinorBehind): a replace starts only once every other worker of the pool is " +
+				"deployed, healthy and Ready for spec.template.spec.minReadySeconds, because it waits for all of them before it " +
+				"completes; waiting for worker w3 of the pool; repair or replace a worker that stays broken (for example " +
+				"`ibmcloud ks worker replace`)"},
+		{name: "a_worker_of_the_victim's_zone_that_is_not_healthy_holds_the_rollout", wantReason: string(ReasonWorkersNotReady),
+			modify: func(f *rolloutFixture) {
+				// w2 is on the master minor, so not due; an unhealthy worker that is due would be replaced first.
+				f.workers[2] = poolWorker("w2", "us-south-1", WorkerStateDeployed, "critical")
+			}},
+		{name: "a_Node_of_another_zone_that_is_not_Ready_holds_the_rollout", wantReason: string(ReasonWorkersNotReady),
+			modify: func(f *rolloutFixture) {
+				node := &corev1.Node{}
+				NewWithT(f.t).Expect(f.workload.Get(context.Background(), client.ObjectKey{Name: sdNodeName("w3")}, node)).To(Succeed())
+				node.Status.Conditions[0].Status = corev1.ConditionFalse
+				NewWithT(f.t).Expect(f.workload.Status().Update(context.Background(), node)).To(Succeed())
 			}},
 	}
 	for _, tc := range testCases {
@@ -736,6 +762,123 @@ func TestMachinePoolScopeRolloutGates(t *testing.T) {
 			}
 		})
 	}
+	// A pool that went mid-drain without reverting its cordons (its finalizer removed by hand) left its marker on the Node
+	// of the worker to replace; it holds nothing, and the replace drains that Node as its own.
+	t.Run("the_victim's_Node_marked_by_a_pool_that_no_longer_exists_is_drained_for_this_pool", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRolloutFixture(t, nil)
+		f.minorBehind("w0")
+		f.machinePool.Spec.Template.Spec.Deletion.NodeDrainTimeoutSeconds = ptr.To[int32](3600)
+		cordonForGonePool(t, f.workload, sdNodeName("w0"), poolTestNamespace+"/gone")
+		f.expect()
+		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNode))))
+		expectTakenOver(t, f.workload, sdNodeName("w0"), f.pool, poolTestNow)
+		g.Expect(f.lease().Spec.HolderIdentity).To(Equal(ptr.To(DisruptionTokenHolder(f.pool))))
+		g.Expect(f.pool.Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseDraining))
+		g.Expect(f.pool.Status.Disruption.DrainStartTime.Time).To(BeTemporally("==", poolTestNow))
+		g.Expect(f.upToDate().Reason).To(Equal(string(ReasonDrainingNode)))
+	})
+}
+
+// TestMachinePoolScopeRolloutWaitsForTheOtherWorkers follows a rollout in a pool with a worker IBM failed to provision
+// (it has no Node and no version, so it is never due): the replace waits before its first cordon, without the Cluster's
+// disruption token, and starts once the worker is repaired; a worker whose Node soaks for minReadySeconds holds the
+// replace until the soak ends, and the scope names that time for the requeue.
+func TestMachinePoolScopeRolloutWaitsForTheOtherWorkers(t *testing.T) {
+	t.Run("a_rollout_after_waits_for_a_broken_worker_then_starts", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRolloutFixture(t, nil)
+		f.pool.Spec.Rollout.After = metav1.NewTime(poolTestNow.Add(-time.Hour))
+		f.workers = withState(f.workers, "provision_failed", "w3")
+		f.workers[3].KubeVersionActual, f.workers[3].KubeVersionTarget = "", ""
+		g.Expect(f.workload.Delete(context.Background(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: sdNodeName("w3")}})).To(Succeed())
+		for range 3 {
+			f.expect()
+			g.Expect(f.reconcile()).To(Equal(NotDone(IntervalGuarded, string(ReasonWorkersNotReady))))
+			g.Expect(f.upToDate().Message).To(ContainSubstring("worker w0 (RolloutRequested): a replace starts only once every other worker"))
+			g.Expect(f.upToDate().Message).To(ContainSubstring("waiting for worker w3 of the pool"))
+			g.Expect(f.lease()).To(BeNil(), "the Cluster's disruption token stays free for the other pools")
+			g.Expect(f.cordoned()).To(BeEmpty())
+			f.clock.Step(6 * time.Hour)
+		}
+
+		// A human replaced w3; its new Node is newer than spec.rollout.after, so it is not due itself.
+		f.workers[3] = poolWorker("w3", "us-south-2", WorkerStateDeployed, "normal")
+		node := victimNode(sdNodeName("w3"), "w3")
+		node.CreationTimestamp = metav1.NewTime(f.clock.Now())
+		g.Expect(f.workload.Create(context.Background(), node)).To(Succeed())
+		f.expect()
+		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNode))))
+		g.Expect(f.cordoned()).To(Equal([]string{sdNodeName("w0")}))
+		g.Expect(f.lease().Spec.HolderIdentity).To(Equal(ptr.To(DisruptionTokenHolder(f.pool))))
+	})
+	t.Run("a_Node_that_soaks_for_minReadySeconds_holds_the_replace_until_the_soak_ends", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRolloutFixture(t, nil)
+		f.minorBehind("w0", "w1", "w2")
+		f.machinePool.Spec.Template.Spec.MinReadySeconds = ptr.To[int32](300)
+		node := &corev1.Node{}
+		g.Expect(f.workload.Get(context.Background(), client.ObjectKey{Name: sdNodeName("w3")}, node)).To(Succeed())
+		node.Status.Conditions[0].LastTransitionTime = metav1.NewTime(poolTestNow.Add(-time.Minute))
+		g.Expect(f.workload.Status().Update(context.Background(), node)).To(Succeed())
+		f.expect()
+		outcome, scope := f.reconcileScope()
+		g.Expect(outcome).To(Equal(NotDone(IntervalGuarded, string(ReasonWorkersNotReady))))
+		g.Expect(scope.RolloutRecheckAt()).To(BeTemporally("==", poolTestNow.Add(4*time.Minute)))
+		g.Expect(f.lease()).To(BeNil())
+
+		f.clock.Step(4 * time.Minute)
+		f.expect()
+		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNode))))
+	})
+}
+
+// TestMachinePoolScopeRolloutReleasesAnIdleToken plays a disruption token this pool took for a replace that recorded
+// nothing (its first cordon failed, or the controller stopped right after the Lease create) and whose worker is no
+// longer due: an idle pool releases it, or every other pool of the Cluster would wait for it until a human deleted the
+// Lease. Without the workload cluster this pool's drain-owner markers cannot be read, so the token is kept.
+func TestMachinePoolScopeRolloutReleasesAnIdleToken(t *testing.T) {
+	t.Run("an_idle_pool_releases_it_and_another_pool_can_take_it", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRolloutFixture(t, nil)
+		other := poolObject("other", "other")
+		f.others = append(f.others, other, heldLease(DisruptionTokenHolder(f.pool)))
+		f.expect()
+		g.Expect(f.reconcile()).To(Equal(Done()))
+		g.Expect(f.lease()).To(BeNil())
+		otherToken, err := NewDisruptionToken(DisruptionTokenParams{Client: f.mgmt, APIReader: f.mgmt, Clock: f.clock,
+			Cluster: f.cluster, Pool: other})
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(otherToken.Status(context.Background())).To(Equal(TokenStatus{State: TokenNotHeld}))
+	})
+	t.Run("a_growing_pool_releases_it", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRolloutFixture(t, nil)
+		f.others = append(f.others, heldLease(DisruptionTokenHolder(f.pool)))
+		f.machinePool.Spec.Replicas = ptr.To[int32](6)
+		f.expect()
+		f.ibm.EXPECT().ResizeWorkerPool(gomock.Any(), poolTestClusterID, poolTestPoolID, int64(3)).Return(nil)
+		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalPoolTransition, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyResizingReason)))
+		g.Expect(f.lease()).To(BeNil())
+	})
+	t.Run("another_pool's_token_is_kept", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRolloutFixture(t, nil)
+		other := poolObject("other", "other")
+		f.others = append(f.others, other, heldLease(DisruptionTokenHolder(other)))
+		f.expect()
+		g.Expect(f.reconcile()).To(Equal(Done()))
+		g.Expect(f.lease().Spec.HolderIdentity).To(Equal(ptr.To(DisruptionTokenHolder(other))))
+	})
+	t.Run("without_the_workload_cluster_it_is_kept", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRolloutFixture(t, nil)
+		f.others = append(f.others, heldLease(DisruptionTokenHolder(f.pool)))
+		f.clusterCache = clustercache.NewFakeEmptyClusterCache()
+		f.expect()
+		g.Expect(f.reconcile()).To(Equal(Done()))
+		g.Expect(f.lease().Spec.HolderIdentity).To(Equal(ptr.To(DisruptionTokenHolder(f.pool))))
+	})
 }
 
 // TestMachinePoolScopeRolloutPreCallGate checks the pre-call cluster-state gate of the replace: the cluster turns
@@ -1268,11 +1411,11 @@ func TestMachinePoolScopeRolloutRequeue(t *testing.T) {
 	}
 }
 
-// TestMachinePoolScopeRolloutDispatch checks the order of a pool's flows around a replace: growth runs first (it
-// removes nothing), a replace in flight goes before a scale-down, a failing pool guard settles a replace in flight,
-// and a status that cannot be persisted sends no ReplaceWorker.
+// TestMachinePoolScopeRolloutDispatch checks the order of a pool's flows around a replace: growth runs at once (it
+// removes nothing) and a replace in flight runs on beside it, a replace in flight goes before a scale-down, a failing
+// pool guard settles a replace in flight, and a status that cannot be persisted sends no ReplaceWorker.
 func TestMachinePoolScopeRolloutDispatch(t *testing.T) {
-	t.Run("growth runs while a replace is in flight", func(t *testing.T) {
+	t.Run("growth runs while a replace is in flight, and the replace goes on", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newRolloutFixture(t, nil)
 		f.minorBehind("w0")
@@ -1280,9 +1423,63 @@ func TestMachinePoolScopeRolloutDispatch(t *testing.T) {
 		f.machinePool.Spec.Replicas = ptr.To[int32](6)
 		f.expect()
 		f.ibm.EXPECT().ResizeWorkerPool(gomock.Any(), poolTestClusterID, poolTestPoolID, int64(3)).Return(nil)
-		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalPoolTransition, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyResizingReason)))
-		g.Expect(f.pool.Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseDraining), "the replace waits one reconcile")
+		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNode))), "the drain's retry comes sooner")
+		g.Expect(f.pool.Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseDraining))
+		g.Expect(f.calls.count("evict")).To(Equal(1), "the victim is drained in the same reconcile")
+		g.Expect(condition(f.pool, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCondition).Reason).
+			To(Equal(infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyResizingReason))
 	})
+	t.Run("the_replace's_IBM_call_puts_the_growth_off_to_the_next_reconcile", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRolloutFixture(t, nil)
+		f.minorBehind("w0")
+		f.inPhase(infrav1.WorkerDisruptionPhaseWaitingForIBM)
+		f.drainedVictim()
+		f.machinePool.Spec.Replicas = ptr.To[int32](6)
+		f.expect()
+		// gomock fails on a ResizeWorkerPool: one IBM mutation per reconcile.
+		f.ibm.EXPECT().ReplaceWorker(gomock.Any(), poolTestClusterID, "w0", true).Return(nil)
+		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalPoolTransition, string(ReasonReplacingWorker))))
+
+		f.clock.Step(30 * time.Second)
+		f.expect()
+		f.ibm.EXPECT().ResizeWorkerPool(gomock.Any(), poolTestClusterID, poolTestPoolID, int64(3)).Return(nil)
+		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalPoolTransition, string(ReasonReplacingWorker))))
+	})
+	// A replace past its IBM call needs nothing from the growth: when IBM refuses the growth or the cluster state forbids
+	// it, the replace still completes and gives the Cluster's disruption token back.
+	growthBlocked := []struct {
+		name   string
+		modify func(f *rolloutFixture)
+		want   Outcome
+	}{
+		{name: "IBM_refuses_the_growth", want: Terminal(MachinePoolIBMAPIErrorReason, "IBM Cloud refused the request (HTTP 400, code E0000) "+
+			"while growing worker pool workers of IBM cluster "+poolTestClusterID+" to 3 workers per zone; check spec.flavor and "+
+			"spec.zones of IBMCloudManagedMachinePool/workers; the controller log has IBM's description"),
+			modify: func(f *rolloutFixture) {
+				f.ibm.EXPECT().ResizeWorkerPool(gomock.Any(), poolTestClusterID, poolTestPoolID, int64(3)).
+					Return(apiError(kubernetesservice.OpResizeWorkerPool, http.StatusBadRequest, "E0000"))
+			}},
+		{name: "the_cluster_state_forbids_the_growth", want: NotDone(IntervalGuarded, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForClusterStateReason),
+			modify: func(f *rolloutFixture) { f.cp.Status.State = "unsupported" }},
+	}
+	for _, tc := range growthBlocked {
+		t.Run("a_replace_past_its_call_completes_when_"+tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			f := newRolloutFixture(t, nil)
+			f.minorBehind("w0")
+			f.afterCall(poolTestNow.Add(-10 * time.Minute))
+			f.pool.Status.Disruption.Phase = infrav1.WorkerDisruptionPhaseWaitingForReplacement
+			f.addReplacement(WorkerStateDeployed, poolTestNow.Add(-5*time.Minute))
+			f.machinePool.Spec.Replicas = ptr.To[int32](6)
+			f.expect()
+			tc.modify(f)
+			g.Expect(f.reconcile()).To(Equal(tc.want))
+			g.Expect(f.pool.Status.Disruption).To(Equal(infrav1.WorkerDisruptionStatus{}))
+			g.Expect(f.lease()).To(BeNil(), "the Cluster's disruption token is released")
+			g.Expect(f.upToDate().Status).To(Equal(metav1.ConditionTrue))
+		})
+	}
 	t.Run("a failing pool guard settles a replace in flight before its call", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newRolloutFixture(t, nil)
@@ -1347,6 +1544,136 @@ func TestMachinePoolScopeRolloutDispatch(t *testing.T) {
 		g.Expect(f.upToDate().Message).To(Equal("rolling out pool workers; worker w0 (RolloutRequested): the workload cluster is "+
 			"not connected; the Nodes stay cordoned and no IBM call is made"), "the victim keeps its classification")
 	})
+}
+
+// TestMachinePoolScopeRolloutHoldsARefusedGrowth plays a growth that IBM refuses while a replace drains its worker behind
+// a PodDisruptionBudget. The replace requeues at the drain's retry interval, so the refused resize must not ride along on
+// each of those reconciles: it is asked again once growthRetryDelay has passed since the refusal, as often as without a
+// replace in flight, or at once when the MachinePool asks for another size or the pool's spec changes. The drain goes on
+// meanwhile.
+func TestMachinePoolScopeRolloutHoldsARefusedGrowth(t *testing.T) {
+	growth := func(f *rolloutFixture, perZone int64, answer error) {
+		f.ibm.EXPECT().ResizeWorkerPool(gomock.Any(), poolTestClusterID, poolTestPoolID, perZone).Return(answer)
+	}
+	// newDrainingReplace returns a replace of w0 that a PodDisruptionBudget keeps in Draining while the MachinePool asks
+	// for three workers per zone, and runs the reconcile in which IBM refuses the growth with refusal.
+	newDrainingReplace := func(t *testing.T, refusal error) *rolloutFixture {
+		t.Helper()
+		g := NewWithT(t)
+		f := newRolloutFixture(t, map[string]error{"web-w0": pdbRefusal()})
+		f.minorBehind("w0")
+		f.inPhase(infrav1.WorkerDisruptionPhaseDraining)
+		f.machinePool.Spec.Replicas = ptr.To[int32](6)
+		f.expect()
+		growth(f, 3, refusal)
+		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNode))), "the replace keeps its cadence")
+		return f
+	}
+	refusals := []struct {
+		name    string
+		refusal error
+		answer  string
+	}{
+		{name: "a_400", refusal: apiError(kubernetesservice.OpResizeWorkerPool, http.StatusBadRequest, "E0000"),
+			answer: "IBM Cloud refused the request (HTTP 400, code E0000) while growing worker pool workers of IBM cluster " +
+				poolTestClusterID + " to 3 workers per zone; check spec.flavor and spec.zones of IBMCloudManagedMachinePool/workers; " +
+				"the controller log has IBM's description"},
+		{name: "a_403", refusal: apiError(kubernetesservice.OpResizeWorkerPool, http.StatusForbidden, ""),
+			answer: "(HTTP 403) while growing worker pool workers of IBM cluster " + poolTestClusterID + " to 3 workers per zone"},
+	}
+	for _, tc := range refusals {
+		t.Run(tc.name+"_is_asked_again_only_after_the_retry_delay", func(t *testing.T) {
+			g := NewWithT(t)
+			f := newDrainingReplace(t, tc.refusal)
+			ready := *condition(f.pool, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCondition)
+			g.Expect(ready.Reason).To(Equal(MachinePoolIBMAPIErrorReason))
+			g.Expect(ready.Message).To(ContainSubstring(tc.answer))
+			g.Expect(ready.Message).To(HaveSuffix("; while a worker of the pool is replaced, CAPIBM asks IBM again for 3 workers per " +
+				"zone at 2026-11-16T12:15:00Z"))
+			evictions := f.calls.count("evict")
+			for range 4 {
+				f.clock.Step(DrainRetryInterval)
+				f.expect()
+				// gomock fails on a ResizeWorkerPool.
+				g.Expect(f.reconcile()).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNode))))
+				g.Expect(*condition(f.pool, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCondition)).To(Equal(ready),
+					"the refusal stays on WorkerPoolReady as it was written")
+			}
+			g.Expect(f.calls.count("evict")).To(Equal(evictions+4), "the drain goes on")
+
+			f.clock.SetTime(poolTestNow.Add(growthRetryDelay))
+			f.expect()
+			growth(f, 3, tc.refusal)
+			g.Expect(f.reconcile()).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNode))))
+			g.Expect(condition(f.pool, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCondition).Message).To(HaveSuffix(
+				"CAPIBM asks IBM again for 3 workers per zone at 2026-11-16T12:30:00Z"))
+		})
+	}
+	t.Run("another_size_is_asked_for_at_once", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newDrainingReplace(t, refusals[0].refusal)
+		f.clock.Step(DrainRetryInterval)
+		f.machinePool.Spec.Replicas = ptr.To[int32](8)
+		f.expect()
+		growth(f, 4, nil)
+		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNode))))
+		g.Expect(condition(f.pool, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCondition).Reason).
+			To(Equal(infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyResizingReason))
+	})
+	t.Run("a_spec_change_of_the_pool_asks_again_at_once", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newDrainingReplace(t, refusals[0].refusal)
+		f.clock.Step(DrainRetryInterval)
+		f.pool.Generation++
+		f.expect()
+		growth(f, 3, nil)
+		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNode))))
+		g.Expect(condition(f.pool, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCondition).Reason).
+			To(Equal(infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyResizingReason))
+	})
+	t.Run("a_growth_that_failed_for_another_reason_is_not_held", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRolloutFixture(t, map[string]error{"web-w0": pdbRefusal()})
+		f.minorBehind("w0")
+		f.inPhase(infrav1.WorkerDisruptionPhaseDraining)
+		f.machinePool.Spec.Replicas = ptr.To[int32](6)
+		f.expect()
+		growth(f, 3, apiError(kubernetesservice.OpResizeWorkerPool, http.StatusInternalServerError, ""))
+		g.Expect(f.reconcile().Kind).To(Equal(OutcomeTransient))
+		f.clock.Step(DrainRetryInterval)
+		f.expect()
+		growth(f, 3, nil)
+		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNode))))
+	})
+}
+
+// TestGrowthRetryTime checks that the retry time of a refused growth is read back only from the note that names the
+// size asked for, so that a request for another size is never held by an older refusal.
+func TestGrowthRetryTime(t *testing.T) {
+	at := time.Date(2026, 11, 16, 12, 15, 0, 0, time.UTC)
+	testCases := []struct {
+		name    string
+		message string
+		perZone int64
+		want    time.Time
+		found   bool
+	}{
+		{name: "the note of the size asked for", message: "IBM Cloud refused the request" + growthRetryNote(3, at), perZone: 3,
+			want: at, found: true},
+		{name: "notes appended after it", message: "IBM Cloud refused the request" + growthRetryNote(3, at) + "; VersionIgnored: x",
+			perZone: 3, want: at, found: true},
+		{name: "the note of another size", message: "IBM Cloud refused the request" + growthRetryNote(3, at), perZone: 4},
+		{name: "no note", message: "IBM Cloud refused the request", perZone: 3},
+		{name: "a time that does not parse", message: "CAPIBM asks IBM again for 3 workers per zone at soon", perZone: 3},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			got, found := growthRetryTime(tc.message, tc.perZone)
+			g.Expect(found).To(Equal(tc.found))
+			g.Expect(got).To(BeTemporally("==", tc.want))
+		})
+	}
 }
 
 // TestMachinePoolScopeRolloutWorkloadClusterLost checks that a replace needs the workload cluster past the Gated
