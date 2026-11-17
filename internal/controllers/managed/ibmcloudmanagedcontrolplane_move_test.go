@@ -430,6 +430,33 @@ func TestControlPlaneDeleteStoredKubeconfigProbe(t *testing.T) {
 		g.Expect(condition.Message).To(ContainSubstring("the credentials of the CAPIBM controller identity need"))
 		expectNoIdentityDetails(g, condition.Message)
 	})
+
+	// A deletion runs the same proof before it deletes a cluster that only the moved Secret names, so IBM can refuse
+	// the CA fetch of the proof as well as the lookup or the DELETE. Such a 403 is a refused call of the deletion like
+	// the others: Deleting=True PermissionDenied whose message names the call, the 15-minute recheck, and no DELETE.
+	t.Run("a_GetCACertificate_403_during_the_proof_of_a_deletion_is_PermissionDenied_without_a_DELETE", func(t *testing.T) {
+		g := NewWithT(t)
+		creds := newKubeconfigCredentials(t, time.Hour)
+		f, prober := newKubeconfigFixture(t, func(objs *cpObjects) {
+			withMovedStatus(objs, movedSecret(t, creds))
+			objs.cp.DeletionTimestamp = ptr.To(metav1.NewTime(cpTestStart.Add(-time.Minute)))
+		})
+		// No DeleteCluster expectation: gomock fails the test if the DELETE is sent.
+		gomock.InOrder(f.expectObserve(cpCluster("normal")), f.kube.EXPECT().GetCACertificate(gomock.Any(), cpIKSClusterID).
+			Return(nil, ibmError(kubernetesservice.OpGetCACertificate, http.StatusForbidden, "")))
+
+		result, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		expectRequeue(g, result, 15*time.Minute)
+		permissionDenied := controlplanev1.IBMCloudManagedControlPlaneDeletingPermissionDeniedReason
+		condition := expectCondition(g, expectDeleting(g, f, permissionDenied), controlplanev1.IBMCloudManagedControlPlaneDeletingCondition,
+			metav1.ConditionTrue, permissionDenied)
+		g.Expect(condition.Message).To(ContainSubstring("IBM Cloud refused fetching the CA of IBM cluster iksclusterid00000001 " +
+			"for the ownership proof with HTTP 403"))
+		expectNoIdentityDetails(g, condition.Message)
+		g.Expect(prober.calls()).To(BeEmpty(), "nothing is probed without the CA")
+	})
 }
 
 // TestControlPlaneEnvtestMove runs the target side of clusterctl move against the real API server: the control plane
