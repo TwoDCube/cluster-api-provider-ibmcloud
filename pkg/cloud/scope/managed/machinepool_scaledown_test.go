@@ -391,11 +391,13 @@ func (f *scaleDownFixture) lease() *coordinationv1.Lease {
 	return lease
 }
 
-// inPhase records a scale-down of w0 and w1 in phase whose drain started ten minutes ago, with the token held.
+// inPhase records a scale-down of w0 and w1 in phase whose drain started ten minutes ago, with the token held; past
+// Draining its volume detach wait began five minutes ago (detachWaitBegan).
 func (f *scaleDownFixture) inPhase(phase infrav1.WorkerDisruptionPhase) {
 	f.others = append(f.others, heldLease(DisruptionTokenHolder(f.pool)))
 	f.pool.Status.Disruption = infrav1.WorkerDisruptionStatus{Operation: infrav1.WorkerDisruptionOperationScaleDown, Phase: phase,
-		WorkerIDs: []string{"w0", "w1"}, DrainStartTime: metav1.NewTime(poolTestNow.Add(-10 * time.Minute))}
+		WorkerIDs: []string{"w0", "w1"}, DrainStartTime: metav1.NewTime(poolTestNow.Add(-10 * time.Minute)),
+		VolumeDetachStartTime: detachWaitBegan(phase)}
 }
 
 // cordonVictims cordons the Nodes of w0 and w1 for the pool, as an earlier reconcile would have; with drained the
