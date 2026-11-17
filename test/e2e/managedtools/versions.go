@@ -40,6 +40,9 @@ func ValidateUpgradeStep(from, to string) error {
 	if err != nil {
 		return fmt.Errorf("IKS_DISTRIBUTION_VERSION_UPGRADE_TO: %w", err)
 	}
+	// TODO: the check assumes that the next version is the next minor, which holds for IKS. A ROKS upgrade lane could not
+	// use it: after OpenShift 4.22 a master can move to 4.23 or to 5.0. Take the allowed step from IBM's per-cluster
+	// upgrade-path endpoint once it is stable (see the TODO on ibmversion.Minor.Next).
 	if toMinor != fromMinor.Next() {
 		return fmt.Errorf("IKS_DISTRIBUTION_VERSION_UPGRADE_TO %q must be the minor after IKS_DISTRIBUTION_VERSION %q, "+
 			"that is %q: IBM upgrades a master one minor at a time", to, from, fromMinor.Next())
