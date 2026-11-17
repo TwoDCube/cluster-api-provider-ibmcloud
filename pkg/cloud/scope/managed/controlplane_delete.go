@@ -310,7 +310,7 @@ func (s *ControlPlaneScope) deleteCallProblem(ctx context.Context, err error) Ou
 	case kubernetesservice.ClassUnauthorized:
 		logIBMRefusal(ctx, callErr)
 		s.params.ClientBuilder.InvalidateAuthenticator(callErr.identity.Key)
-		s.setDeleting(permissionDenied, cpUnauthorizedMessage(identity, callErr.action))
+		s.setDeleting(permissionDenied, cpUnauthorizedMessage(identity, callErr.action, callErr.err))
 		return NotDone(IntervalSteadyState, permissionDenied)
 	case kubernetesservice.ClassPermissionDenied:
 		logIBMRefusal(ctx, callErr)

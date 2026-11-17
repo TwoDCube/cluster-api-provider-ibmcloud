@@ -174,9 +174,11 @@ func TestCPWorkersMessage(t *testing.T) {
 
 func TestControlPlaneDeleteCallProblemIsNeverTerminal(t *testing.T) {
 	identity := credentials.Identity{Key: credentials.ControllerKey(), Description: credentials.ControllerDescription}
+	failedCall := func(err error) error {
+		return &controlPlaneCallError{identity: identity, op: kubernetesservice.OpGetCluster, action: "getting IBM cluster x", err: err}
+	}
 	callErr := func(status int) error {
-		return &controlPlaneCallError{identity: identity, op: kubernetesservice.OpGetCluster, action: "getting IBM cluster x",
-			err: &kubernetesservice.APIError{Operation: kubernetesservice.OpGetCluster, StatusCode: status, IncidentID: "inc-9"}}
+		return failedCall(&kubernetesservice.APIError{Operation: kubernetesservice.OpGetCluster, StatusCode: status, IncidentID: "inc-9"})
 	}
 	testCases := []struct {
 		name           string
@@ -184,9 +186,19 @@ func TestControlPlaneDeleteCallProblemIsNeverTerminal(t *testing.T) {
 		wantKind       OutcomeKind
 		wantReason     string
 		wantInvalidate bool
+		// wantMessage is the Deleting message; "" when the case does not check it.
+		wantMessage string
 	}{
 		{name: "401", err: callErr(http.StatusUnauthorized), wantKind: OutcomeNotDone,
-			wantReason: controlplanev1.IBMCloudManagedControlPlaneDeletingPermissionDeniedReason, wantInvalidate: true},
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneDeletingPermissionDeniedReason, wantInvalidate: true,
+			wantMessage: "IBM Cloud rejected the credentials of the CAPIBM controller identity with HTTP 401 while getting IBM " +
+				"cluster x; CAPIBM rebuilds its authenticator and retries in about 5 minutes; check that the API key of the " +
+				"CAPIBM controller identity is valid and not deleted"},
+		{name: "IAM refused the API key", err: failedCall(iamRejected(kubernetesservice.OpGetCluster)), wantKind: OutcomeNotDone,
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneDeletingPermissionDeniedReason, wantInvalidate: true,
+			wantMessage: "The IAM token service of IBM Cloud rejected the credentials of the CAPIBM controller identity with HTTP " +
+				"400 while getting IBM cluster x, so the request was not sent; CAPIBM rebuilds its authenticator and retries " +
+				"in about 5 minutes; check that the API key of the CAPIBM controller identity is valid and not deleted"},
 		{name: "403", err: callErr(http.StatusForbidden), wantKind: OutcomeNotDone,
 			wantReason: controlplanev1.IBMCloudManagedControlPlaneDeletingPermissionDeniedReason},
 		{name: "429", err: callErr(http.StatusTooManyRequests), wantKind: OutcomeRateLimited,
@@ -216,6 +228,9 @@ func TestControlPlaneDeleteCallProblemIsNeverTerminal(t *testing.T) {
 			g.Expect(deleting.Status).To(Equal(metav1.ConditionTrue))
 			g.Expect(deleting.Reason).To(Equal(tc.wantReason))
 			g.Expect(deleting.Message).NotTo(ContainSubstring("inc-9"), "IBM's per-answer incident ID never reaches status")
+			if tc.wantMessage != "" {
+				g.Expect(deleting.Message).To(Equal(tc.wantMessage))
+			}
 			g.Expect(builder.invalidated).To(HaveLen(map[bool]int{true: 1, false: 0}[tc.wantInvalidate]))
 		})
 	}
