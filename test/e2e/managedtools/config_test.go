@@ -153,3 +153,24 @@ func TestIKSWorkerRolloutWaitCoversEveryReplacement(t *testing.T) {
 		"managed-iks/wait-worker-rollout (%s) must cover %d worker replacements of %s each: the upgrade replaces every "+
 			"worker of both pools, one at a time", rollout, upgradeReplacements, replacementBudget)
 }
+
+// TestRegistryClusterGoneWaitCoversROKSDeletion guards the interval with which the ROKS lane's registry bucket cleanup
+// waits for IBM to answer 404 for the run's clusters. In the case the IBM backstop exists for, CAPIBM never deleted
+// the cluster and the backstop sends the DELETE just before that wait, so the wait must cover a whole ROKS deletion
+// (measured at 18 minutes) with room for a slower IBM; a shorter wait fails the cleanup before it deletes the run's
+// registry bucket, and the next run's baseline then hides that bucket. It is its own interval, not the delete step's
+// wait-ibm-404, so that tuning one never changes the other.
+func TestRegistryClusterGoneWaitCoversROKSDeletion(t *testing.T) {
+	const (
+		// measuredROKSDeletion is how long IBM took to delete a ROKS cluster when measured.
+		measuredROKSDeletion = 18 * time.Minute
+		// minimumWait is half again the measured deletion.
+		minimumWait = measuredROKSDeletion + measuredROKSDeletion/2
+	)
+	g := NewWithT(t)
+	cfg := loadManagedE2EConfig(t)
+	wait := cfg.timeout(t, "managed-roks", "wait-registry-cluster-gone")
+	g.Expect(wait).To(BeNumerically(">=", minimumWait),
+		"managed-roks/wait-registry-cluster-gone (%s) must be at least %s: the backstop's DELETE may start just before "+
+			"it, and a ROKS deletion took %s when measured", wait, minimumWait, measuredROKSDeletion)
+}

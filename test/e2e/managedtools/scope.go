@@ -25,16 +25,18 @@ import (
 // The two switches of the managed e2e configuration that let a lane share the e2e account with other runs.
 //
 // Their defaults keep the CI behaviour, where the Boskos lease of hack/scripts/ci/ci-e2e.sh guarantees one managed run
-// per account at a time: the janitor deletes the clusters that crashed runs left behind, and the inventory diff holds
-// the lane responsible for every new cluster and VPC resource of the resource group. Neither holds next to other runs:
-// the janitor cannot tell a crashed run's cluster from a running one's (both are old and carry the e2e prefix), and the
-// diff would report the other runs' resources as the lane's leftovers. A run that shares the account therefore turns
-// the janitor off and limits the diff to what can be attributed to the lane.
+// per account at a time: the janitor deletes the clusters that crashed runs left behind, the inventory diff holds the
+// lane responsible for every new cluster and VPC resource of the resource group, and the ROKS lane's bucket check
+// (DiffBuckets) for every new bucket of the COS instance COS_INSTANCE_CRN. None of that holds next to other runs: the
+// janitor cannot tell a crashed run's cluster from a running one's (both are old and carry the e2e prefix), and the
+// checks would report the other runs' resources and buckets as the lane's leftovers. A run that shares the account
+// therefore turns the janitor off and limits the checks to what can be attributed to the lane.
 const (
 	// JanitorVariable is the e2e configuration variable that switches the janitor on ("true", the default) or off
 	// ("false").
 	JanitorVariable = "E2E_MANAGED_JANITOR"
-	// LeftoverScopeVariable is the e2e configuration variable that selects the LeftoverScope of the inventory diff.
+	// LeftoverScopeVariable is the e2e configuration variable that selects the LeftoverScope of the inventory diff and
+	// of the ROKS lane's bucket check.
 	LeftoverScopeVariable = "E2E_MANAGED_LEFTOVER_SCOPE"
 )
 
@@ -57,16 +59,23 @@ func ParseJanitorSwitch(value string) (bool, error) {
 	}
 }
 
-// LeftoverScope selects which resources the inventory diff of a lane holds the lane responsible for.
+// LeftoverScope selects which new resources a lane's leftover checks hold the lane responsible for: the inventory diff
+// (clusters and VPC resources of the resource group, InventoryScope) and, in the ROKS lane, the bucket check of the
+// COS instance COS_INSTANCE_CRN (DiffBuckets).
 type LeftoverScope string
 
 const (
 	// LeftoverScopeAccount (the default) covers every cluster, load balancer, VPE gateway, security group and volume
-	// of the resource group: anything new after the lane is a leftover, whoever created it.
+	// of the resource group and, in the ROKS lane, every bucket of the COS instance COS_INSTANCE_CRN: anything new
+	// after the lane is a leftover, whoever created it. The only new buckets that do not fail the lane are the run's
+	// registry buckets, named roks-<ID of a cluster of the run>-..., which the lane deletes.
 	LeftoverScopeAccount LeftoverScope = "account"
 	// LeftoverScopeLane covers only the resources attributable to the lane: the clusters named
 	// "<E2E_NAME_PREFIX>-<E2E_RUN_ID>-..." and the load balancers, VPE gateways and security groups of the lane's own
-	// VPC. Volumes cannot be attributed and are left out (see InventoryScope.Includes).
+	// VPC. Volumes cannot be attributed and are left out (see InventoryScope.Includes). Of the new buckets of the COS
+	// instance COS_INSTANCE_CRN, only the run's registry buckets, named roks-<ID of a cluster of the run>-..., count:
+	// the ROKS lane deletes them and reports every other new bucket as not attributed to the run, without failing on
+	// it and without touching it.
 	LeftoverScopeLane LeftoverScope = "lane"
 )
 
@@ -83,9 +92,11 @@ func ParseLeftoverScope(value string) (LeftoverScope, error) {
 		return LeftoverScopeLane, nil
 	default:
 		return "", fmt.Errorf("%s %q is not valid: use %q (the default: every new cluster and VPC resource of the "+
-			"resource group is a leftover, for an account that holds one managed run at a time) or %q (only the "+
-			"lane's own clusters and the VPC resources of the VPC IBMCLOUD_VPC_NAME, for an account shared with other "+
-			"runs that each use a VPC of their own)", LeftoverScopeVariable, value, LeftoverScopeAccount, LeftoverScopeLane)
+			"resource group and, in the ROKS lane, every new bucket of %s that is not the run's registry bucket is a "+
+			"leftover, for an account that holds one managed run at a time) or %q (only the lane's own clusters, the "+
+			"VPC resources of the VPC IBMCLOUD_VPC_NAME and the registry buckets named %s<ID of a cluster of the "+
+			"run>-..., for an account shared with other runs that each use a VPC of their own)", LeftoverScopeVariable,
+			value, LeftoverScopeAccount, COSInstanceCRNVariable, LeftoverScopeLane, registryBucketPrefix)
 	}
 }
 

@@ -81,7 +81,10 @@ variables:
   #     "<E2E_NAME_PREFIX>-<E2E_RUN_ID>-..." and the load balancers, VPE gateways and security groups of the VPC
   #     IBMCLOUD_VPC_NAME, so every concurrent run needs a run ID and a VPC of its own. Volumes are not checked in the
   #     lane scope: IKS and ROKS create them only for PersistentVolumeClaims (the lanes create none), named pvc-<uid>
-  #     and tagged with nothing that names the cluster, so they must be checked account-wide after all runs.
+  #     and tagged with nothing that names the cluster, so they must be checked account-wide after all runs. The same
+  #     switch scopes the ROKS lane's bucket check (COS_INSTANCE_CRN below): "account" fails on every new bucket of the
+  #     COS instance that is not the run's registry bucket; "lane" fails on none of them and only names them in the log
+  #     as not attributed to the run, because only a registry bucket's name says which cluster it belongs to.
   # Any other value fails the lane before it creates anything.
   E2E_MANAGED_JANITOR: "${E2E_MANAGED_JANITOR:-true}"
   E2E_MANAGED_LEFTOVER_SCOPE: "${E2E_MANAGED_LEFTOVER_SCOPE:-account}"
@@ -106,7 +109,16 @@ variables:
   IKS_DISTRIBUTION_VERSION_UPGRADE_TO: "${IKS_DISTRIBUTION_VERSION_UPGRADE_TO:-1.36}"
   ROKS_DISTRIBUTION_VERSION: "${ROKS_DISTRIBUTION_VERSION:-4.21}"
   # The ROKS lane's image registry storage: the CRN of an existing standard COS instance (IBM rejects a ROKS VPC
-  # cluster without one, E7278).
+  # cluster without one, E7278). IBM creates a bucket in it for the cluster's registry and keeps it when the cluster is
+  # deleted, because the IBM SDK that CAPIBM pins cannot ask for its deletion (deleteOpenShiftRegistryCOSBucket). So the
+  # lane lists the instance's buckets before it creates anything and, once IBM answers 404 for its cluster
+  # (wait-registry-cluster-gone below), empties and deletes each new bucket named roks-<its cluster ID>-<suffix>. That
+  # name form comes from IBM's procedure for a registry bucket created by hand; that the bucket IBM creates has it too
+  # is assumed. The lane never touches any other new bucket: the account scope (E2E_MANAGED_LEFTOVER_SCOPE) fails the
+  # lane naming it, the lane scope only names it in the log. Should IBM name the registry bucket otherwise, the account
+  # scope fails every ROKS run on the run's own registry bucket, and the lane scope leaves that bucket in the instance.
+  # The API key needs at least the Writer role on the instance. That cleanup goes away once CAPIBM can send
+  # deleteOpenShiftRegistryCOSBucket.
   COS_INSTANCE_CRN: "${COS_INSTANCE_CRN:-}"
   WORKER_UPDATE_POLICY: "Manual"
   # The templates read it into the control plane's spec.deletion.persistentStorage (default Retain). Every lane deletes
@@ -120,7 +132,9 @@ variables:
   # workers reach over private endpoints, or the IKS lane fails at its first PodDisruptionBudget step (wait-probe).
   MANAGED_E2E_PROBE_IMAGE: "${MANAGED_E2E_PROBE_IMAGE:-registry.k8s.io/e2e-test-images/busybox:1.36.1-1}"
   # Optional endpoint overrides of the lanes' own IBM clients; empty means the public defaults
-  # (https://containers.cloud.ibm.com/global and https://<region>.iaas.cloud.ibm.com/v1).
+  # (https://containers.cloud.ibm.com/global and https://<region>.iaas.cloud.ibm.com/v1). The ROKS lane's COS client
+  # has no override: it lists the buckets at https://s3.<IBMCLOUD_REGION>.cloud-object-storage.appdomain.cloud and
+  # sends every request about a bucket to the public endpoint of the bucket's own location.
   IBMCLOUD_CONTAINERS_URL: "${IBMCLOUD_CONTAINERS_URL:-}"
   IBMCLOUD_VPC_URL: "${IBMCLOUD_VPC_URL:-}"
 
@@ -128,7 +142,8 @@ variables:
 # begins. That holds for the create step's wait-control-plane and wait-worker-nodes too, although the ROKS lane's
 # 120 + 120 + 90 m exceed 4 h: the lanes run those waits themselves instead of leaving them to the CAPI framework, which
 # would take their intervals when the step starts (managed_test.go create). The cleanups (wait-delete-cluster in the
-# CAPI deletion, wait-inventory-clean) are not lowered: they run after the hard timeout, within their own node timeouts.
+# CAPI deletion, wait-registry-cluster-gone in the ROKS lane's registry bucket cleanup, wait-inventory-clean) are not
+# lowered: they run after the hard timeout, within their own node timeouts.
 intervals:
   default/wait-controllers: ["3m", "10s"]
   default/wait-delete-cluster: ["60m", "30s"]
@@ -137,6 +152,14 @@ intervals:
   default/wait-cluster: ["10m", "10s"]
   default/wait-move: ["30m", "15s"]
   default/wait-ibm-404: ["15m", "30s"]
+  # The ROKS lane's registry bucket cleanup waits this long for IBM to answer 404 for every cluster of the run before it
+  # deletes their registry buckets. When CAPIBM did not delete the cluster, the IBM backstop sends the DELETE just
+  # before this wait, and a ROKS cluster deletion took 18 m when measured, so the wait is 30 m; a wait that runs out
+  # first leaves the run's registry bucket behind. It is not wait-ibm-404, the delete step's check after CAPIBM's own
+  # deletion, so that tuning one never changes the other. The cleanup's node timeout (registryBucketCleanupTimeout in
+  # test/e2e/managed_test.go) holds this wait plus 15 m for the bucket deletion; the lane refuses a longer wait before
+  # it creates anything.
+  default/wait-registry-cluster-gone: ["30m", "30s"]
   default/wait-inventory-clean: ["30m", "60s"]
   # The Cluster reaches the Provisioned phase only once IBM has created the cluster (IKS about 25 min, ROKS up to
   # 45 min, more for HA), so the cluster wait must be as long as the control plane wait, not the 10 min default.

@@ -187,15 +187,17 @@ prerequisites_managed(){
     export IBMCLOUD_SUBNET_NAME_2=${IBMCLOUD_SUBNET_NAME_2:-"${IBMCLOUD_VPC_NAME}-${IBMCLOUD_ZONE_2}"}
     export IBMCLOUD_SUBNET_NAME_3=${IBMCLOUD_SUBNET_NAME_3:-"${IBMCLOUD_VPC_NAME}-${IBMCLOUD_ZONE_3}"}
     if [[ "${E2E_FLAVOR}" == "managed-roks-single-zone" ]]; then
+        # The ROKS lane also deletes its cluster's registry bucket from this instance once the cluster is gone (IBM
+        # keeps it), so the API key needs at least the Writer role on it (test/e2e/config/ibmcloud-e2e-managed.yaml).
         require_managed_variable COS_INSTANCE_CRN "export the CRN of the standard COS instance for the ROKS image registry"
     fi
     export EXP_MANAGED_KUBERNETES=true
     # Only the managed specs run. The lanes stop their own steps at their hard timeouts (4 h for each lane, counted
     # from the lane's set-up); Ginkgo's timeout adds 1 h 30 m for the management cluster set-up and the first
     # cleanups. It does not bound the cleanups: each runs within its own NodeTimeout (CAPI deletion 90 m, IBM backstop
-    # 10 m, inventory diff 45 m), and Ginkgo v2 grants a cleanup that starts after the suite timeout its full
-    # NodeTimeout, so the IBM backstop always runs and a run can last up to GINKGO_TIMEOUT plus 145 m. The Boskos
-    # lease is held for all of it (heartbeat_managed_lease).
+    # 10 m, the ROKS lane's registry bucket cleanup 45 m, inventory diff 45 m), and Ginkgo v2 grants a cleanup that
+    # starts after the suite timeout its full NodeTimeout, so the IBM backstop always runs and a run can last up to
+    # GINKGO_TIMEOUT plus 145 m (IKS) or 190 m (ROKS). The Boskos lease is held for all of it (heartbeat_managed_lease).
     export GINKGO_FOCUS="Managed Kubernetes"
     export GINKGO_TIMEOUT=${GINKGO_TIMEOUT:-"5h30m"}
 }

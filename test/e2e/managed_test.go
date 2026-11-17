@@ -74,9 +74,10 @@ const (
 	// BeforeAll. No step waits past them: every step's context ends there, and l.intervals lowers every Eventually
 	// timeout to the time left, including those of the CAPI framework helpers that poll without a context. The
 	// cleanups that BeforeAll registers run after the steps, each within its own NodeTimeout (CAPI deletion 90 m, IBM
-	// backstop 10 m, inventory diff 45 m), so a lane can hold its cluster for up to its hard timeout plus 145 m.
-	// Ginkgo's --timeout (ci-e2e.sh) does not cut that short where it matters: Ginkgo v2 gives a cleanup node that
-	// starts after the suite timeout its full NodeTimeout, so the IBM backstop and the inventory diff still run.
+	// backstop 10 m, registry bucket cleanup 45 m, which only the ROKS lane uses, inventory diff 45 m), so a lane can
+	// run for up to its hard timeout plus 145 m (IKS) or 190 m (ROKS). Ginkgo's --timeout (ci-e2e.sh) does not cut that
+	// short where it matters: Ginkgo v2 gives a cleanup node that starts after the suite timeout its full NodeTimeout,
+	// so the IBM backstop, the registry bucket cleanup and the inventory diff still run.
 	// The IKS lane's steps take about 175 to 190 m: set-up 1, create 23 (measured 20 to 23), scale-down 4, pool add 5,
 	// master upgrade 19 (measured 18.5 from 1.35 to 1.36) and 2 more until the pools see it, the blocked-drain check
 	// and hold 6, pool deletion 3, move 10 (not measured yet) and its hold of moveHold (7), and cluster deletion 18
@@ -130,6 +131,26 @@ const (
 	machinePoolRecheck = time.Minute
 	// machinePoolRecheckPolling is the polling interval of that recheck.
 	machinePoolRecheckPolling = 10 * time.Second
+
+	// registryBucketCleanupTimeout is the NodeTimeout of the registry bucket cleanup: the wait for IBM's 404 for the
+	// run's clusters (registryClusterGoneInterval, 30 m in the e2e config) and then registryBucketDeletionBudget for
+	// the emptying and deletion of their registry buckets. validateVariables refuses an interval that leaves less.
+	registryBucketCleanupTimeout = 45 * time.Minute
+	// registryBucketDeletionBudget is the part of registryBucketCleanupTimeout kept for the work after the wait: one
+	// bucket listing, then up to registryBucketAttempts attempts per bucket, registryBucketRetryWait apart, of about six
+	// requests each (versioning, object listing and deletion, upload listing, bucket deletion, listing), which take
+	// seconds. 15 m still covers the listing and one request per attempt that runs into ibmRequestTimeout
+	// (2 + 3 x 2 + 2 x 0.5 = 9 m).
+	registryBucketDeletionBudget = 15 * time.Minute
+	// registryClusterGoneInterval is the e2e config interval of the cleanup's wait for IBM's 404. It is not the delete
+	// step's wait-ibm-404: in the case the IBM backstop exists for, the backstop sends the DELETE just before this
+	// wait, which must then cover a whole ROKS deletion (18 m when measured).
+	registryClusterGoneInterval = "wait-registry-cluster-gone"
+	// registryBucketAttempts is how often the cleanup tries to empty and delete one registry bucket before it fails the
+	// lane; registryBucketRetryWait is the pause between two attempts. An attempt fails on any error, a transient 5xx
+	// or a bucket that IBM still lists after the DELETE, so a few spaced attempts let those pass.
+	registryBucketAttempts  = 3
+	registryBucketRetryWait = 30 * time.Second
 
 	// ibmRequestTimeout bounds every IBM request of the lanes' own clients.
 	ibmRequestTimeout = 2 * time.Minute
@@ -212,8 +233,9 @@ var _ = Describe("Managed Kubernetes (IKS and ROKS)", Label("managed"), func() {
 			WorkerMachineCount: roksWorkerMachineCount,
 			Timeout:            roksLaneTimeout,
 			Identity:           ControllerIdentityFixture{},
+			RegistryBuckets:    true,
 			RequiredVariables: []string{varRegion, varResourceGroupID, varVPCName, "IBMCLOUD_ZONE_1",
-				"IBMCLOUD_SUBNET_NAME_1", "ROKS_DISTRIBUTION_VERSION", "COS_INSTANCE_CRN"},
+				"IBMCLOUD_SUBNET_NAME_1", "ROKS_DISTRIBUTION_VERSION", managedtools.COSInstanceCRNVariable},
 		}}
 		BeforeAll(lane.setUp)
 		It("creates a ROKS cluster with 1 zone x 2 workers from the managed-roks-single-zone flavor", lane.create)
@@ -238,6 +260,11 @@ type managedLaneInput struct {
 	Identity IdentityFixture
 	// MoveTargetIdentity provides the credentials on the clusterctl move target; nil for lanes without a move.
 	MoveTargetIdentity IdentityFixture
+	// RegistryBuckets is true for a lane whose clusters store their image registry in a bucket that IBM creates in the
+	// COS instance COS_INSTANCE_CRN (ROKS). Such a lane lists the instance's buckets before it creates anything and,
+	// once IBM answers 404 for its cluster, deletes that cluster's registry bucket (registryBucketCleanup), which the
+	// cluster's deletion keeps.
+	RegistryBuckets bool
 	// RequiredVariables must be set (non-empty) in the e2e config or the environment.
 	RequiredVariables []string
 }
@@ -278,6 +305,14 @@ type managedLane struct {
 	baseline      managedtools.Snapshot
 	baselineTaken bool
 
+	// bucketBaseline is the bucket listing of the COS instance taken before the lane created anything; only a lane
+	// with RegistryBuckets takes it (bucketBaselineTaken).
+	bucketBaseline      []managedtools.Bucket
+	bucketBaselineTaken bool
+	// runClusterIDs are the IBM IDs of the run's clusters, as the lane learnt them from the control plane's
+	// status.clusterID or from the IBM backstop; the registry bucket cleanup deletes only buckets named after them.
+	runClusterIDs []string
+
 	// janitor is E2E_MANAGED_JANITOR: whether setUp runs the janitor.
 	janitor bool
 	// leftoverScope is E2E_MANAGED_LEFTOVER_SCOPE; scope is built from it once the IBM clients exist.
@@ -299,6 +334,9 @@ type laneIBMClients struct {
 	// service is CAPIBM's own IBM Cloud Kubernetes Service client, for the 404 assertion and the move step's worker
 	// listings. It sends one request per call and never retries.
 	service kubernetesservice.KubernetesService
+	// buckets lists, empties and deletes buckets of the COS instance COS_INSTANCE_CRN for the registry bucket cleanup;
+	// nil for a lane without RegistryBuckets.
+	buckets *managedtools.BucketService
 	// resourceGroupID scopes every IBM call.
 	resourceGroupID string
 }
@@ -416,9 +454,11 @@ func (l *managedLane) setUp(specCtx SpecContext) {
 
 	// The cleanups are registered before anything is created, and each checks what exists, so that a set-up that
 	// fails half-way is cleaned up too. DeferCleanup runs them in reverse order: the CAPI deletion first, then the
-	// IBM backstop, then the inventory diff. Each is its own node with its own timeout, so an interrupted CAPI deletion
-	// still leaves time for the backstop.
+	// IBM backstop, then the registry bucket cleanup (a lane with RegistryBuckets only), then the inventory diff. Each
+	// is its own node with its own timeout, so an interrupted CAPI deletion still leaves time for the backstop, and a
+	// failed bucket cleanup does not keep the inventory diff from running.
 	DeferCleanup(l.finalCleanup, NodeTimeout(45*time.Minute))
+	DeferCleanup(l.registryBucketCleanup, NodeTimeout(registryBucketCleanupTimeout))
 	DeferCleanup(l.ibmBackstop, NodeTimeout(10*time.Minute))
 	DeferCleanup(l.capiCleanup, NodeTimeout(90*time.Minute))
 
@@ -444,8 +484,10 @@ func (l *managedLane) setUp(specCtx SpecContext) {
 }
 
 // validateVariables fails unless every required variable is set, the janitor switch and the leftover scope are valid,
-// the templates will ask IBM to delete the cluster's persistent storage with the cluster and, for the IKS lane, the
-// upgrade is one minor. It also reads the path through which the CI heartbeat reports a lost Boskos lease.
+// the templates will ask IBM to delete the cluster's persistent storage with the cluster, for a lane with
+// RegistryBuckets COS_INSTANCE_CRN is a COS instance CRN and the wait of the registry bucket cleanup leaves it
+// registryBucketDeletionBudget, and, for the IKS lane, the upgrade is one minor. It also reads the path through which
+// the CI heartbeat reports a lost Boskos lease.
 func (l *managedLane) validateVariables() {
 	var missing []string
 	for _, name := range l.input.RequiredVariables {
@@ -463,6 +505,14 @@ func (l *managedLane) validateVariables() {
 	Expect(managedtools.ValidateLanePersistentStorage(
 		e2eConfig.GetVariableOrEmpty(managedtools.PersistentStorageVariable))).To(Succeed())
 	l.leaseLostFile = e2eConfig.GetVariableOrEmpty(managedtools.LeaseLostFileVariable)
+	if l.input.RegistryBuckets {
+		Expect(managedtools.ValidateCOSInstanceCRN(e2eConfig.GetVariableOrEmpty(managedtools.COSInstanceCRNVariable))).
+			To(Succeed())
+		// The cleanup waits with the interval's full timeout and must still have time to delete the buckets after it.
+		Expect(managedtools.ValidateWaitWithinNodeTimeout(registryClusterGoneInterval,
+			l.configuredIntervals(registryClusterGoneInterval), registryBucketDeletionBudget,
+			registryBucketCleanupTimeout)).To(Succeed(), "the %s lane's registry bucket cleanup", l.input.Lane)
+	}
 	if l.input.Lane == managedtools.LaneIKS {
 		Expect(managedtools.ValidateUpgradeStep(e2eConfig.GetVariableOrEmpty(varIKSVersion),
 			e2eConfig.GetVariableOrEmpty(varIKSUpgradeTo))).To(Succeed())
@@ -506,6 +556,16 @@ func (l *managedLane) buildIBMClients() {
 		UserAgent:     managedtools.DefaultUserAgent,
 	})
 	Expect(err).NotTo(HaveOccurred())
+	if l.input.RegistryBuckets {
+		// The bucket listing answers on the endpoint of any location; the lanes' region is one that has an endpoint.
+		l.ibm.buckets, err = managedtools.NewBucketService(managedtools.BucketServiceOptions{
+			InstanceCRN:   e2eConfig.GetVariableOrEmpty(managedtools.COSInstanceCRNVariable),
+			ListLocation:  region,
+			Authenticator: auth,
+			HTTPClient:    options.HTTPClient,
+		})
+		Expect(err).NotTo(HaveOccurred())
+	}
 }
 
 // runJanitor deletes, by ID, the clusters of earlier runs that are older than managedtools.JanitorMinimumAge. A
@@ -552,12 +612,22 @@ func (l *managedLane) buildInventoryScope(ctx context.Context) {
 	Byf("Leftover check of the %s lane: %s", l.input.Lane, l.scope)
 }
 
-// takeBaseline takes the inventory snapshot that the final diff compares with.
+// takeBaseline takes the inventory snapshot that the final diff compares with and, for a lane with RegistryBuckets,
+// the bucket listing of the COS instance that the registry bucket cleanup compares with. A listing that fails stops
+// the lane here, before it creates a cluster whose registry bucket it could not clean up.
 func (l *managedLane) takeBaseline(ctx context.Context) {
 	var err error
 	l.baseline, err = l.snapshot(ctx)
 	Expect(err).NotTo(HaveOccurred())
 	l.baselineTaken = true
+	if l.ibm.buckets == nil {
+		return
+	}
+	l.bucketBaseline, err = l.ibm.buckets.ListBuckets(ctx)
+	Expect(err).NotTo(HaveOccurred(), "listing the buckets of the COS instance %s (%s); the API key needs at least the "+
+		"Writer role on it", e2eConfig.GetVariableOrEmpty(managedtools.COSInstanceCRNVariable), managedtools.COSInstanceCRNVariable)
+	l.bucketBaselineTaken = true
+	Byf("The COS instance holds %d buckets before the %s lane", len(l.bucketBaseline), l.input.Lane)
 }
 
 // snapshot takes an inventory snapshot and keeps only the resources of the lane's leftover scope. The baseline and the
@@ -1253,6 +1323,7 @@ func (l *managedLane) delete(specCtx SpecContext) {
 	Expect(err).NotTo(HaveOccurred())
 	clusterID := cp.Status.ClusterID
 	Expect(clusterID).NotTo(BeEmpty(), "status.clusterID before the deletion")
+	l.recordClusterID(clusterID)
 
 	framework.DeleteCluster(ctx, framework.DeleteClusterInput{Deleter: c, Cluster: l.cluster()})
 	framework.WaitForClusterDeleted(ctx, framework.WaitForClusterDeletedInput{
@@ -1288,6 +1359,9 @@ func (l *managedLane) capiCleanup(ctx SpecContext) {
 	if l.result != nil {
 		cluster = l.result.Cluster
 	}
+	if l.input.RegistryBuckets {
+		l.recordControlPlaneClusterIDs(ctx)
+	}
 	dumpSpecResourcesAndCleanup(ctx, cleanupInput{
 		SpecName:          l.input.SpecName,
 		Cluster:           cluster,
@@ -1321,10 +1395,109 @@ func (l *managedLane) ibmBackstop(ctx SpecContext) {
 	}
 	report, err := managedtools.DeleteRunClusters(ctx, l.ibm.clusters, []string{l.clusterName}, l.runStart, false)
 	Byf("IBM backstop for %s:\n%s", l.clusterName, report)
+	// The backstop's clusters carry the run's cluster name and were created after the run started, so they are the
+	// run's, even when CAPIBM never wrote their ID into a control plane; the registry bucket cleanup needs their IDs.
+	// A cluster the backstop skipped is not recorded: one that IBM is already deleting may be an earlier run's with
+	// the same E2E_RUN_ID, since the backstop checks the creation time only of the clusters it deletes.
+	for _, cluster := range slices.Concat(report.Deleted, report.AlreadyGone) {
+		l.recordClusterID(cluster.ID)
+	}
+	for _, failed := range report.Failed {
+		l.recordClusterID(failed.Cluster.ID)
+	}
 	Expect(err).NotTo(HaveOccurred(), "the IBM backstop could not delete the run's cluster")
 	if l.clusterDeleted {
 		Expect(report.Deleted).To(BeEmpty(), "the IBM cluster outlived the deletion of its CAPI Cluster")
 	}
+}
+
+// recordClusterID adds id to the run's cluster IDs, once. "" (a control plane without an IBM cluster yet) is skipped,
+// and so is a value that is not an IBM cluster ID, with a note in the log: the registry bucket cleanup would never
+// attribute a bucket to it.
+//
+// Parameters:
+//   - id is the IBM ID of a cluster of the run.
+func (l *managedLane) recordClusterID(id string) {
+	if id == "" || slices.Contains(l.runClusterIDs, id) {
+		return
+	}
+	if err := managedtools.ValidateClusterID(id); err != nil {
+		Byf("Not recording the run's cluster ID: %v", err)
+		return
+	}
+	l.runClusterIDs = append(l.runClusterIDs, id)
+}
+
+// recordControlPlaneClusterIDs records the status.clusterID of every IBMCloudManagedControlPlane in the lane's
+// namespace, on the management cluster that owns them now, before the CAPI deletion removes them: a step that failed
+// before the delete step leaves the cluster's ID only there. A failed read is logged and not fatal, because the CAPI
+// deletion must run anyway; a registry bucket whose cluster ID the lane missed is then never deleted, and the registry
+// bucket cleanup reports it as a leftover in the account scope and as not attributed to the run in the lane scope.
+//
+// Parameters:
+//   - ctx bounds the read.
+func (l *managedLane) recordControlPlaneClusterIDs(ctx context.Context) {
+	controlPlanes := &controlplanev1.IBMCloudManagedControlPlaneList{}
+	if err := managedClient(l.mgmt).List(ctx, controlPlanes, client.InNamespace(l.namespace.Name)); err != nil {
+		Byf("Could not read the IBM cluster IDs of namespace %s before its deletion: %v", l.namespace.Name, err)
+		return
+	}
+	for i := range controlPlanes.Items {
+		l.recordClusterID(controlPlanes.Items[i].Status.ClusterID)
+	}
+}
+
+// registryBucketCleanup deletes, for a lane with RegistryBuckets, the registry buckets that IBM created in the COS
+// instance COS_INSTANCE_CRN for the run's ROKS clusters, and fails the lane on every other new bucket of its leftover
+// scope, which it leaves untouched (managedtools.CleanUpRegistryBuckets); the lane scope only logs those. IBM keeps a
+// ROKS cluster's registry bucket when the cluster is deleted, unless the DELETE carries
+// deleteOpenShiftRegistryCOSBucket=true, which the IBM SDK that CAPIBM pins cannot send; so CAPIBM keeps the bucket,
+// and without this cleanup every ROKS run would leave one behind. This cleanup becomes unnecessary once CAPIBM can pass
+// that parameter.
+//
+// It first waits until IBM answers 404 for every cluster of the run (registryClusterGoneInterval): a cluster that still
+// exists may still write to its registry bucket, and its bucket stays until the cluster is gone. When CAPIBM did not
+// delete the cluster, the IBM backstop sends the DELETE just before, so the wait covers a whole ROKS deletion.
+func (l *managedLane) registryBucketCleanup(ctx SpecContext) {
+	if !l.bucketBaselineTaken {
+		return
+	}
+	instance := e2eConfig.GetVariableOrEmpty(managedtools.COSInstanceCRNVariable)
+	ids := slices.Clone(l.runClusterIDs)
+	prefixes := make([]string, 0, len(ids))
+	for _, id := range ids {
+		prefixes = append(prefixes, managedtools.RegistryBucketNamePrefix(id)+"...")
+	}
+	if skipCleanup {
+		Byf("Skipping the registry bucket cleanup (-e2e.skip-resource-cleanup): the registry buckets of clusters %v "+
+			"stay in COS instance %s; delete the buckets named %v by hand once IBM answers 404 for their clusters",
+			ids, instance, prefixes)
+		return
+	}
+	if len(ids) > 0 {
+		Byf("Waiting for IBM to answer 404 for the run's clusters %v before deleting their registry buckets", ids)
+		// One wait for all clusters, not one per cluster, so that registryBucketCleanupTimeout holds however many
+		// clusters the run had: they are deleted side by side, not one after the other.
+		eventually(ctx, func(g Gomega) {
+			for _, id := range ids {
+				_, err := l.ibm.service.GetCluster(ctx, id, l.ibm.resourceGroupID)
+				g.Expect(kubernetesservice.Classify(kubernetesservice.OpGetCluster, err)).To(
+					Equal(kubernetesservice.ClassNotFound), "IBM has not answered 404 for cluster %s (GetCluster: %v), "+
+						"so its registry bucket stays: once IBM does, delete the buckets named %s of COS instance %s "+
+						"by hand", id, err, managedtools.RegistryBucketNamePrefix(id)+"...", instance)
+			}
+		}, l.configuredIntervals(registryClusterGoneInterval)).Should(Succeed())
+	}
+	report, err := managedtools.CleanUpRegistryBuckets(ctx, l.ibm.buckets, managedtools.RegistryBucketCleanup{
+		Baseline:      l.bucketBaseline,
+		RunClusterIDs: ids,
+		Scope:         l.scope,
+		Attempts:      registryBucketAttempts,
+		Wait:          registryBucketRetryWait,
+	})
+	Byf("Registry bucket cleanup in COS instance %s for the run's clusters %v (%s scope):\n%s", instance, ids,
+		l.scope.Scope(), report)
+	Expect(err).NotTo(HaveOccurred(), "the registry bucket cleanup of the %s lane", l.input.Lane)
 }
 
 // finalCleanup compares the inventory with the baseline, within the lane's leftover scope, until the run left nothing

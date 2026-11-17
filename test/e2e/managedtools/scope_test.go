@@ -94,6 +94,9 @@ func TestParseLeftoverScope(t *testing.T) {
 			if tc.wantErr {
 				g.Expect(err).To(MatchError(And(ContainSubstring(LeftoverScopeVariable), ContainSubstring(`use "account"`),
 					ContainSubstring(`or "lane"`))))
+				// The scope also selects the buckets of the ROKS lane's check, so the message tells the operator so.
+				g.Expect(err).To(MatchError(And(ContainSubstring("every new bucket of "+COSInstanceCRNVariable),
+					ContainSubstring("registry buckets named roks-<ID of a cluster of the run>-"))))
 				return
 			}
 			g.Expect(err).NotTo(HaveOccurred())

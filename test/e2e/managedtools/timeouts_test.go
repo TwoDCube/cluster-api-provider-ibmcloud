@@ -71,3 +71,51 @@ func TestLimitTimeout(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateWaitWithinNodeTimeout(t *testing.T) {
+	const key = "wait-registry-cluster-gone"
+	testCases := []struct {
+		name        string
+		intervals   []interface{}
+		reserve     time.Duration
+		nodeTimeout time.Duration
+		wantErr     []string
+	}{
+		{name: "wait plus reserve fit with room", intervals: []interface{}{"20m", "30s"}, reserve: 15 * time.Minute,
+			nodeTimeout: 45 * time.Minute},
+		{name: "wait plus reserve fill the node timeout exactly", intervals: []interface{}{"30m", "30s"},
+			reserve: 15 * time.Minute, nodeTimeout: 45 * time.Minute},
+		{name: "time.Duration timeout", intervals: []interface{}{30 * time.Minute, 30 * time.Second},
+			reserve: 15 * time.Minute, nodeTimeout: 45 * time.Minute},
+		{name: "no reserve", intervals: []interface{}{"45m"}, nodeTimeout: 45 * time.Minute},
+		{name: "a longer wait leaves too little for the work after it", intervals: []interface{}{"31m", "30s"},
+			reserve: 15 * time.Minute, nodeTimeout: 45 * time.Minute,
+			wantErr: []string{"interval " + key + " waits up to 31m0s", "has 45m0s in all and keeps 15m0s",
+				"lower the interval's timeout in the e2e config to at most 30m0s"}},
+		{name: "a wait as long as the node timeout leaves nothing", intervals: []interface{}{"45m", "30s"},
+			reserve: time.Minute, nodeTimeout: 45 * time.Minute, wantErr: []string{"to at most 44m0s"}},
+		{name: "no interval", reserve: time.Minute, nodeTimeout: time.Hour,
+			wantErr: []string{"the e2e config has no " + key + " interval", "default/" + key}},
+		{name: "unparsable timeout", intervals: []interface{}{"half an hour"}, reserve: time.Minute,
+			nodeTimeout: time.Hour, wantErr: []string{"the timeout of interval " + key, `"half an hour" is not a duration`}},
+		{name: "zero timeout", intervals: []interface{}{"0s"}, reserve: time.Minute, nodeTimeout: time.Hour,
+			wantErr: []string{"0s is not a positive duration"}},
+		{name: "negative reserve", intervals: []interface{}{"10m"}, reserve: -time.Minute, nodeTimeout: time.Hour,
+			wantErr: []string{"must not be negative"}},
+		{name: "node timeout not longer than the reserve", intervals: []interface{}{"10m"}, reserve: time.Hour,
+			nodeTimeout: time.Hour, wantErr: []string{"needs a node timeout (1h0m0s) longer than the time it keeps"}},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			err := ValidateWaitWithinNodeTimeout(key, tc.intervals, tc.reserve, tc.nodeTimeout)
+			if len(tc.wantErr) == 0 {
+				g.Expect(err).NotTo(HaveOccurred())
+				return
+			}
+			for _, want := range tc.wantErr {
+				g.Expect(err).To(MatchError(ContainSubstring(want)))
+			}
+		})
+	}
+}

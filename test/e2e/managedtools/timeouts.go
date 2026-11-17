@@ -54,6 +54,38 @@ func LimitTimeout(intervals []interface{}, remaining time.Duration) ([]interface
 	return limited, nil
 }
 
+// ValidateWaitWithinNodeTimeout returns an error unless the timeout of an e2e config interval plus reserve fits into
+// nodeTimeout. A cleanup node waits with the interval's full timeout (the cleanups run after the lane's hard timeout,
+// so LimitTimeout does not lower it) and then still has work to do. Ginkgo ends the node at its NodeTimeout whatever
+// the wait's own timeout, so an interval tuned longer in the e2e config would silently take the time of that work, and
+// a wait that ends at the NodeTimeout leaves the work undone. The lanes check this before they create anything.
+//
+// Parameters:
+//   - key is the interval's name, for example "wait-registry-cluster-gone"; the error names it.
+//   - intervals is the E2EConfig.GetIntervals result for key: the Eventually timeout first, as for LimitTimeout.
+//   - reserve is the time the node needs after the wait; it must not be negative.
+//   - nodeTimeout is the node's NodeTimeout; it must be longer than reserve.
+func ValidateWaitWithinNodeTimeout(key string, intervals []interface{}, reserve, nodeTimeout time.Duration) error {
+	if reserve < 0 || nodeTimeout <= reserve {
+		return fmt.Errorf("the cleanup that waits with interval %s needs a node timeout (%s) longer than the time it "+
+			"keeps for the work after the wait (%s), and that time must not be negative", key, nodeTimeout, reserve)
+	}
+	if len(intervals) == 0 {
+		return fmt.Errorf("the e2e config has no %s interval: set <spec>/%s or default/%s to a timeout and a polling "+
+			`interval, for example ["30m", "30s"]`, key, key, key)
+	}
+	timeout, err := intervalDuration(intervals[0])
+	if err != nil {
+		return fmt.Errorf("the timeout of interval %s: %w", key, err)
+	}
+	if timeout+reserve > nodeTimeout {
+		return fmt.Errorf("interval %s waits up to %s, but its cleanup has %s in all and keeps %s for the work after "+
+			"the wait: lower the interval's timeout in the e2e config to at most %s, or raise the cleanup's node "+
+			"timeout with it", key, timeout, nodeTimeout, reserve, nodeTimeout-reserve)
+	}
+	return nil
+}
+
 // intervalDuration returns the positive duration of one interval element, as Gomega would read it.
 //
 // Parameters:

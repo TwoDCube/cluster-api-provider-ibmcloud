@@ -35,6 +35,16 @@ limitations under the License.
 //     the inventory diff cover every e2e cluster and VPC resource of the resource group, which is right for an account
 //     that holds one managed run at a time. With the janitor off and the lane scope, a lane answers only for its run's
 //     clusters and the VPC resources of its own VPC, so it can run next to other runs that use VPCs of their own.
+//   - The registry bucket check (buckets.go, cos.go): IBM creates a bucket in the COS instance of a ROKS cluster for
+//     its image registry and keeps it when the cluster is deleted, and the IBM SDK that CAPIBM pins cannot ask for its
+//     deletion. The ROKS lane lists the instance's buckets before it starts and, once its cluster is gone, deletes
+//     each new bucket named after that cluster, roks-<cluster ID>-<suffix>. That name form comes from IBM's procedure
+//     for a registry bucket created by hand; that the bucket IBM creates has it too is assumed. The lane never touches
+//     any other new bucket: the account scope fails the lane naming it, the lane scope only names it in the log. Should
+//     IBM name the registry bucket otherwise, the account scope therefore fails every ROKS run on the run's own
+//     registry bucket, and the lane scope leaves that bucket in the instance. The ownership rule and the diff are pure
+//     functions with table tests, and the COS client is tested against httptest servers that stand in for IBM's
+//     endpoints of several locations.
 //   - The disruption recorder (disruption.go) and the version helpers (versions.go): the pure parts of the
 //     PodDisruptionBudget probe and of the upgrade checks, so that the lanes only orchestrate.
 //   - The pinned check (pins.go): the worker-by-worker proof of a drain. A drain step pins a probe pod to every worker
@@ -58,5 +68,8 @@ limitations under the License.
 // identity fixture's credentials, the same credentials that created the run's clusters) and never read the
 // environment, a credentials file or a global authenticator. They are built on the IBM SDK packages that CAPIBM's own
 // clients wrap (kubernetesserviceapiv1 and vpcv1): the CAPIBM interfaces have no cluster list, VPE gateway list or
-// volume list, and their HTTP transport cannot be replaced from another package, which the httptest tests need.
+// volume list, and their HTTP transport cannot be replaced from another package, which the httptest tests need. The
+// COS client is built on the IBM COS SDK that CAPIBM's COS client wraps (pkg/cloud/services/cos), without its session,
+// which would read AWS_* variables and the ~/.aws files, and its requests carry the caller's authenticator's token
+// instead of an API key that the SDK would exchange itself.
 package managedtools
