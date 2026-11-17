@@ -1,23 +1,16 @@
-# clusterctl flavor managed-roks: a Red Hat OpenShift on IBM Cloud (ROKS) cluster on VPC Gen2 whose control plane IBM
-# manages, in IBM's HA topology of 3 zones x 2 workers per zone, in an existing VPC with one existing subnet per zone and
-# an existing Cloud Object Storage instance for the internal image registry. The provider must run with the
-# ManagedKubernetes feature gate (EXP_MANAGED_KUBERNETES=true). The IBM Cloud credentials are the controller's own;
-# this template has no credential variable. templates/README.md lists every variable. Pass --worker-machine-count=6 to
-# clusterctl generate cluster: without the flag or the variable it sets WORKER_MACHINE_COUNT to 0, which the default
-# of 6 below cannot override.
+# clusterctl flavor managed-roks: a Red Hat OpenShift on IBM Cloud (ROKS) cluster whose control plane IBM manages, in
+# IBM's HA topology of 3 zones x 2 workers per zone, in an existing VPC with one existing subnet per zone, with an
+# existing Cloud Object Storage instance for the internal image registry.
+# Pass --worker-machine-count=6 to clusterctl generate cluster; without it, clusterctl sets WORKER_MACHINE_COUNT to 0.
+# The provider needs the ManagedKubernetes feature gate. templates/README.md lists the variables, and the book explains
+# the rest: https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/index.html
 apiVersion: cluster.x-k8s.io/v1beta2
 kind: Cluster
 metadata:
   name: "${CLUSTER_NAME}"
 spec:
-  # clusterNetwork is omitted on purpose: IBM then picks the next free pod /18 in the VPC and its default service range.
-  # Custom pod and service ranges cannot be shared between clusters (IBM containers docs, vpc-subnets.md), so a fixed
-  # default here would make the second cluster from this template conflict. To choose ranges, add for example:
-  # clusterNetwork:
-  #   pods:
-  #     cidrBlocks: ["172.17.64.0/18"]     # or the size-only form "0.0.0.0/20"; at least /23
-  #   services:
-  #     cidrBlocks: ["172.22.0.0/16"]      # at least /24; unique per cluster
+  # clusterNetwork is omitted: IBM picks free pod and service ranges. To choose them, see
+  # https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/creating-a-cluster.html#pod-and-service-networks
   infrastructureRef:
     apiGroup: infrastructure.cluster.x-k8s.io
     kind: IBMCloudManagedCluster
@@ -39,10 +32,8 @@ spec:
     type: Reference
     reference:
       name: "${IBMCLOUD_VPC_NAME}"
-  # IBM's HA topology: three zones of the region, one existing subnet in each ("Plan to have at least two worker nodes
-  # per zone, so six nodes across three zones in total", IBM docs strategy.md, 2026-11-05). Zones can be added later,
-  # never removed. For one zone (development and tests, not HA) use the managed-iks-single-zone or
-  # managed-roks-single-zone flavor.
+  # IBM's HA topology: three zones, one existing subnet in each. Zones can be added later, never removed; see
+  # https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/topology.html
   zones:
   - name: "${IBMCLOUD_ZONE_1}"
     subnet:
@@ -60,13 +51,13 @@ metadata:
   name: "${CLUSTER_NAME}-control-plane"
 spec:
   distribution: OpenShift
-  distributionVersion: "${ROKS_DISTRIBUTION_VERSION:=4.21}"  # MAJOR.MINOR only
+  distributionVersion: "${ROKS_DISTRIBUTION_VERSION:=4.21}"  # MAJOR.MINOR only; IBM applies the newest patch
   openShift:
     imageRegistry:
-      cos:                                    # required: IBM rejects a ROKS VPC create without it (E7278)
+      cos:                                    # required: IBM rejects a ROKS cluster on VPC without it
         instanceCRN: "${COS_INSTANCE_CRN}"
-  # Named after the Cluster (admission warning about account-wide uniqueness). To choose a name:
-  # ibmCloudClusterName: my-roks-cluster      # immutable
+  # The IBM cluster is named after the Cluster, with an admission warning. To choose the name, see
+  # https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/creating-a-cluster.html#naming-the-ibm-cluster
 ---
 apiVersion: cluster.x-k8s.io/v1beta2
 kind: MachinePool
@@ -74,24 +65,16 @@ metadata:
   name: "${CLUSTER_NAME}-default"
 spec:
   clusterName: "${CLUSTER_NAME}"
-  # Total across zones; a multiple of the zone count. 6 = 2 workers in each of the 3 zones, IBM's HA topology: "Plan to
-  # have at least two worker nodes per zone, so six nodes across three zones in total", and full coverage under IBM's
-  # HA SLA needs "at least 6 worker nodes, two worker nodes per zone" (IBM docs, openshift strategy.md, 2026-11-05);
-  # "Ingress requires at least two worker nodes per zone" (ts-ingress-alb-pods-nodes.md, 2026-04-06). CAPIBM requires
-  # at least 2 ROKS workers per zone at create (whether IBM counts 2 per zone or in total is not yet verified against
-  # IBM Cloud), so 6 is also the smallest value this three-zone flavor accepts at create; fewer ROKS workers mean fewer
-  # zones, i.e. the managed-roks-single-zone flavor.
+  # Workers in total, a multiple of the zone count: 6 = 2 per zone, IBM's HA topology and the ROKS minimum for
+  # three zones. See https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/topology.html
   replicas: ${WORKER_MACHINE_COUNT:=6}
   template:
     spec:
       clusterName: "${CLUSTER_NAME}"
       bootstrap:
         dataSecretName: ""
-      # Drain knobs (CAPI-native; read by CAPIBM before every worker removal). Unset = wait as long as PDBs require.
-      # deletion:
-      #   nodeDrainTimeoutSeconds: 3600
-      #   nodeVolumeDetachTimeoutSeconds: 600
-      # minReadySeconds: 60                  # replacement soak before the next worker is touched
+      # Drain time limits and the replacement soak are Cluster API fields here (deletion, minReadySeconds); see
+      # https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/worker-pools.html#drain-settings
       infrastructureRef:
         apiGroup: infrastructure.cluster.x-k8s.io
         kind: IBMCloudManagedMachinePool
@@ -102,18 +85,18 @@ kind: IBMCloudManagedMachinePool
 metadata:
   name: "${CLUSTER_NAME}-default"
 spec:
-  poolName: default                           # the IBM pool name; IBM accepts any valid name
-  # The initial pool: IBM creates it together with the cluster (exactly one pool of the Cluster says so; others omit
-  # it or say AfterCluster).
-  creation: WithCluster
+  poolName: default                           # the IBM pool name; any name works
+  creation: WithCluster                       # the initial pool, created together with the IBM cluster
   flavor: "${IBMCLOUD_WORKER_FLAVOR:=bx2.4x16}"  # ROKS needs at least 4 vCPU and 16 GB
-  # The same three zones; immutable. Give the initial ROKS pool every zone the cluster will ever use: IBM does
-  # not extend the router load balancer to zones added later.
+  # Immutable; give the initial ROKS pool every zone the cluster will ever use. See
+  # https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/topology.html#zones-are-chosen-at-create-time
   zones:
   - name: "${IBMCLOUD_ZONE_1}"
   - name: "${IBMCLOUD_ZONE_2}"
   - name: "${IBMCLOUD_ZONE_3}"
   workerUpdates:
-    policy: "${WORKER_UPDATE_POLICY:=Manual}"  # Manual: fix packs roll only after rollout.after; Automatic: as IBM offers them
-  # rollout:
-  #   after: "2026-11-20T09:00:00Z"           # replace every worker whose Node is older, one at a time, drained
+    # Manual: worker fix packs roll only after spec.rollout.after; Automatic: as soon as IBM offers them. See
+    # https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/upgrades.html#worker-fix-packs-and-the-update-policy
+    policy: "${WORKER_UPDATE_POLICY:=Manual}"
+  # To replace every worker on request, set spec.rollout.after; see
+  # https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/upgrades.html#rolling-workers-on-request-specrolloutafter

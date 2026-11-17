@@ -1,24 +1,16 @@
-# clusterctl flavor managed-iks-single-zone: an IBM Cloud Kubernetes Service (IKS) cluster on VPC Gen2 whose control
-# plane IBM manages, with 2 workers in one zone, for development and tests. NOT HA: a zone outage stops every worker,
-# and IBM may report the ingress as warning or critical (expected and informational; CAPIBM ignores it). Use the
-# managed-iks flavor for IBM's HA topology. It reads the first zone and subnet variables of managed-iks, so one set of
-# variables serves all managed flavors. The provider must run with the ManagedKubernetes feature gate
-# (EXP_MANAGED_KUBERNETES=true). The IBM Cloud credentials are the controller's own; this template has no credential
-# variable. templates/README.md lists every variable. Pass --worker-machine-count=2 to clusterctl generate cluster:
-# without the flag or the variable it sets WORKER_MACHINE_COUNT to 0, which the default of 2 below cannot override.
+# clusterctl flavor managed-iks-single-zone: an IBM Cloud Kubernetes Service (IKS) cluster whose control plane IBM
+# manages, with 2 workers in one zone, for development and tests. NOT HA; managed-iks is IBM's HA topology. It reads
+# the first zone and subnet variables of managed-iks.
+# Pass --worker-machine-count=2 to clusterctl generate cluster; without it, clusterctl sets WORKER_MACHINE_COUNT to 0.
+# The provider needs the ManagedKubernetes feature gate. templates/README.md lists the variables, and the book explains
+# the rest: https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/index.html
 apiVersion: cluster.x-k8s.io/v1beta2
 kind: Cluster
 metadata:
   name: "${CLUSTER_NAME}"
 spec:
-  # clusterNetwork is omitted on purpose: IBM then picks the next free pod /18 in the VPC and its default service range.
-  # Custom pod and service ranges cannot be shared between clusters (IBM containers docs, vpc-subnets.md), so a fixed
-  # default here would make the second cluster from this template conflict. To choose ranges, add for example:
-  # clusterNetwork:
-  #   pods:
-  #     cidrBlocks: ["172.17.64.0/18"]     # or the size-only form "0.0.0.0/20"; at least /23
-  #   services:
-  #     cidrBlocks: ["172.22.0.0/16"]      # at least /24; unique per cluster
+  # clusterNetwork is omitted: IBM picks free pod and service ranges. To choose them, see
+  # https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/creating-a-cluster.html#pod-and-service-networks
   infrastructureRef:
     apiGroup: infrastructure.cluster.x-k8s.io
     kind: IBMCloudManagedCluster
@@ -40,9 +32,8 @@ spec:
     type: Reference
     reference:
       name: "${IBMCLOUD_VPC_NAME}"
-  # Single zone, for development and tests: NOT HA. A zone outage stops every worker, and IBM may report the ingress
-  # as warning or critical (informational, CAPIBM ignores it). Use the managed-iks or managed-roks flavor for IBM's HA
-  # topology.
+  # One zone, for development and tests: NOT HA. Zones can be added later, never removed; see
+  # https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/topology.html#smaller-topologies-are-not-ha
   zones:
   - name: "${IBMCLOUD_ZONE_1}"
     subnet:
@@ -55,9 +46,8 @@ metadata:
 spec:
   distribution: Kubernetes
   distributionVersion: "${IKS_DISTRIBUTION_VERSION:=1.36}"   # MAJOR.MINOR only; IBM applies the newest patch
-  # The IBM cluster is named after the Cluster. IBM cluster names are unique per account, so the API server returns an
-  # admission warning about other namespaces or management clusters using the same name. To choose a name:
-  # ibmCloudClusterName: my-iks-cluster       # immutable
+  # The IBM cluster is named after the Cluster, with an admission warning. To choose the name, see
+  # https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/creating-a-cluster.html#naming-the-ibm-cluster
 ---
 apiVersion: cluster.x-k8s.io/v1beta2
 kind: MachinePool
@@ -65,20 +55,16 @@ metadata:
   name: "${CLUSTER_NAME}-default"
 spec:
   clusterName: "${CLUSTER_NAME}"
-  # 2 workers in the one zone: IBM's minimum for Ingress per zone (ts-ingress-alb-pods-nodes.md) and enough for an IKS
-  # rollout to pass the capacity gate (IKS's minimum of 1 ready worker remains while the other is replaced). 1 is
-  # possible and can never roll a worker.
+  # 2 workers in the one zone: 1 is possible but can never replace a worker. See
+  # https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/topology.html#smaller-topologies-are-not-ha
   replicas: ${WORKER_MACHINE_COUNT:=2}
   template:
     spec:
       clusterName: "${CLUSTER_NAME}"
       bootstrap:
         dataSecretName: ""
-      # Drain knobs (CAPI-native; read by CAPIBM before every worker removal). Unset = wait as long as PDBs require.
-      # deletion:
-      #   nodeDrainTimeoutSeconds: 3600
-      #   nodeVolumeDetachTimeoutSeconds: 600
-      # minReadySeconds: 60                  # replacement soak before the next worker is touched
+      # Drain time limits and the replacement soak are Cluster API fields here (deletion, minReadySeconds); see
+      # https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/worker-pools.html#drain-settings
       infrastructureRef:
         apiGroup: infrastructure.cluster.x-k8s.io
         kind: IBMCloudManagedMachinePool
@@ -89,13 +75,16 @@ kind: IBMCloudManagedMachinePool
 metadata:
   name: "${CLUSTER_NAME}-default"
 spec:
-  poolName: default                           # the IBM pool name; IBM accepts any valid name
+  poolName: default                           # the IBM pool name; any name works
   creation: WithCluster                       # the initial pool, created together with the IBM cluster
   flavor: "${IBMCLOUD_WORKER_FLAVOR:=cx2.2x4}"
-  # Immutable; more zones later: add them to the IBMCloudManagedCluster, then create a new pool there.
+  # Immutable; for more zones, add them to the IBMCloudManagedCluster and create a new pool there. See
+  # https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/topology.html#zones-are-chosen-at-create-time
   zones:
   - name: "${IBMCLOUD_ZONE_1}"
   workerUpdates:
-    policy: "${WORKER_UPDATE_POLICY:=Manual}"  # Manual: fix packs roll only after rollout.after; Automatic: as IBM offers them
-  # rollout:
-  #   after: "2026-11-20T09:00:00Z"           # replace every worker whose Node is older, one at a time, drained
+    # Manual: worker fix packs roll only after spec.rollout.after; Automatic: as soon as IBM offers them. See
+    # https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/upgrades.html#worker-fix-packs-and-the-update-policy
+    policy: "${WORKER_UPDATE_POLICY:=Manual}"
+  # To replace every worker on request, set spec.rollout.after; see
+  # https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/upgrades.html#rolling-workers-on-request-specrolloutafter

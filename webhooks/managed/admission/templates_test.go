@@ -236,17 +236,304 @@ func TestManagedTemplates(t *testing.T) {
 	})
 }
 
-// readManagedTemplate returns the rendered template file of flavor, as clusterctl downloads it from a release.
+// sharedManagedTemplateDocument is a document that several managed flavor templates carry byte for byte. The
+// templates are hand-written files, so no generator keeps the copies equal; TestManagedTemplatesShareDocuments does.
+type sharedManagedTemplateDocument struct {
+	// name is the subtest name.
+	name string
+	// kind is the document's top-level kind; a template holds each shared kind in exactly one document.
+	kind string
+	// flavors are the flavors whose templates carry the document; the first one holds the reference copy.
+	flavors []string
+}
+
+// sharedManagedTemplateDocuments are the documents the four flavors share: the Cluster in all of them, the
+// IBMCloudManagedCluster in the two three-zone (HA) flavors and in the two single-zone flavors, and the control plane
+// in the two IKS and in the two ROKS flavors. The two pool documents differ in every flavor (replicas, worker flavor,
+// zones), so they are not listed. templates/README.md shows the same table to the people who edit the templates.
+var sharedManagedTemplateDocuments = []sharedManagedTemplateDocument{
+	{
+		name: "Cluster_in_every_flavor", kind: "Cluster",
+		flavors: []string{"managed-iks", "managed-roks", "managed-iks-single-zone", "managed-roks-single-zone"},
+	},
+	{
+		name: "IBMCloudManagedCluster_in_the_HA_flavors", kind: "IBMCloudManagedCluster",
+		flavors: []string{"managed-iks", "managed-roks"},
+	},
+	{
+		name: "IBMCloudManagedCluster_in_the_single-zone_flavors", kind: "IBMCloudManagedCluster",
+		flavors: []string{"managed-iks-single-zone", "managed-roks-single-zone"},
+	},
+	{
+		name: "IBMCloudManagedControlPlane_in_the_IKS_flavors", kind: "IBMCloudManagedControlPlane",
+		flavors: []string{"managed-iks", "managed-iks-single-zone"},
+	},
+	{
+		name: "IBMCloudManagedControlPlane_in_the_ROKS_flavors", kind: "IBMCloudManagedControlPlane",
+		flavors: []string{"managed-roks", "managed-roks-single-zone"},
+	},
+}
+
+// TestManagedTemplatesShareDocuments checks that every document of sharedManagedTemplateDocuments is byte-identical,
+// comments included, in the templates of the flavors that share it, so that an edit to one copy cannot miss the
+// others. A failure names the flavors and the first line that differs, with its line number in both template files.
+func TestManagedTemplatesShareDocuments(t *testing.T) {
+	for _, shared := range sharedManagedTemplateDocuments {
+		t.Run(shared.name, func(t *testing.T) {
+			g := NewWithT(t)
+			copies := make([]templateDocument, 0, len(shared.flavors))
+			for _, flavor := range shared.flavors {
+				document, err := findTemplateDocument(flavor, readManagedTemplate(t, flavor), shared.kind)
+				g.Expect(err).NotTo(HaveOccurred())
+				copies = append(copies, document)
+			}
+			g.Expect(sharedDocumentMismatch(shared.kind, copies)).To(BeEmpty())
+		})
+	}
+}
+
+// TestFindTemplateDocument checks how the shared-document check cuts a template into documents: the header comment
+// is not part of the first document, line numbers count from the top of the file, only an unindented kind line
+// selects a document, and a missing or repeated kind is an error.
+func TestFindTemplateDocument(t *testing.T) {
+	raw := []byte(strings.Join([]string{
+		"# clusterctl flavor test: the header comment", // line 1
+		"# names the flavor",                           // line 2
+		"apiVersion: cluster.x-k8s.io/v1beta2",         // line 3
+		"kind: Cluster",                                // line 4
+		"spec:",                                        // line 5
+		"  infrastructureRef:",                         // line 6
+		"    kind: Pool",                               // line 7
+		"---",                                          // line 8
+		"# a comment of the second document",           // line 9
+		"kind: Pool",                                   // line 10
+		"---",                                          // line 11
+		"kind: Repeated",                               // line 12
+		"---",                                          // line 13
+		"kind: Repeated",                               // line 14
+	}, "\n") + "\n")
+	tests := []struct {
+		name      string
+		kind      string
+		wantLines []string
+		wantFirst int
+		wantErr   string
+	}{
+		{
+			name: "first_document_without_the_header", kind: "Cluster",
+			wantLines: []string{"apiVersion: cluster.x-k8s.io/v1beta2", "kind: Cluster", "spec:", "  infrastructureRef:", "    kind: Pool"},
+			wantFirst: 3,
+		},
+		{
+			name: "later_document_with_its_own_comment_not_the_indented_reference", kind: "Pool",
+			wantLines: []string{"# a comment of the second document", "kind: Pool"},
+			wantFirst: 9,
+		},
+		{
+			name: "missing_kind", kind: "Absent",
+			wantErr: `templates/cluster-template-test.yaml has no document with the top-level line "kind: Absent"`,
+		},
+		{
+			name: "repeated_kind", kind: "Repeated",
+			wantErr: `templates/cluster-template-test.yaml has 2 documents with the top-level line "kind: Repeated"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			document, err := findTemplateDocument("test", raw, tt.kind)
+			if tt.wantErr != "" {
+				g.Expect(err).To(MatchError(ContainSubstring(tt.wantErr)))
+				return
+			}
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(document).To(Equal(templateDocument{flavor: "test", lines: tt.wantLines, firstLine: tt.wantFirst}))
+		})
+	}
+}
+
+// TestSharedDocumentMismatch checks the comparison behind TestManagedTemplatesShareDocuments: identical copies pass,
+// and a copy with an added, changed or missing line fails with a message that names the flavors that share the
+// document and the first differing line, with its line number, in both template files.
+func TestSharedDocumentMismatch(t *testing.T) {
+	reference := []string{"apiVersion: cluster.x-k8s.io/v1beta2", "kind: Cluster", "spec:", "  infrastructureRef:"}
+	paused := []string{"apiVersion: cluster.x-k8s.io/v1beta2", "kind: Cluster", "spec:", "  paused: true", "  infrastructureRef:"}
+	trailingSpace := []string{"apiVersion: cluster.x-k8s.io/v1beta2", "kind: Cluster", "spec: ", "  infrastructureRef:"}
+	document := func(flavor string, firstLine int, lines []string) templateDocument {
+		return templateDocument{flavor: flavor, lines: lines, firstLine: firstLine}
+	}
+	tests := []struct {
+		name   string
+		copies []templateDocument
+		// want are the parts the message must contain; none means the copies must pass.
+		want []string
+	}{
+		{
+			name:   "identical_copies_at_different_lines",
+			copies: []templateDocument{document("managed-iks", 6, reference), document("managed-roks", 8, reference), document("managed-iks-single-zone", 9, reference)},
+		},
+		{
+			name:   "a_single_copy",
+			copies: []templateDocument{document("managed-iks", 6, reference)},
+		},
+		{
+			name:   "a_line_added_to_one_copy",
+			copies: []templateDocument{document("managed-iks", 6, reference), document("managed-roks", 8, paused)},
+			want: []string{`the Cluster document must be byte-identical in the templates of managed-iks, managed-roks, ` +
+				`which share it, but templates/cluster-template-managed-iks.yaml line 9 is "  infrastructureRef:" where ` +
+				`templates/cluster-template-managed-roks.yaml line 11 is "  paused: true"; make the same edit in every ` +
+				`one of these templates`},
+		},
+		{
+			name: "the_third_copy_differs",
+			copies: []templateDocument{
+				document("managed-iks", 6, reference), document("managed-roks", 8, reference), document("managed-iks-single-zone", 9, paused),
+			},
+			want: []string{
+				"templates of managed-iks, managed-roks, managed-iks-single-zone, which share it",
+				`templates/cluster-template-managed-iks-single-zone.yaml line 12 is "  paused: true"`,
+			},
+		},
+		{
+			name:   "trailing_whitespace_counts",
+			copies: []templateDocument{document("managed-iks", 6, reference), document("managed-roks", 8, trailingSpace)},
+			want: []string{
+				`templates/cluster-template-managed-iks.yaml line 8 is "spec:"`,
+				`templates/cluster-template-managed-roks.yaml line 10 is "spec: "`,
+			},
+		},
+		{
+			name:   "one_copy_ends_early",
+			copies: []templateDocument{document("managed-iks", 6, reference), document("managed-roks", 8, reference[:3])},
+			want: []string{
+				`templates/cluster-template-managed-iks.yaml line 9 is "  infrastructureRef:"`,
+				"templates/cluster-template-managed-roks.yaml line 11 is the end of the document",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			message := sharedDocumentMismatch("Cluster", tt.copies)
+			if len(tt.want) == 0 {
+				g.Expect(message).To(BeEmpty())
+				return
+			}
+			for _, part := range tt.want {
+				g.Expect(message).To(ContainSubstring(part))
+			}
+		})
+	}
+}
+
+// templateDocument is one YAML document of a managed flavor template, as lines of text.
+type templateDocument struct {
+	// flavor is the flavor whose template holds the document.
+	flavor string
+	// lines are the document's lines without the "---" separators. The first document of a template starts after the
+	// header comment, which names the flavor and so differs between flavors.
+	lines []string
+	// firstLine is the line number in the template file, counted from 1, of lines[0].
+	firstLine int
+}
+
+// findTemplateDocument returns the one document of a template whose top-level kind is kind. It works on the text, not
+// on parsed YAML, because the shared documents must match byte for byte: comments and quotes count.
+//
+// flavor names the template in the result and in errors; raw is the template file; kind is the kind to find, matched
+// as the unindented line "kind: <kind>" so that the kind of a reference inside a spec does not count.
+func findTemplateDocument(flavor string, raw []byte, kind string) (templateDocument, error) {
+	lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+	kindLine := "kind: " + kind
+	// The header comment is the run of comment lines at the top of the file.
+	start := 0
+	for start < len(lines) && strings.HasPrefix(lines[start], "#") {
+		start++
+	}
+	found := []templateDocument{}
+	for start <= len(lines) {
+		end := start
+		for end < len(lines) && lines[end] != "---" {
+			end++
+		}
+		if slices.Contains(lines[start:end], kindLine) {
+			found = append(found, templateDocument{flavor: flavor, lines: lines[start:end], firstLine: start + 1})
+		}
+		start = end + 1
+	}
+	switch len(found) {
+	case 1:
+		return found[0], nil
+	case 0:
+		return templateDocument{}, fmt.Errorf("templates/%s has no document with the top-level line %q",
+			managedTemplateFile(flavor), kindLine)
+	default:
+		return templateDocument{}, fmt.Errorf("templates/%s has %d documents with the top-level line %q; a template "+
+			"holds each shared kind once", managedTemplateFile(flavor), len(found), kindLine)
+	}
+}
+
+// sharedDocumentMismatch compares every copy of a shared document with the first one and returns "" when all are
+// identical. Otherwise it describes the first copy that differs: the flavors that share the document, and the first
+// differing line with its line number in both template files.
+//
+// kind is the document's kind, for the message; copies are the document as each flavor's template holds it.
+func sharedDocumentMismatch(kind string, copies []templateDocument) string {
+	if len(copies) < 2 {
+		return ""
+	}
+	flavors := make([]string, 0, len(copies))
+	for _, c := range copies {
+		flavors = append(flavors, c.flavor)
+	}
+	want := copies[0]
+	for _, got := range copies[1:] {
+		i := 0
+		for i < len(want.lines) && i < len(got.lines) && want.lines[i] == got.lines[i] {
+			i++
+		}
+		if i == len(want.lines) && i == len(got.lines) {
+			continue
+		}
+		return fmt.Sprintf("the %s document must be byte-identical in the templates of %s, which share it, but "+
+			"templates/%s line %d is %s where templates/%s line %d is %s; make the same edit in every one of these "+
+			"templates", kind, strings.Join(flavors, ", "),
+			managedTemplateFile(want.flavor), want.firstLine+i, documentLine(want.lines, i),
+			managedTemplateFile(got.flavor), got.firstLine+i, documentLine(got.lines, i))
+	}
+	return ""
+}
+
+// documentLine quotes the line at index i of a document for a mismatch message, or says that the document ends
+// before it.
+//
+// lines are the document's lines; i is the index of the first differing line.
+func documentLine(lines []string, i int) string {
+	if i >= len(lines) {
+		return "the end of the document"
+	}
+	return strconv.Quote(lines[i])
+}
+
+// readManagedTemplate returns the template file of flavor, as clusterctl downloads it from a release.
 //
 // t is the test; flavor is the clusterctl flavor name.
 func readManagedTemplate(t *testing.T, flavor string) []byte {
 	t.Helper()
-	path := filepath.Join(managedTemplatesDir, "cluster-template-"+flavor+".yaml")
+	path := filepath.Join(managedTemplatesDir, managedTemplateFile(flavor))
 	raw, err := os.ReadFile(path) //nolint:gosec // a fixed path inside the repository
 	if err != nil {
-		t.Fatalf("cannot read %s: %v; run make generate-templates", path, err)
+		t.Fatalf("cannot read %s: %v; the managed flavor templates are hand-written files in the repository's "+
+			"templates directory, one per flavor", path, err)
 	}
 	return raw
+}
+
+// managedTemplateFile returns the file name of the template of flavor in the templates directory.
+//
+// flavor is the clusterctl flavor name.
+func managedTemplateFile(flavor string) string {
+	return "cluster-template-" + flavor + ".yaml"
 }
 
 // expectManagedTemplateHeader checks the leading comment block of a template: it names the flavor, the single-zone

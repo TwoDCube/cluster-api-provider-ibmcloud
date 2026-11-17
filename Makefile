@@ -209,20 +209,6 @@ generate-templates: $(KUSTOMIZE) ## Generate cluster templates
 	$(KUSTOMIZE) build $(TEMPLATES_DIR)/cluster-template-powervs --load-restrictor LoadRestrictionsNone > $(TEMPLATES_DIR)/cluster-template-powervs.yaml
 	$(KUSTOMIZE) build $(TEMPLATES_DIR)/cluster-template-powervs-clusterclass --load-restrictor LoadRestrictionsNone > $(TEMPLATES_DIR)/cluster-template-powervs-clusterclass.yaml
 	$(KUSTOMIZE) build $(TEMPLATES_DIR)/cluster-template-vpc-clusterclass --load-restrictor LoadRestrictionsNone > $(TEMPLATES_DIR)/cluster-template-vpc-clusterclass.yaml
-# The managed (IKS and ROKS) flavors are concatenated from their parts, not built with kustomize: kustomize build drops
-# YAML comments and quotes, and these templates need both (templates/README.md, "IBM Cloud managed Kubernetes").
-	cd $(TEMPLATES_DIR) && cat cluster-template-managed-iks/header.yaml cluster-template-managed-iks/cluster.yaml \
-		cluster-template-managed-iks/ibmcloudmanagedcluster.yaml cluster-template-managed-iks/controlplane.yaml \
-		cluster-template-managed-iks/machinepool.yaml > cluster-template-managed-iks.yaml
-	cd $(TEMPLATES_DIR) && cat cluster-template-managed-roks/header.yaml cluster-template-managed-iks/cluster.yaml \
-		cluster-template-managed-iks/ibmcloudmanagedcluster.yaml cluster-template-managed-roks/controlplane.yaml \
-		cluster-template-managed-roks/machinepool.yaml > cluster-template-managed-roks.yaml
-	cd $(TEMPLATES_DIR) && cat cluster-template-managed-iks-single-zone/header.yaml cluster-template-managed-iks/cluster.yaml \
-		cluster-template-managed-iks-single-zone/ibmcloudmanagedcluster.yaml cluster-template-managed-iks/controlplane.yaml \
-		cluster-template-managed-iks-single-zone/machinepool.yaml > cluster-template-managed-iks-single-zone.yaml
-	cd $(TEMPLATES_DIR) && cat cluster-template-managed-roks-single-zone/header.yaml cluster-template-managed-iks/cluster.yaml \
-		cluster-template-managed-iks-single-zone/ibmcloudmanagedcluster.yaml cluster-template-managed-roks/controlplane.yaml \
-		cluster-template-managed-roks-single-zone/machinepool.yaml > cluster-template-managed-roks-single-zone.yaml
 	
 .PHONY: generate-e2e-templates
 generate-e2e-templates: $(KUSTOMIZE) ## Generate E2E cluster templates

@@ -150,8 +150,26 @@ same variables: `managed-roks` those of `managed-iks` plus `COS_INSTANCE_CRN`, `
   plane returns an admission warning: IBM cluster names are unique per account, while Cluster names are unique only per
   namespace. To choose a name, set `spec.ibmCloudClusterName` (immutable) in the generated control plane.
 * No template sets `spec.clusterNetwork`: IBM then picks free pod and service ranges. Custom ranges cannot be shared
-  between clusters; the Cluster object of each template shows how to set them.
+  between clusters; the book page
+  [Creating a cluster](../docs/book/src/topics/managed/creating-a-cluster.md#pod-and-service-networks) shows how to set
+  them.
 * Keep the quotes when editing a generated cluster: an unquoted `distributionVersion: 1.30` is the YAML number 1.3,
-  which the API server rejects, and an unquoted Cloud Object Storage CRN ends in `::`, which is not valid YAML. This is
-  also why `make generate-templates` concatenates these templates from the parts in their directories instead of
-  building them with kustomize, which drops quotes and comments.
+  which the API server rejects, and an unquoted Cloud Object Storage CRN ends in `::`, which is not valid YAML.
+
+### How these templates are built
+
+The four `cluster-template-managed-*.yaml` files are hand-written, like `cluster-template-vpc-with-network-spec.yaml`,
+and `make generate-templates` does not touch them: a kustomize build would drop the quotes above. Their comments only
+point to the pages of the book ([docs/book/src/topics/managed](../docs/book/src/topics/managed)), which explain the
+settings.
+
+Several flavors carry the same document, and every copy must stay byte-identical, comments included:
+
+| Document | Flavors that share it |
+|---|---|
+| `Cluster` | all four |
+| `IBMCloudManagedCluster` | `managed-iks` and `managed-roks` (three zones); `managed-iks-single-zone` and `managed-roks-single-zone` (one zone) |
+| `IBMCloudManagedControlPlane` | `managed-iks` and `managed-iks-single-zone`; `managed-roks` and `managed-roks-single-zone` |
+
+Make an edit to a shared document in every flavor that has it: `TestManagedTemplatesShareDocuments` in
+`webhooks/managed/admission/templates_test.go` fails otherwise and names the flavors and the first line that differs.

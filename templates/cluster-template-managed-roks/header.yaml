@@ -1,7 +1,0 @@
-# clusterctl flavor managed-roks: a Red Hat OpenShift on IBM Cloud (ROKS) cluster on VPC Gen2 whose control plane IBM
-# manages, in IBM's HA topology of 3 zones x 2 workers per zone, in an existing VPC with one existing subnet per zone and
-# an existing Cloud Object Storage instance for the internal image registry. The provider must run with the
-# ManagedKubernetes feature gate (EXP_MANAGED_KUBERNETES=true). The IBM Cloud credentials are the controller's own;
-# this template has no credential variable. templates/README.md lists every variable. Pass --worker-machine-count=6 to
-# clusterctl generate cluster: without the flag or the variable it sets WORKER_MACHINE_COUNT to 0, which the default
-# of 6 below cannot override.
