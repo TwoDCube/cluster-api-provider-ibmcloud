@@ -49,8 +49,10 @@ capibmadm=$(pwd)/bin/capibmadm
 trap cleanup EXIT
 
 cleanup(){
+    local status=$?
     # stop the boskos heartbeat
     [[ -z ${HEART_BEAT_PID:-} ]] || kill -9 "${HEART_BEAT_PID}" || true
+    report_lost_managed_lease "${status}" "${E2E_MANAGED_LEASE_LOST_FILE:-}"
 }
 
 retry() {
@@ -166,18 +168,6 @@ validate_managed_flavor(){
     esac
 }
 
-# heartbeat_managed_lease keeps the Boskos lease of a managed run alive until the script ends; the EXIT trap (cleanup)
-# kills it. heartbeat_account (boskos.sh) stops after 120 updates, one a minute, but a managed run lasts up to
-# GINKGO_TIMEOUT plus the lanes' cleanups. A lease that is no longer refreshed is reclaimed by the Boskos reaper and
-# can be handed to a second job while this run still owns clusters in the e2e account and VPC; the second run's
-# inventory diff and janitor rely on one managed run at a time (test/e2e/managedtools/janitor.go JanitorMinimumAge).
-# The loop restarts heartbeat_account whenever it returns; a refused update exits the background shell, as before.
-heartbeat_managed_lease(){
-    while true; do
-        heartbeat_account
-    done
-}
-
 prerequisites_managed(){
     # Managed Kubernetes (IKS and ROKS) lanes: test/e2e/managed_test.go with test/e2e/config/ibmcloud-e2e-managed.yaml.
     # The e2e VPC is an existing VPC with one existing subnet in each of three zones of the region; CAPIBM never
@@ -245,7 +235,11 @@ main(){
         # Run the heart beat process to tell Boskos that we are still
         # using the checked out resource periodically.
         if [[ "${E2E_FLAVOR}" == managed-* ]]; then
-            heartbeat_managed_lease >> "$ARTIFACTS/logs/boskos.log" 2>&1 &
+            # The heartbeat reports a refused renewal through this file: the lanes stop their steps once it appears
+            # (test/e2e/managedtools/lease.go), and cleanup fails the job with it (report_lost_managed_lease).
+            export E2E_MANAGED_LEASE_LOST_FILE="${ARTIFACTS}/logs/boskos-lease-lost"
+            rm -f "${E2E_MANAGED_LEASE_LOST_FILE}"
+            heartbeat_managed_lease "${E2E_MANAGED_LEASE_LOST_FILE}" >> "$ARTIFACTS/logs/boskos.log" 2>&1 &
         else
             heartbeat_account >> "$ARTIFACTS/logs/boskos.log" 2>&1 &
         fi

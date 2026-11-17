@@ -48,6 +48,7 @@ import (
 
 	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
 	infrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/v1alpha1"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/test/e2e/managedtools"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -111,15 +112,29 @@ func managedClient(proxy framework.ClusterProxy) client.Client {
 // managedControlPlaneWaiters replaces the framework's KubeadmControlPlane waiters (clusterctl_helpers.go setDefaults)
 // for the managed flavors, as CAPZ's AKS and CAPA's EKS suites do: the control plane is initialized when the
 // Cluster's ControlPlaneInitialized condition and the IBMCloudManagedControlPlane's Available condition are True, and
-// there are no control plane Machines to wait for, because IBM runs the masters.
-func managedControlPlaneWaiters() clusterctl.ControlPlaneWaiters {
+// there are no control plane Machines to wait for, because IBM runs the masters. The hook for those Machines, the last
+// one the framework calls before its own MachinePool wait, waits for the MachinePools instead: the framework takes the
+// interval of its MachinePool wait when the step starts and polls without the step's context, so only a wait that
+// takes its interval where it begins can end by the lane's hard timeout. The framework's MachinePool wait then finds
+// the pools ready at its first poll.
+//
+// Parameters:
+//   - controlPlaneIntervals returns the timeout and polling interval of the control plane wait; it is called where
+//     that wait begins.
+//   - machinePoolIntervals returns those of the MachinePool wait; it is called where that wait begins.
+func managedControlPlaneWaiters(controlPlaneIntervals, machinePoolIntervals func() []interface{}) clusterctl.ControlPlaneWaiters {
 	return clusterctl.ControlPlaneWaiters{
 		WaitForControlPlaneInitialized: func(ctx context.Context, input clusterctl.ApplyCustomClusterTemplateAndWaitInput,
 			result *clusterctl.ApplyCustomClusterTemplateAndWaitResult) {
-			waitForControlPlaneAvailable(ctx, managedClient(input.ClusterProxy), result.Cluster, input.WaitForControlPlaneIntervals...)
+			waitForControlPlaneAvailable(ctx, managedClient(input.ClusterProxy), result.Cluster, controlPlaneIntervals()...)
 		},
-		WaitForControlPlaneMachinesReady: func(context.Context, clusterctl.ApplyCustomClusterTemplateAndWaitInput,
-			*clusterctl.ApplyCustomClusterTemplateAndWaitResult) {
+		WaitForControlPlaneMachinesReady: func(ctx context.Context, input clusterctl.ApplyCustomClusterTemplateAndWaitInput,
+			result *clusterctl.ApplyCustomClusterTemplateAndWaitResult) {
+			framework.DiscoveryAndWaitForMachinePools(ctx, framework.DiscoveryAndWaitForMachinePoolsInput{
+				Getter:  input.ClusterProxy.GetClient(),
+				Lister:  input.ClusterProxy.GetClient(),
+				Cluster: result.Cluster,
+			}, machinePoolIntervals()...)
 		},
 	}
 }
@@ -539,56 +554,83 @@ func deleteBlocker(ctx context.Context, workload client.Client, intervals ...int
 	waitForProbePodsGone(ctx, workload, meta.Name, intervals...)
 }
 
-// ownershipFacts are the IBM facts that a clusterctl move must not change: CAPIBM re-adopts the same IBM cluster and
-// pools, and replaces, adds or removes no worker.
-type ownershipFacts struct {
-	// ClusterID is the control plane's status.clusterID.
-	ClusterID string
-	// MasterVersion is the control plane's status.distributionVersion.
-	MasterVersion string
-	// Pools maps each IBMCloudManagedMachinePool name to its IBM pool.
-	Pools map[string]poolFacts
+// workerLister lists the workers of an IBM cluster, deleted ones included; CAPIBM's
+// kubernetesservice.KubernetesService is one.
+type workerLister interface {
+	ListWorkers(ctx context.Context, clusterID string) ([]kubernetesservice.Worker, error)
 }
 
-// poolFacts are one pool's IBM facts.
-type poolFacts struct {
-	// PoolID is status.poolID.
-	PoolID string
-	// ProviderIDs is spec.providerIDList, sorted.
-	ProviderIDs []string
-}
-
-// collectOwnershipFacts reads the ownership facts of a cluster; every ID must be set, so that two empty fact sets can
-// never compare equal.
+// collectOwnershipFacts reads the facts that a clusterctl move must not change (managedtools.CollectOwnershipFacts)
+// from the management cluster and from IBM. Every ID must be set, so that two fact sets read before CAPIBM has
+// (re)discovered the IBM objects can never compare equal. An error of IBM's worker listing is marked
+// (managedtools.IBMWorkerListingError), so that a check can wait out an IBM answer that may pass
+// (managedtools.OwnershipFactsMayPass): the listing is one request, which CAPIBM's client never retries.
 //
 // Parameters:
 //   - ctx bounds the requests.
 //   - c is a management cluster client with managedScheme.
+//   - ibm lists the IBM cluster's workers; the lanes pass CAPIBM's own client, built with the lane's credentials.
 //   - cluster is the CAPI Cluster; its namespace holds only this cluster's objects.
-func collectOwnershipFacts(ctx context.Context, c client.Client, cluster *clusterv1.Cluster) (ownershipFacts, error) {
+func collectOwnershipFacts(ctx context.Context, c client.Client, ibm workerLister, cluster *clusterv1.Cluster) (managedtools.OwnershipFacts, error) {
 	cp, err := getControlPlane(ctx, c, cluster)
 	if err != nil {
-		return ownershipFacts{}, err
-	}
-	if cp.Status.ClusterID == "" {
-		return ownershipFacts{}, fmt.Errorf("control plane %s has no status.clusterID yet", cp.Name)
+		return managedtools.OwnershipFacts{}, err
 	}
 	pools := &infrav1.IBMCloudManagedMachinePoolList{}
 	if err := c.List(ctx, pools, client.InNamespace(cluster.Namespace)); err != nil {
-		return ownershipFacts{}, err
+		return managedtools.OwnershipFacts{}, err
 	}
-	facts := ownershipFacts{ClusterID: cp.Status.ClusterID, MasterVersion: cp.Status.DistributionVersion,
-		Pools: map[string]poolFacts{}}
+	var workers []kubernetesservice.Worker
+	// Without a cluster ID there is nothing to ask IBM; CollectOwnershipFacts reports the missing ID.
+	if cp.Status.ClusterID != "" {
+		if workers, err = ibm.ListWorkers(ctx, cp.Status.ClusterID); err != nil {
+			return managedtools.OwnershipFacts{}, managedtools.IBMWorkerListingError(cp.Status.ClusterID, err)
+		}
+	}
+	return managedtools.CollectOwnershipFacts(cp, pools.Items, workers)
+}
+
+// readOwnershipFacts reads the ownership facts (collectOwnershipFacts) until the read succeeds and returns them. The
+// read asks IBM once, and CAPIBM's client never retries, so a single read would fail the step on any 5xx; this waits
+// out every error, as the lanes' other waits do, and fails only when no read succeeds within intervals.
+//
+// Parameters:
+//   - ctx bounds the reads and the wait (the lane's hard timeout).
+//   - c is a management cluster client with managedScheme.
+//   - ibm lists the IBM cluster's workers; the lanes pass CAPIBM's own client, built with the lane's credentials.
+//   - cluster is the CAPI Cluster; its namespace holds only this cluster's objects.
+//   - what names the reading in the failure message, for example "IBM facts before the move".
+//   - intervals are the Eventually timeout and polling interval of the wait.
+func readOwnershipFacts(ctx context.Context, c client.Client, ibm workerLister, cluster *clusterv1.Cluster, what string,
+	intervals []interface{}) managedtools.OwnershipFacts {
+	var facts managedtools.OwnershipFacts
+	eventually(ctx, func(g Gomega) {
+		read, err := collectOwnershipFacts(ctx, c, ibm, cluster)
+		g.Expect(err).NotTo(HaveOccurred(), what)
+		facts = read
+	}, intervals).Should(Succeed(), what)
+	return facts
+}
+
+// expectNoWorkerDisruption fails g unless no pool of the namespace has a worker disruption in flight or reports its
+// Draining condition True: CAPIBM drains a worker before it asks IBM to remove or replace it, so a removal shows here
+// first.
+//
+// Parameters:
+//   - ctx bounds the request.
+//   - g is the Gomega of the enclosing Consistently.
+//   - c is a management cluster client with managedScheme.
+//   - namespace is the namespace of the cluster's pools.
+func expectNoWorkerDisruption(ctx context.Context, g Gomega, c client.Client, namespace string) {
+	pools := &infrav1.IBMCloudManagedMachinePoolList{}
+	g.Expect(c.List(ctx, pools, client.InNamespace(namespace))).To(Succeed())
 	for i := range pools.Items {
 		pool := &pools.Items[i]
-		if pool.Status.PoolID == "" {
-			return ownershipFacts{}, fmt.Errorf("pool %s has no status.poolID yet", pool.Name)
-		}
-		ids := slices.Clone(pool.Spec.ProviderIDList)
-		slices.Sort(ids)
-		facts.Pools[pool.Name] = poolFacts{PoolID: pool.Status.PoolID, ProviderIDs: ids}
+		g.Expect(pool.Status.Disruption.Operation).To(BeEmpty(), "pool %s status.disruption.operation", pool.Name)
+		g.Expect(conditions.IsTrue(pool, infrav1.IBMCloudManagedMachinePoolDrainingCondition)).To(BeFalse(),
+			"pool %s condition %s: %v", pool.Name, infrav1.IBMCloudManagedMachinePoolDrainingCondition,
+			conditions.Get(pool, infrav1.IBMCloudManagedMachinePoolDrainingCondition))
 	}
-	return facts, nil
 }
 
 // eventually is Eventually(ctx, f) with the timeout and polling interval of an e2e config interval. Go does not allow

@@ -85,6 +85,11 @@ variables:
   # Any other value fails the lane before it creates anything.
   E2E_MANAGED_JANITOR: "${E2E_MANAGED_JANITOR:-true}"
   E2E_MANAGED_LEFTOVER_SCOPE: "${E2E_MANAGED_LEFTOVER_SCOPE:-account}"
+  # The file through which the Boskos heartbeat of hack/scripts/ci/ci-e2e.sh reports that Boskos refused to renew the
+  # run's lease. Every step checks it first and while it runs, and once it exists the lanes stop their steps and only
+  # clean up, because the account may already serve another managed run. ci-e2e.sh sets it; empty (a run without a
+  # Boskos lease) disables the check.
+  E2E_MANAGED_LEASE_LOST_FILE: "${E2E_MANAGED_LEASE_LOST_FILE:-}"
   # The e2e VPC: an existing VPC with one existing subnet in each of three zones of the region (CAPIBM never creates
   # or deletes VPC resources). The ROKS lane reads the first zone and subnet.
   IBMCLOUD_REGION: "${IBMCLOUD_REGION:-}"
@@ -113,12 +118,11 @@ variables:
   IBMCLOUD_CONTAINERS_URL: "${IBMCLOUD_CONTAINERS_URL:-}"
   IBMCLOUD_VPC_URL: "${IBMCLOUD_VPC_URL:-}"
 
-# Each step's timeout is lowered to the time left until the lane's hard timeout (4 h for each lane). The create step
-# takes wait-cluster, wait-control-plane and wait-worker-nodes at its start, so that step is bound to end by the hard
-# timeout only while their sum stays below it. IKS 60 + 60 + 60 m does; ROKS 120 + 120 + 90 m = 330 m does not, and a
-# ROKS create whose control plane becomes available later than 150 m into the lane can keep waiting for its workers up
-# to 90 m past the hard timeout (managed_test.go create). The cleanups (wait-delete-cluster in the CAPI deletion,
-# wait-inventory-clean) are not lowered: they run after the hard timeout, within their own node timeouts.
+# Each step's timeout is lowered to the time left until the lane's hard timeout (4 h for each lane), where its wait
+# begins. That holds for the create step's wait-control-plane and wait-worker-nodes too, although the ROKS lane's
+# 120 + 120 + 90 m exceed 4 h: the lanes run those waits themselves instead of leaving them to the CAPI framework, which
+# would take their intervals when the step starts (managed_test.go create). The cleanups (wait-delete-cluster in the
+# CAPI deletion, wait-inventory-clean) are not lowered: they run after the hard timeout, within their own node timeouts.
 intervals:
   default/wait-controllers: ["3m", "10s"]
   default/wait-delete-cluster: ["60m", "30s"]

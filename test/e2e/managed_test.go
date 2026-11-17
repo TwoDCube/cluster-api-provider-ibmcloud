@@ -77,14 +77,14 @@ const (
 	// backstop 10 m, inventory diff 45 m), so a lane can hold its cluster for up to its hard timeout plus 145 m.
 	// Ginkgo's --timeout (ci-e2e.sh) does not cut that short where it matters: Ginkgo v2 gives a cleanup node that
 	// starts after the suite timeout its full NodeTimeout, so the IBM backstop and the inventory diff still run.
-	// The IKS lane's steps take about 170 to 185 m: set-up 1, create 23 (measured 20 to 23), scale-down 4, pool add 5,
+	// The IKS lane's steps take about 175 to 190 m: set-up 1, create 23 (measured 20 to 23), scale-down 4, pool add 5,
 	// master upgrade 19 (measured 18.5 from 1.35 to 1.36) and 2 more until the pools see it, the blocked-drain check
-	// and hold 6, pool deletion 3, move 10 (not measured yet) and cluster deletion 18 (measured on ROKS), plus 9 worker
-	// replacements (6 when the workers of both pools follow the upgrade, 3 for rollout.after) of 8 to 10 m each (the
-	// estimate in test/e2e/config/ibmcloud-e2e-managed.yaml), plus about 1 m in each of the 4 drain steps for pinning a
-	// probe pod to every worker the step may remove and deleting the pods left afterwards (start-up, and up to 20 s of
-	// SIGTERM handling; not measured yet). 4 h still leaves about an hour for a slower IBM. It must not exceed
-	// managedtools.JanitorMinimumAge, which assumes that no lane's steps last longer.
+	// and hold 6, pool deletion 3, move 10 (not measured yet) and its hold of moveHold (7), and cluster deletion 18
+	// (measured on ROKS), plus 9 worker replacements (6 when the workers of both pools follow the upgrade, 3 for
+	// rollout.after) of 8 to 10 m each (the estimate in test/e2e/config/ibmcloud-e2e-managed.yaml), plus about 1 m in
+	// each of the 4 drain steps for pinning a probe pod to every worker of the lane's pools and deleting the pods left
+	// afterwards (start-up, and up to 20 s of SIGTERM handling; not measured yet). 4 h still leaves about 50 minutes for
+	// a slower IBM. It must not exceed managedtools.JanitorMinimumAge, which assumes that no lane's steps last longer.
 	iksLaneTimeout  = 4 * time.Hour
 	roksLaneTimeout = 4 * time.Hour
 
@@ -111,6 +111,25 @@ const (
 	// blockedDrainHold is how long the IKS lane checks that no worker is replaced while a PodDisruptionBudget blocks
 	// the drain: longer than CAPIBM's DisruptionSettleDelay (3 m), so that a replace sent despite the block shows.
 	blockedDrainHold = 4 * time.Minute
+	// moveHold is how long the move step keeps checking, once the target has re-adopted the cluster, that CAPIBM there
+	// starts no worker disruption and that IBM's facts stay as they were. clusterctl move drops status, so the target
+	// sets lastDisruptionTime to the time of its first reconcile and starts no worker removal within
+	// DisruptionSettleDelay of it; a replacement it decided on after the re-adoption would start only after that delay
+	// and the next requeue. Twice the delay plus a minute covers both, so a write that a single check right after the
+	// re-adoption would miss shows.
+	moveHold = 2*managed.DisruptionSettleDelay + time.Minute
+	// moveHoldPoll is the polling interval of that check. Each poll lists the IBM cluster's workers once.
+	moveHoldPoll = 20 * time.Second
+	// leasePoll is how often a step checks whether the run has lost its Boskos lease (managedtools.WatchLease).
+	leasePoll = 30 * time.Second
+	// machinePoolRecheck is the timeout of the CAPI framework's own MachinePool wait at the end of the create step. The
+	// lanes wait for the MachinePools themselves just before it (managedControlPlaneWaiters), with an interval taken
+	// where that wait begins and ending machinePoolRecheck before the hard timeout, because the framework takes its
+	// interval when the step starts and polls without a context. Its own wait then only re-reads what the lane has
+	// just seen, so a minute is plenty, and the step still ends by the hard timeout.
+	machinePoolRecheck = time.Minute
+	// machinePoolRecheckPolling is the polling interval of that recheck.
+	machinePoolRecheckPolling = 10 * time.Second
 
 	// ibmRequestTimeout bounds every IBM request of the lanes' own clients.
 	ibmRequestTimeout = 2 * time.Minute
@@ -247,6 +266,10 @@ type managedLane struct {
 	// moveTargetProvider is the kind cluster of the move target, disposed at the end of the lane.
 	moveTargetProvider bootstrap.ClusterProvider
 	moveTargetProxy    framework.ClusterProxy
+	// cancelMoveTargetWatches stops the move target's controller log streams, metrics and namespace event watch, which
+	// run from the move step until disposeMoveTarget, so that the target's CAPIBM logs cover the deletion and the
+	// cleanups too; nil until the move step creates the target.
+	cancelMoveTargetWatches context.CancelFunc
 
 	result         *clusterctl.ApplyClusterTemplateAndWaitResult
 	clusterDeleted bool
@@ -261,6 +284,9 @@ type managedLane struct {
 	leftoverScope managedtools.LeftoverScope
 	// scope is what the inventory baseline and the final leftover check cover.
 	scope managedtools.InventoryScope
+	// leaseLostFile is E2E_MANAGED_LEASE_LOST_FILE: where the CI heartbeat reports that Boskos refused to renew the
+	// run's lease (managedtools.CheckLease); empty for a run without a lease.
+	leaseLostFile string
 }
 
 // laneIBMClients are the lane's IBM clients, built with the identity fixture's authenticator.
@@ -270,7 +296,8 @@ type laneIBMClients struct {
 	// vpc lists the VPC resources for the inventory; in the lane scope it also gives each load balancer its VPC
 	// (buildInventoryScope).
 	vpc *managedtools.VPCService
-	// service is CAPIBM's own IBM Cloud Kubernetes Service client, for the 404 assertion.
+	// service is CAPIBM's own IBM Cloud Kubernetes Service client, for the 404 assertion and the move step's worker
+	// listings. It sends one request per call and never retries.
 	service kubernetesservice.KubernetesService
 	// resourceGroupID scopes every IBM call.
 	resourceGroupID string
@@ -294,13 +321,20 @@ func runID() (string, error) {
 	return managedRunID, managedRunIDErr
 }
 
-// stepContext returns a context that ends at the lane's hard timeout or with the spec, whichever comes first.
+// stepContext returns a context that ends at the lane's hard timeout, with the spec, or once the run has lost its
+// Boskos lease, whichever comes first. A step does not start at all once the lease is lost: another managed run may
+// already use the account, so the lane goes straight to its cleanups, which delete its own cluster.
 //
 // Parameters:
 //   - specCtx is the spec's context.
 func (l *managedLane) stepContext(specCtx context.Context) context.Context {
+	Expect(managedtools.CheckLease(l.leaseLostFile)).To(Succeed(), "the %s lane starts no step without its Boskos lease",
+		l.input.Lane)
 	ctx, cancel := context.WithDeadline(specCtx, l.deadline)
 	DeferCleanup(cancel)
+	ctx, stopWatch, err := managedtools.WatchLease(ctx, l.leaseLostFile, leasePoll)
+	Expect(err).NotTo(HaveOccurred())
+	DeferCleanup(stopWatch)
 	return ctx
 }
 
@@ -315,6 +349,23 @@ func (l *managedLane) stepContext(specCtx context.Context) context.Context {
 //   - key is the interval name, for example "wait-control-plane".
 func (l *managedLane) intervals(key string) []interface{} {
 	intervals, err := managedtools.LimitTimeout(l.configuredIntervals(key), time.Until(l.deadline))
+	Expect(err).NotTo(HaveOccurred(), "the %s lane's %s wait", l.input.Lane, key)
+	return intervals
+}
+
+// intervalsEndingBefore returns intervals(key) with the timeout lowered further, so that the wait ends at least
+// reserve before the lane's hard timeout. A step uses it for a wait that a later wait of the same step follows, when
+// that later wait cannot be capped where it begins (a CAPI framework wait whose interval the framework takes when the
+// step starts): the reserve is that later wait's timeout, so the step still ends by the hard timeout.
+//
+// Parameters:
+//   - key is the interval name, for example "wait-worker-nodes".
+//   - reserve is the time to leave before the hard timeout; it must be smaller than the time left.
+func (l *managedLane) intervalsEndingBefore(key string, reserve time.Duration) []interface{} {
+	remaining := time.Until(l.deadline)
+	Expect(remaining).To(BeNumerically(">", reserve), "the %s lane's %s wait must end %s before the lane's hard "+
+		"timeout, which is only %s away", l.input.Lane, key, reserve, remaining.Round(time.Second))
+	intervals, err := managedtools.LimitTimeout(l.configuredIntervals(key), remaining-reserve)
 	Expect(err).NotTo(HaveOccurred(), "the %s lane's %s wait", l.input.Lane, key)
 	return intervals
 }
@@ -374,6 +425,9 @@ func (l *managedLane) setUp(specCtx SpecContext) {
 	l.validateVariables()
 	l.buildNames()
 	l.buildIBMClients()
+	// The janitor deletes stale e2e clusters of any run, which is safe only while the run holds the account alone.
+	Expect(managedtools.CheckLease(l.leaseLostFile)).To(Succeed(), "the %s lane runs no janitor without its Boskos lease",
+		l.input.Lane)
 	l.runJanitor(ctx)
 	l.buildInventoryScope(ctx)
 	l.takeBaseline(ctx)
@@ -390,7 +444,8 @@ func (l *managedLane) setUp(specCtx SpecContext) {
 }
 
 // validateVariables fails unless every required variable is set, the janitor switch and the leftover scope are valid
-// and, for the IKS lane, the upgrade is one minor.
+// and, for the IKS lane, the upgrade is one minor. It also reads the path through which the CI heartbeat reports a
+// lost Boskos lease.
 func (l *managedLane) validateVariables() {
 	var missing []string
 	for _, name := range l.input.RequiredVariables {
@@ -405,6 +460,7 @@ func (l *managedLane) validateVariables() {
 	Expect(err).NotTo(HaveOccurred())
 	l.leftoverScope, err = managedtools.ParseLeftoverScope(e2eConfig.GetVariableOrEmpty(managedtools.LeftoverScopeVariable))
 	Expect(err).NotTo(HaveOccurred())
+	l.leaseLostFile = e2eConfig.GetVariableOrEmpty(managedtools.LeaseLostFileVariable)
 	if l.input.Lane == managedtools.LaneIKS {
 		Expect(managedtools.ValidateUpgradeStep(e2eConfig.GetVariableOrEmpty(varIKSVersion),
 			e2eConfig.GetVariableOrEmpty(varIKSUpgradeTo))).To(Succeed())
@@ -535,16 +591,19 @@ func (l *managedLane) create(specCtx SpecContext) {
 			WorkerMachineCount:       ptr.To(l.input.WorkerMachineCount),
 			ClusterctlVariables:      l.clusterctlVariables,
 		},
-		// The framework takes all three intervals when the step starts, so each is capped at the time left then, not
-		// at the start of its own wait. The step still ends by the hard timeout while their sum stays below it, as the
-		// IKS lane's 60 + 60 + 60 m of 4 h do. The ROKS lane's 120 + 120 + 90 m = 330 m exceed its 4 h: the control
-		// plane wait ends with this step's context, but the machine pool wait polls without it, so a ROKS control plane
-		// that becomes available later than 150 m after the lane's set-up can leave that wait running up to 90 m past
-		// the hard timeout.
-		WaitForClusterIntervals:      l.intervals("wait-cluster"),
-		WaitForControlPlaneIntervals: l.intervals("wait-control-plane"),
-		WaitForMachinePools:          l.intervals("wait-worker-nodes"),
-		ControlPlaneWaiters:          managedControlPlaneWaiters(),
+		// The framework takes these intervals when the step starts, so a wait late in the step would be capped at the
+		// time left then, not at its own start: the ROKS lane's 120 + 120 + 90 m exceed its 4 h, and the framework's
+		// MachinePool wait polls without this step's context, so it could run up to 90 m past the hard timeout. Only
+		// the cluster wait, the first one, takes its interval from here. managedControlPlaneWaiters takes the control
+		// plane's and the MachinePools' intervals where those waits begin, and the MachinePool wait it runs ends
+		// machinePoolRecheck before the hard timeout, so the framework's own MachinePool wait that follows, which only
+		// re-reads what the lane has just seen, ends by it too.
+		WaitForClusterIntervals: l.intervals("wait-cluster"),
+		WaitForMachinePools:     []interface{}{machinePoolRecheck, machinePoolRecheckPolling},
+		ControlPlaneWaiters: managedControlPlaneWaiters(
+			func() []interface{} { return l.intervals("wait-control-plane") },
+			func() []interface{} { return l.intervalsEndingBefore("wait-worker-nodes", machinePoolRecheck) },
+		),
 	}, l.result)
 	Expect(l.result.MachinePools).To(HaveLen(1), "the managed flavors have exactly one MachinePool")
 }
@@ -594,9 +653,9 @@ func (l *managedLane) expectHATopology(specCtx SpecContext) {
 
 // expectContract checks the CAPI contract fields against the workload cluster itself: the control plane is
 // initialized and externally managed, the endpoint reached the Cluster, the kubeconfig Secret exists,
-// status.versions[0] is the API server's /version, and for every MachinePool the providerIDList, the NodeRefs and the
-// versions match the pool's Nodes (IBM ships worker fix packs independently of the master's, so the two are compared
-// separately).
+// status.versions[0] is the API server's /version, and for every MachinePool the providerIDList, the NodeRefs, the
+// versions and the replica counts match the pool's Nodes and both pool objects report their infrastructure as
+// provisioned (IBM ships worker fix packs independently of the master's, so the two are compared separately).
 func (l *managedLane) expectContract(specCtx SpecContext) {
 	ctx := l.stepContext(specCtx)
 	c := managedClient(l.mgmt)
@@ -627,7 +686,8 @@ func (l *managedLane) expectContract(specCtx SpecContext) {
 	}, l.intervals("wait-contract")).Should(Succeed())
 }
 
-// expectMachinePoolContract checks one MachinePool against the Nodes of its IBM pool.
+// expectMachinePoolContract checks one MachinePool and its IBMCloudManagedMachinePool against the Nodes of their IBM
+// pool: the provider IDs, the NodeRefs, the versions, the replica counts and the provisioned flags.
 //
 // Parameters:
 //   - ctx bounds the requests.
@@ -651,6 +711,17 @@ func expectMachinePoolContract(ctx context.Context, g Gomega, c, workload client
 	}
 	g.Expect(pool.Spec.ProviderIDList).To(ConsistOf(providerIDs), "IBMCloudManagedMachinePool %s spec.providerIDList", pool.Name)
 	g.Expect(mp.Spec.ProviderIDList).To(ConsistOf(providerIDs), "MachinePool %s spec.providerIDList", mp.Name)
+	// The InfraMachinePool contract's provisioned flag and replica count. CAPI v1.14 reads status.ready (later releases
+	// initialization.provisioned) and copies status.replicas into the MachinePool's replicas, readyReplicas and
+	// availableReplicas, because these pools have no MachinePool Machines; the framework's own MachinePool waits read
+	// only the deprecated readyReplicas, which CAPI counts from the NodeRefs, so a wrong count would pass them.
+	g.Expect(pool.Status.Initialization.Provisioned).To(HaveValue(BeTrue()), "IBMCloudManagedMachinePool %s status.initialization.provisioned", pool.Name)
+	g.Expect(pool.Status.Ready).To(HaveValue(BeTrue()), "IBMCloudManagedMachinePool %s status.ready", pool.Name)
+	g.Expect(pool.Status.Replicas).To(HaveValue(BeEquivalentTo(len(nodes))), "IBMCloudManagedMachinePool %s status.replicas", pool.Name)
+	g.Expect(mp.Status.Initialization.InfrastructureProvisioned).To(HaveValue(BeTrue()), "MachinePool %s status.initialization.infrastructureProvisioned", mp.Name)
+	g.Expect(mp.Status.Replicas).To(HaveValue(BeEquivalentTo(len(nodes))), "MachinePool %s status.replicas", mp.Name)
+	g.Expect(mp.Status.ReadyReplicas).To(HaveValue(BeEquivalentTo(len(nodes))), "MachinePool %s status.readyReplicas", mp.Name)
+	g.Expect(mp.Status.AvailableReplicas).To(HaveValue(BeEquivalentTo(len(nodes))), "MachinePool %s status.availableReplicas", mp.Name)
 	nodeRefs := make([]string, 0, len(mp.Status.NodeRefs))
 	for _, ref := range mp.Status.NodeRefs {
 		nodeRefs = append(nodeRefs, ref.Name)
@@ -860,14 +931,16 @@ func extraPoolObjects(cluster *clusterv1.Cluster, template *infrav1.IBMCloudMana
 // initial pool's workers by now depends on where the scheduler put the pods that the upgrade and the rollout.after
 // evicted, and their spread is only a preference, so the step first pins a probe pod to each of the initial pool's 3
 // workers: the drain has to evict all 3, and stopAndExpectDrained requires each eviction to go through the Eviction
-// API instead of hoping for a spread pod there.
+// API instead of hoping for a spread pod there. It pins one to each of the added pool's 3 workers too, which the step
+// must leave alone: a drain or a replacement that reached the wrong pool would go unnoticed otherwise, because the
+// Eviction API keeps such a drain within every budget and the pool sizes come out right afterwards.
 func (l *managedLane) deleteInitialPool(specCtx SpecContext) {
 	ctx := l.stepContext(specCtx)
 	c := managedClient(l.mgmt)
 	workloadProxy, workload := l.workload(ctx)
 	waitForDrainableZones(ctx, workload, l.intervals("wait-contract")...)
 	waitForProbeHealthy(ctx, workload, "spread", probeReplicas, l.intervals("wait-probe")...)
-	pins := l.pinProbePods(ctx, workloadProxy, workload, rollingPool{name: initialPoolName, replicas: scaledDownReplicas})
+	pins := l.pinProbePods(ctx, workloadProxy, workload, iksRollingPools...)
 
 	probe := startDisruptionProbe(ctx, workload)
 	Byf("Deleting the initial MachinePool %s", l.poolKey(initialPoolName).Name)
@@ -963,7 +1036,8 @@ func expectWorkersOnMinor(ctx context.Context, g Gomega, c, workload client.Clie
 // pinned probe pod, so every replacement must show its drain as an eviction through the Eviction API. The pinned pod of
 // the first worker goes while the blocker still holds that drain: a drain evicts every pod no budget protects at once
 // and waits only for the refused ones, and the step's blocked-drain check is about the worker's replacement, not
-// about its pods.
+// about its pods. Each of the initial pool's 3 workers holds a pinned probe pod as well, which must stay untouched:
+// rollout.after on one pool must neither drain nor replace a worker of the other.
 func (l *managedLane) rolloutAfterWithBlockedDrain(specCtx SpecContext) {
 	ctx := l.stepContext(specCtx)
 	c := managedClient(l.mgmt)
@@ -984,7 +1058,7 @@ func (l *managedLane) rolloutAfterWithBlockedDrain(specCtx SpecContext) {
 	})
 	waitForProbeHealthy(ctx, workload, "blocker", blockers, l.intervals("wait-probe")...)
 	waitForProbeHealthy(ctx, workload, "spread", probeReplicas, l.intervals("wait-probe")...)
-	pins := l.pinProbePods(ctx, workloadProxy, workload, rollingPool{name: extraPoolName, replicas: extraPoolReplicas})
+	pins := l.pinProbePods(ctx, workloadProxy, workload, iksRollingPools...)
 
 	pool, err := getPool(ctx, c, l.poolKey(extraPoolName))
 	Expect(err).NotTo(HaveOccurred())
@@ -1031,18 +1105,24 @@ func (l *managedLane) rolloutAfterWithBlockedDrain(specCtx SpecContext) {
 }
 
 // move moves the cluster to a second kind management cluster with clusterctl and checks that CAPIBM there re-adopts
-// it without any IBM write: the same IBM cluster ID and master version, the same IBM pools and workers, no create
-// event, and still exactly one IBM cluster with the name (the target binds through the ownership proof with the
-// moved kubeconfig).
+// it without any IBM write: the same IBM cluster ID and master minor, the same IBM pools, the same workers both in
+// CAPIBM's providerIDList and in IBM's own worker list, no create event, and still exactly one IBM cluster with the
+// name (the target binds through the ownership proof with the moved kubeconfig). A single match right after the
+// re-adoption would prove little: the move drops status, so the target holds every worker removal for
+// DisruptionSettleDelay after its first reconcile, and a replacement it decided on would start only after the match.
+// The step therefore keeps checking for moveHold that the facts stay, that no pool starts a worker disruption and
+// that none reports Draining, and reads the facts once more when the hold is over. Each reading of the facts lists the
+// IBM cluster's workers with one request, which CAPIBM's client never retries: the readings before and after the hold
+// wait until IBM answers, and the hold polls again on an IBM answer that may pass instead of failing on it.
 func (l *managedLane) move(specCtx SpecContext) {
 	ctx := l.stepContext(specCtx)
 	Expect(l.input.MoveTargetIdentity).NotTo(BeNil(), "the %s lane has no move target identity", l.input.Lane)
-	before, err := collectOwnershipFacts(ctx, managedClient(l.mgmt), l.cluster())
-	Expect(err).NotTo(HaveOccurred(), "IBM facts before the move")
+	before := readOwnershipFacts(ctx, managedClient(l.mgmt), l.ibm.service, l.cluster(), "IBM facts before the move",
+		l.intervals("wait-contract"))
 
 	l.createMoveTarget(ctx)
 	// A move renders no template, so the target fixture's variables have no use here; it only prepares credentials.
-	_, err = l.input.MoveTargetIdentity.Setup(ctx, l.moveTargetProxy, l.namespace.Name)
+	_, err := l.input.MoveTargetIdentity.Setup(ctx, l.moveTargetProxy, l.namespace.Name)
 	Expect(err).NotTo(HaveOccurred(), "setting up the target identity fixture %T", l.input.MoveTargetIdentity)
 	source := l.mgmt
 	clusterctl.Move(ctx, clusterctl.MoveInput{
@@ -1060,19 +1140,43 @@ func (l *managedLane) move(specCtx SpecContext) {
 
 	c := managedClient(l.mgmt)
 	waitForControlPlaneAvailable(ctx, c, l.cluster(), l.intervals("wait-move")...)
-	var after ownershipFacts
 	eventually(ctx, func(g Gomega) {
 		cp, err := getControlPlane(ctx, c, l.cluster())
 		g.Expect(err).NotTo(HaveOccurred())
 		expectConditionTrue(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition)
-		after, err = collectOwnershipFacts(ctx, c, l.cluster())
+		after, err := collectOwnershipFacts(ctx, c, l.ibm.service, l.cluster())
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(after).To(Equal(before), "IBM facts after the move")
 	}, l.intervals("wait-move")).Should(Succeed())
+	Byf("Checking for %s that CAPIBM on the move target starts no worker disruption and the IBM facts stay", moveHold)
+	// Consistently fails on the first poll that fails, so a poll whose worker listing IBM did not answer (a 5xx, a 429,
+	// a timeout: what CAPIBM's controllers requeue on) passes on the pools' state alone and leaves the facts to the
+	// next poll; IBM's final answers still fail it. Gomega's TryAgainAfter would not do here: a Consistently whose
+	// timeout comes while it waits to retry fails, so an IBM error on the last poll would still fail the hold, and
+	// Gomega v1.42.1 panics while it renders that failure after polls that passed. The reading after the hold makes
+	// sure that IBM's worker list has the last word.
+	Consistently(ctx, func(g Gomega) {
+		expectNoWorkerDisruption(ctx, g, c, l.namespace.Name)
+		after, err := collectOwnershipFacts(ctx, c, l.ibm.service, l.cluster())
+		if managedtools.OwnershipFactsMayPass(err) {
+			fmt.Fprintf(GinkgoWriter, "the move hold's worker listing got an IBM answer that may pass, polling again: %v\n", err)
+			return
+		}
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(after).To(Equal(before), "IBM facts while CAPIBM runs on the move target")
+	}, moveHold, moveHoldPoll).Should(Succeed())
+	Expect(readOwnershipFacts(ctx, c, l.ibm.service, l.cluster(), "IBM facts after the move hold",
+		l.intervals("wait-contract"))).To(Equal(before), "IBM facts after CAPIBM ran on the move target for %s", moveHold)
 	expectNoEventWithReason(ctx, c, l.namespace.Name, managed.EventReasonSuccessfulCreateIBMCluster)
 
-	clusters, err := l.ibm.clusters.ListClusters(ctx)
-	Expect(err).NotTo(HaveOccurred())
+	// The cluster listing is one IBM request too. Only the request is retried, not the comparison: a second cluster
+	// with the name would not go away.
+	var clusters []managedtools.Cluster
+	eventually(ctx, func() error {
+		listed, err := l.ibm.clusters.ListClusters(ctx)
+		clusters = listed
+		return err
+	}, l.intervals("wait-contract")).Should(Succeed(), "listing the IBM clusters after the move")
 	var ids []string
 	for _, cluster := range clusters {
 		if cluster.Name == l.clusterName {
@@ -1083,7 +1187,14 @@ func (l *managedLane) move(specCtx SpecContext) {
 }
 
 // createMoveTarget creates the second kind management cluster and installs the providers, as the suite does for the
-// first one (suite_test.go setupBootstrapCluster, initBootstrapCluster).
+// first one (suite_test.go setupBootstrapCluster, initBootstrapCluster). It also starts the target's controller log
+// streams, metrics and the event watch of the lane's namespace, which the move creates there, and keeps them running
+// past the move step until disposeMoveTarget: the cluster's deletion and the cleanups run on the target, and its
+// CAPIBM logs and events are what explains a failure there. The suite does the same for the first management cluster,
+// whose watches outlive every spec.
+//
+// Parameters:
+//   - ctx is the move step's context; the cluster creation and the providers' installation end with it.
 func (l *managedLane) createMoveTarget(ctx context.Context) {
 	name := e2eConfig.ManagementClusterName + "-move"
 	input := bootstrap.CreateKindBootstrapClusterAndLoadImagesInput{
@@ -1097,12 +1208,27 @@ func (l *managedLane) createMoveTarget(ctx context.Context) {
 	l.moveTargetProvider = bootstrap.CreateKindBootstrapClusterAndLoadImages(ctx, input)
 	Expect(l.moveTargetProvider).NotTo(BeNil(), "creating the move target %s", name)
 	l.moveTargetProxy = framework.NewClusterProxy(name, l.moveTargetProvider.GetKubeconfigPath(), initScheme())
-	clusterctl.InitManagementClusterAndWatchControllerLogs(ctx, clusterctl.InitManagementClusterAndWatchControllerLogsInput{
+	// The framework starts the watches with the context it waits with, so they get one that ends with the step only
+	// until the providers run.
+	watchCtx, detach, cancel := managedtools.DetachableContext(ctx)
+	l.cancelMoveTargetWatches = cancel
+	logFolder := filepath.Join(artifactFolder, "clusters", name)
+	clusterctl.InitManagementClusterAndWatchControllerLogs(watchCtx, clusterctl.InitManagementClusterAndWatchControllerLogsInput{
 		ClusterProxy:            l.moveTargetProxy,
 		ClusterctlConfigPath:    clusterctlConfigPath,
 		InfrastructureProviders: e2eConfig.InfrastructureProviders(),
-		LogFolder:               filepath.Join(artifactFolder, "clusters", name),
+		LogFolder:               logFolder,
 	}, l.intervals("wait-controllers")...)
+	detach()
+	// The namespace does not exist on the target yet; the watch lists nothing until the move creates it.
+	go func() {
+		defer GinkgoRecover()
+		framework.WatchNamespaceEvents(watchCtx, framework.WatchNamespaceEventsInput{
+			ClientSet: l.moveTargetProxy.GetClientSet(),
+			Name:      l.namespace.Name,
+			LogFolder: logFolder,
+		})
+	}()
 }
 
 // delete deletes the Cluster and checks that IBM reports the cluster as gone (404 from CAPIBM's own client) and that
@@ -1215,8 +1341,12 @@ func (l *managedLane) teardownIdentity(ctx context.Context) {
 	Expect(identity.Teardown(ctx, l.mgmt)).To(Succeed(), "tearing down the identity fixture %T", identity)
 }
 
-// disposeMoveTarget deletes the move target's kind cluster, unless -e2e.skip-resource-cleanup keeps it for debugging.
+// disposeMoveTarget stops the move target's watches and deletes its kind cluster, unless -e2e.skip-resource-cleanup
+// keeps the cluster for debugging.
 func (l *managedLane) disposeMoveTarget(ctx context.Context) {
+	if l.cancelMoveTargetWatches != nil {
+		l.cancelMoveTargetWatches()
+	}
 	if l.moveTargetProxy == nil || skipCleanup {
 		return
 	}

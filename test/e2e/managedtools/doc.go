@@ -40,6 +40,14 @@ limitations under the License.
 //     each kept worker left alone, wherever the scheduler put the spread probe's pods.
 //   - The timeout limit (timeouts.go): it lowers every wait's timeout to the time left until the lane's hard timeout,
 //     because the CAPI framework helpers the lanes call poll without a context.
+//   - The lease check (lease.go): in CI only the Boskos lease keeps a second managed run out of the account, so the
+//     lanes stop their steps once the CI heartbeat reports that Boskos refused to renew it.
+//   - The detachable context (contexts.go): work that a step starts but that must outlive it, such as the move
+//     target's controller log streams, stays within the step's deadline while it starts and runs on afterwards.
+//   - The ownership facts (ownership.go): what a clusterctl move must not change, taken from CAPIBM's objects and from
+//     IBM's own worker list, so that a copied spec field cannot make the move look clean. The same file tells an IBM
+//     answer that may pass from IBM's final answer, so that the move step's hold over the facts waits out a single 5xx
+//     instead of failing on it.
 //   - The zone check (zones.go): the Ready workers per zone that a drain through IBM's Ingress ALB budgets needs, so
 //     that a step whose topology cannot drain fails with the zone's name instead of timing out in DrainBlocked.
 //
