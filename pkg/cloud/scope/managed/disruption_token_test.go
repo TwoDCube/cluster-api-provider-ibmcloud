@@ -504,6 +504,50 @@ func TestOtherDrainOwners(t *testing.T) {
 	}
 }
 
+// TestDisruptionTokenDrainingPools checks that a drain-owner marker counts only while its pool exists: the marker of a
+// pool deleted mid-drain would otherwise hold every worker removal of the Cluster until a human removed it.
+func TestDisruptionTokenDrainingPools(t *testing.T) {
+	key := infrav1.NodeAnnotationPrefix + "drain-owner"
+	marked := func(name, owner string) corev1.Node {
+		return corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: map[string]string{key: owner}}}
+	}
+	nodes := []corev1.Node{marked("10.0.0.1", tokenNamespace+"/pool-a"), marked("10.0.0.2", tokenNamespace+"/pool-b"),
+		marked("10.0.0.3", tokenNamespace+"/pool-gone"), marked("10.0.0.4", "written-by-hand"), marked("10.0.0.5", "elsewhere/pool-x")}
+	testCases := []struct {
+		name    string
+		objects []client.Object
+		funcs   interceptor.Funcs
+		want    []string
+		wantErr string
+	}{
+		{name: "a live pool is kept, a deleted one is left out, a marker no pool of the Cluster wrote is kept for a human",
+			objects: []client.Object{tokenPool("pool-b", "uid-b")}, want: []string{tokenNamespace + "/pool-b", "elsewhere/pool-x", "written-by-hand"}},
+		{name: "a recreated pool of the same name still owns its marker", objects: []client.Object{tokenPool("pool-b", "uid-new")},
+			want: []string{tokenNamespace + "/pool-b", "elsewhere/pool-x", "written-by-hand"}},
+		{name: "a failed read is no proof that the pool is gone", objects: []client.Object{tokenPool("pool-b", "uid-b")},
+			funcs: interceptor.Funcs{Get: failPoolReads()}, wantErr: "reading IBMCloudManagedMachinePool capi-managed/pool-b, whose drain-owner " +
+				"marker is on a Node of Cluster dev"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			token, _, _ := newTestToken(t, tokenPool("pool-a", "uid-a"), tc.funcs, tc.objects...)
+			got, err := token.DrainingPools(context.Background(), nodes)
+			if tc.wantErr != "" {
+				g.Expect(err).To(MatchError(ContainSubstring(tc.wantErr)))
+				return
+			}
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(got).To(Equal(tc.want))
+		})
+	}
+	t.Run("no other marker makes no call", func(t *testing.T) {
+		g := NewWithT(t)
+		token, _, _ := newTestToken(t, tokenPool("pool-a", "uid-a"), interceptor.Funcs{Get: failPoolReads()})
+		g.Expect(token.DrainingPools(context.Background(), nodes[:1])).To(BeEmpty())
+	})
+}
+
 func TestCreateError(t *testing.T) {
 	g := NewWithT(t)
 	key := tokenKey()

@@ -71,6 +71,9 @@ const (
 	// ReasonWaitingForWorkloadCluster surfaces while ClusterCache has no connection to the workload cluster, so
 	// nothing can be cordoned, evicted or checked.
 	ReasonWaitingForWorkloadCluster DisruptionReason = infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForWorkloadClusterReason
+	// ReasonWorkersNotReady surfaces while another worker of the pool is not deployed, healthy and Ready for
+	// minReadySeconds, so a replace does not start yet (replace only; DisruptionGates.OthersAvailable).
+	ReasonWorkersNotReady DisruptionReason = infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWorkersNotReadyReason
 	// ReasonWaitingForDisruptionToken surfaces while another pool of the Cluster holds the disruption token, or still
 	// drains Nodes (its drain-owner marker).
 	ReasonWaitingForDisruptionToken DisruptionReason = infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForDisruptionTokenReason
@@ -528,9 +531,21 @@ type DisruptionGates struct {
 	// creates no replacement.
 	AutobalanceEnabled bool
 
-	// OtherDrainOwners are the drain-owner markers of other pools found on any Node of the workload cluster
-	// (OtherDrainOwners). A drain half done before a clusterctl move, which does not move the token, still holds the
-	// Cluster.
+	// OthersAvailable is true when every worker of the pool other than the victim already is what a replace waits for
+	// before it completes: deployed and healthy in the victim's zone, and with a Node Ready for minReadySeconds (replace
+	// only). A replace waits for every worker of its pool, not only for its replacement, and IBM's listing does not tell
+	// the replacement apart from a worker that was broken before; a replace started next to a broken worker (for example
+	// one IBM failed to provision, which has no Node) would therefore wait for as long as that worker stays broken, holding
+	// the Cluster's disruption token all along and with it every scale-down, replace and pool deletion of the Cluster.
+	// Checked before the first cordon, the broken worker holds only the rollout of its own pool, without the token.
+	OthersAvailable bool
+
+	// UnavailableWorkers are the workers of the pool, sorted, that keep OthersAvailable false; the message names them.
+	UnavailableWorkers []string
+
+	// OtherDrainOwners are the drain-owner markers of other pools found on any Node of the workload cluster whose pool
+	// still exists (DisruptionToken.DrainingPools). A drain half done before a clusterctl move, which does not move the
+	// token, still holds the Cluster; the marker of a pool that is gone holds nothing.
 	OtherDrainOwners []string
 }
 
@@ -773,11 +788,31 @@ func (o DisruptionObservation) failingGate() (DisruptionReason, string) {
 			"create no replacement; run `ibmcloud ks worker-pool rebalance` for this pool to enable it"
 	case !o.WorkloadClusterConnected:
 		return ReasonWaitingForWorkloadCluster, "the workload cluster is not connected; nothing is cordoned until it is"
+	case replace && !g.OthersAvailable:
+		return ReasonWorkersNotReady, othersUnavailableMessage(g.UnavailableWorkers)
 	case len(g.OtherDrainOwners) > 0:
 		return ReasonWaitingForDisruptionToken, fmt.Sprintf("Nodes are still drained by IBMCloudManagedMachinePool %s; "+
 			"one worker removal runs at a time", strings.Join(g.OtherDrainOwners, ", "))
 	}
 	return "", ""
+}
+
+// othersUnavailableMessage is the message of the gate that holds a replace while another worker of its pool is not
+// deployed, healthy and Ready for minReadySeconds (DisruptionGates.OthersAvailable). It names the workers, bounded by
+// listWorkers, and says why the replace waits and what a human does about a worker that stays broken; a worker whose Node
+// only soaks for minReadySeconds needs nothing and passes on its own. It is deterministic, so a repeated reconcile writes
+// nothing new.
+//
+// Parameters:
+//   - workers: DisruptionGates.UnavailableWorkers, sorted; empty when the caller could not tell which workers they are.
+func othersUnavailableMessage(workers []string) string {
+	why := "a replace starts only once every other worker of the pool is deployed, healthy and Ready for " +
+		"spec.template.spec.minReadySeconds, because it waits for all of them before it completes"
+	if len(workers) == 0 {
+		return why + "; the other workers of the pool were not evaluated"
+	}
+	return fmt.Sprintf("%s; waiting for %s of the pool; repair or replace a worker that stays broken "+
+		"(for example `ibmcloud ks worker replace`)", why, listWorkers(workers))
 }
 
 // decideInterruption applies the rules that come before the phase rules of an in-flight removal: hand-over to a pool

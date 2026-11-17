@@ -426,7 +426,8 @@ func TestWorkerBeingRemoved(t *testing.T) {
 
 // passingGates returns gates that all pass.
 func passingGates() DisruptionGates {
-	return DisruptionGates{ClusterStateAllows: true, Disruption: DisruptionCheckResult{Allowed: true}, AutobalanceEnabled: true}
+	return DisruptionGates{ClusterStateAllows: true, Disruption: DisruptionCheckResult{Allowed: true}, AutobalanceEnabled: true,
+		OthersAvailable: true}
 }
 
 // passingObservation returns an observation in which every gate and check passes, for op in phase.
@@ -492,6 +493,16 @@ func TestDecideDisruptionStep(t *testing.T) {
 		{name: "auto-rebalance off blocks a replace", op: replace, phase: gated, modify: func(o *DisruptionObservation) { o.Gates.AutobalanceEnabled = false }, want: StepWait, wantReason: ReasonAutoRebalanceDisabled, wantRelease: true, wantMessage: "ibmcloud ks worker-pool rebalance"},
 		{name: "auto-rebalance does not matter for a scale-down", op: scaleDown, phase: gated, modify: func(o *DisruptionObservation) { o.Gates.AutobalanceEnabled = false }, want: StepDrain, wantPhase: draining, wantReason: ReasonDrainingNode, wantDrain: ReasonDrainingNode},
 		{name: "disconnected workload cluster blocks before any cordon", op: scaleDown, phase: gated, modify: func(o *DisruptionObservation) { o.WorkloadClusterConnected = false }, want: StepWait, wantReason: ReasonWaitingForWorkloadCluster, wantRelease: true},
+		{name: "a broken worker of the pool holds a replace before its first cordon", op: replace, phase: gated, modify: func(o *DisruptionObservation) {
+			o.Gates.OthersAvailable, o.Gates.UnavailableWorkers = false, []string{"w3"}
+		}, want: StepWait, wantReason: ReasonWorkersNotReady, wantRelease: true, wantMessage: "waiting for worker w3 of the pool; repair or replace"},
+		{name: "unevaluated other workers fail closed", op: replace, phase: gated, modify: func(o *DisruptionObservation) { o.Gates.OthersAvailable = false; o.Token = TokenNotHeld },
+			want: StepWait, wantReason: ReasonWorkersNotReady, wantMessage: "the other workers of the pool were not evaluated"},
+		{name: "the workload cluster connection is reported before the other workers", op: replace, phase: gated, modify: func(o *DisruptionObservation) {
+			o.WorkloadClusterConnected, o.Gates.OthersAvailable = false, false
+		}, want: StepWait, wantReason: ReasonWaitingForWorkloadCluster, wantRelease: true},
+		{name: "other workers do not matter for a scale-down", op: scaleDown, phase: gated, modify: func(o *DisruptionObservation) { o.Gates.OthersAvailable = false }, want: StepDrain, wantPhase: draining, wantReason: ReasonDrainingNode, wantDrain: ReasonDrainingNode},
+		{name: "other workers do not matter for a replace in flight", op: replace, phase: draining, modify: func(o *DisruptionObservation) { o.Gates.OthersAvailable = false }, want: StepWaitForVolumeDetach, wantPhase: detach, wantReason: ReasonDrainingNode, wantDrain: ReasonWaitingForVolumeDetach},
 		{name: "another pool's drain-owner marker defers", op: deletion, phase: gated, modify: func(o *DisruptionObservation) {
 			o.Gates.OtherDrainOwners = []string{"ns/pool-b", "ns/pool-c"}
 			o.Token = TokenNotHeld
@@ -812,10 +823,10 @@ func TestDecideDisruptionStepHandOver(t *testing.T) {
 
 // TestDecideDisruptionStepSafetyProperties checks the safety properties of DecideDisruptionStep over generated
 // observations: the IBM call is never decided while evictable pods may remain, unless the drain timed out or is
-// excluded; the call and every cordon need the token; the call is never repeated within DisruptionSettleDelay; a
-// removal is aborted only before the IBM call or after IBM ignored it for WorkerStuckAfter; a Cluster deletion stops
-// everything; a hand-over restarts at Draining; and every recorded phase is valid for the next decision. The generator
-// is seeded, so a failure reproduces.
+// excluded; the call and every cordon need the token; a replace starts only while every other worker of its pool is
+// available; the call is never repeated within DisruptionSettleDelay; a removal is aborted only before the IBM call or
+// after IBM ignored it for WorkerStuckAfter; a Cluster deletion stops everything; a hand-over restarts at Draining; and
+// every recorded phase is valid for the next decision. The generator is seeded, so a failure reproduces.
 func TestDecideDisruptionStepSafetyProperties(t *testing.T) {
 	g := NewWithT(t)
 	// A seeded generator, so that a failing input reproduces; nothing here needs unpredictable numbers.
@@ -843,7 +854,7 @@ func TestDecideDisruptionStepSafetyProperties(t *testing.T) {
 			PoolDeleting: rng.IntN(4) == 0, TriggerActive: coin(), Token: tokens[rng.IntN(len(tokens))],
 			WorkloadClusterConnected: coin(),
 			Gates: DisruptionGates{ClusterStateAllows: coin(), MasterUpdating: coin(), Disruption: check(),
-				Autoscaled: coin(), AutobalanceEnabled: coin()},
+				Autoscaled: coin(), AutobalanceEnabled: coin(), OthersAvailable: coin()},
 			Drain: DrainProgress{Excluded: rng.IntN(4) == 0, TimedOut: rng.IntN(4) == 0, Done: coin(), Blocked: coin(),
 				DetachExcluded: rng.IntN(4) == 0, DetachTimedOut: rng.IntN(4) == 0, VolumesDetached: coin()},
 			PreCallGate: check(),
@@ -887,6 +898,9 @@ func TestDecideDisruptionStepSafetyProperties(t *testing.T) {
 		if d.Step == StepDrain {
 			g.Expect(o.Token).To(Equal(TokenHeld), "cordon without the disruption token: %+v", o)
 			g.Expect(o.WorkloadClusterConnected).To(BeTrue(), "drain without a workload cluster connection: %+v", o)
+			// A replace that starts next to a worker it would wait for forever would hold the token for as long.
+			g.Expect(o.Operation != infrav1.WorkerDisruptionOperationReplace || phase != "" || o.Gates.OthersAvailable).To(BeTrue(),
+				"a replace starts while another worker of the pool is not available: %+v", o)
 		}
 		if d.Step == StepAbort {
 			g.Expect(o.Operation).NotTo(Equal(infrav1.WorkerDisruptionOperationDeletePool), "%+v", o)

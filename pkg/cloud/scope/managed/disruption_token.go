@@ -46,7 +46,7 @@ import (
 // leader election: there is no renewal and no expiry. A holder that no longer exists (its IBMCloudManagedMachinePool
 // was deleted or recreated) is replaced, with UID and resourceVersion preconditions so that two pools replacing the
 // same stale holder cannot both win. clusterctl move does not move the Lease, so a pool also defers to any Node that
-// carries another pool's drain-owner marker (OtherDrainOwners).
+// carries the drain-owner marker of another pool that still exists (DrainingPools).
 
 // disruptionLeaseSuffix ends the name of every disruption token Lease: <cluster-name>-ibm-worker-disruption.
 const disruptionLeaseSuffix = "-ibm-worker-disruption"
@@ -388,7 +388,8 @@ func DrainOwner(pool *infrav1.IBMCloudManagedMachinePool) string {
 
 // OtherDrainOwners returns, sorted and without duplicates, the drain-owner markers on nodes that name another pool than
 // self. Before it takes the token, a pool defers to such a Node: clusterctl move does not move the Lease, so after a
-// move the marker is what still shows that another pool's drain is half done.
+// move the marker is what still shows that another pool's drain is half done. A marker can outlive its pool;
+// DisruptionToken.DrainingPools leaves those out.
 //
 // Parameters:
 //   - nodes: every Node of the workload cluster.
@@ -407,4 +408,41 @@ func OtherDrainOwners(nodes []corev1.Node, self string) []string {
 	}
 	sort.Strings(others)
 	return others
+}
+
+// DrainingPools returns, sorted, the other pools that still drain Nodes of the workload cluster: the drain-owner markers
+// on nodes that name another pool than this one (OtherDrainOwners) and whose IBMCloudManagedMachinePool still exists.
+// A marker outlives its pool when the pool goes while its drain is in flight (a finalizer removed by hand, or a deletion
+// that leaves the IBM pool to another object and could not revert the cordons); deferring to it would hold every
+// worker removal of the Cluster until a human removed the annotation. It mirrors the stale-holder rule of the Lease
+// (isStale): an owner counts as gone only when the API reader, not the cache, does not find it, so that a pool the cache
+// does not show yet is never passed over. An owner that does not parse as "<namespace>/<name>" was not written by CAPIBM,
+// and one outside the Cluster's namespace is no pool of this Cluster (a pool shares its Cluster's namespace); both are
+// kept without a read, so that a human decides and no read needs access to another namespace. A marker carries no UID,
+// so a pool recreated under the same name counts as its owner.
+//
+// Parameters:
+//   - ctx: bounds the API calls; one Get per owner found.
+//   - nodes: every Node of the workload cluster.
+//
+// It returns an error when an owner cannot be read; the caller requeues.
+func (t *DisruptionToken) DrainingPools(ctx context.Context, nodes []corev1.Node) ([]string, error) {
+	var live []string
+	for _, owner := range OtherDrainOwners(nodes, DrainOwner(t.params.Pool)) {
+		namespace, name, found := strings.Cut(owner, "/")
+		if !found || namespace != t.key.Namespace || name == "" || strings.Contains(name, "/") {
+			live = append(live, owner)
+			continue
+		}
+		err := t.params.APIReader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &infrav1.IBMCloudManagedMachinePool{})
+		switch {
+		case apierrors.IsNotFound(err):
+			continue
+		case err != nil:
+			return nil, fmt.Errorf("reading IBMCloudManagedMachinePool %s, whose drain-owner marker is on a Node of Cluster %s: %w",
+				owner, t.params.Cluster.Name, err)
+		}
+		live = append(live, owner)
+	}
+	return live, nil
 }
