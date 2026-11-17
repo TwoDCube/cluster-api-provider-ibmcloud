@@ -238,6 +238,27 @@ func TestDecideBinding(t *testing.T) {
 				in.Now = last.Add(CreateGracePeriod - time.Second)
 				return in
 			}},
+		// In delete mode the end of row 3 removes the finalizer without a DELETE (row 4), so a cluster IBM accepted
+		// with 201 but lists late gets the delete lookup grace, like row 9, instead of CreateGracePeriod.
+		{name: "row3_deleting_waits_the_delete_lookup_grace", action: BindingWait, row: "3",
+			reason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCreatingReason,
+			message: []string{"2026-11-16T03:05:00Z", "until 2026-11-16T03:35:00Z", "before it counts the cluster as gone"},
+			in: func() BindingInput {
+				in := bindingIKSInput(nil)
+				in.StatusClusterID, in.Deleting = iksID, true
+				in.Intent = controlplanev1.CreateIntent{ClusterName: in.Name, InFlightAttemptTime: metav1.NewTime(time.Date(2026, 11, 16, 3, 5, 0, 0, time.UTC))}
+				in.Now = time.Date(2026, 11, 16, 3, 11, 0, 0, time.UTC)
+				return in
+			}},
+		{name: "row3_deleting_grace_edge_is_row4", action: BindingTerminal, row: "4",
+			reason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMClusterNotFoundReason,
+			in: func() BindingInput {
+				in := bindingIKSInput(nil)
+				in.StatusClusterID, in.Deleting = iksID, true
+				in.Intent = controlplanev1.CreateIntent{ClusterName: in.Name, InFlightAttemptTime: metav1.NewTime(time.Date(2026, 11, 16, 3, 5, 0, 0, time.UTC))}
+				in.Now = time.Date(2026, 11, 16, 3, 35, 0, 0, time.UTC)
+				return in
+			}},
 		{name: "row4_known_id_404_without_intent", action: BindingTerminal, row: "4",
 			reason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMClusterNotFoundReason,
 			message: []string{"reports no cluster iksclusterid00000001, named by status.clusterID", "never creates a replacement"},

@@ -151,8 +151,8 @@ type BindingInput struct {
 	// Now is the caller's clock reading. Required.
 	Now time.Time
 
-	// Deleting selects the delete mode, which the delete flow uses: row 9 waits DeleteLookupGracePeriod, row 10 means
-	// there is nothing to delete, and a same-named cluster that an attempt of unknown outcome may have created is
+	// Deleting selects the delete mode, which the delete flow uses: rows 3 and 9 wait DeleteLookupGracePeriod, row 10
+	// means there is nothing to delete, and a same-named cluster that an attempt of unknown outcome may have created is
 	// PossibleOwnClusterFound.
 	Deleting bool
 }
@@ -244,7 +244,8 @@ type BindingDecision struct {
 //   - 2: status is empty (for example after clusterctl move), the Secret's cluster-id is set, GetCluster(that id)
 //     finds the cluster, and the candidate checks and the proof of possession pass: Known.
 //   - 2b: as row 2, but a candidate check or the proof fails: Terminal(OwnershipNotProven).
-//   - 3: row 1 or 2 got a 404 within CreateGracePeriod of the latest create attempt: Wait (read-after-create lag).
+//   - 3: row 1 or 2 got a 404 within CreateGracePeriod (DeleteLookupGracePeriod in delete mode) of the latest create
+//     attempt: Wait (read-after-create lag).
 //   - 4: row 1 or 2 got a 404 otherwise: Terminal(IBMClusterNotFound); a cluster that existed is never recreated.
 //   - 5: no ID; the same-named cluster passes the candidate checks, spec.controlPlaneEndpoint is set and matches it
 //     (EndpointMatches, only while AdoptByEndpointMatch is on), and the proof passes: Known.
@@ -312,13 +313,20 @@ func (in BindingInput) decideByID(id string, fromStatus bool) BindingDecision {
 		source = "the cluster-id annotation of the kubeconfig Secret"
 	}
 	if in.Found == nil {
-		// Row 3: a 201 recorded the ID, but IBM does not list the cluster yet (read-after-create lag).
-		if latest, ok := in.latestAttempt(); ok && in.Now.Sub(latest) < CreateGracePeriod {
-			until := latest.Add(CreateGracePeriod)
+		// Row 3: a 201 recorded the ID, but IBM does not list the cluster yet (read-after-create lag). In delete mode it
+		// waits DeleteLookupGracePeriod, as row 9 does: once the wait ends, row 4 removes the finalizer without a DELETE,
+		// so a cluster IBM accepted but lists late would keep running unseen.
+		grace := in.lookupGrace()
+		if latest, ok := in.latestAttempt(); ok && in.Now.Sub(latest) < grace {
+			until := latest.Add(grace)
+			next := ""
+			if in.Deleting {
+				next = " before it counts the cluster as gone"
+			}
 			return BindingDecision{Action: BindingWait, Row: "3", WaitUntil: until,
 				Reason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCreatingReason,
 				Message: fmt.Sprintf("IBM Cloud does not list cluster %s yet; CAPIBM sent its create request at %s and "+
-					"waits until %s for IBM to list it", id, bindingTime(latest), bindingTime(until))}
+					"waits until %s for IBM to list it%s", id, bindingTime(latest), bindingTime(until), next)}
 		}
 		// Row 4: the cluster existed and is gone; it is never recreated.
 		return BindingDecision{Action: BindingTerminal, Row: "4",
@@ -375,10 +383,7 @@ func (in BindingInput) decideByName(adoptByEndpointMatch bool) BindingDecision {
 	first, last, unknown := in.unknownOutcomeWindow()
 	endpointSet := in.Endpoint != controlplanev1.APIEndpoint{}
 	if in.Found == nil {
-		grace := CreateGracePeriod
-		if in.Deleting {
-			grace = DeleteLookupGracePeriod
-		}
+		grace := in.lookupGrace()
 		switch {
 		case endpointSet:
 			// Row 8: the endpoint is only set once the cluster existed.
@@ -477,6 +482,17 @@ func (in BindingInput) candidateProblems(c *kubernetesservice.Cluster, wantID st
 		problems = append(problems, fmt.Sprintf("its provider is %s, not %s", c.Provider, bindingProviderVPCGen2))
 	}
 	return problems
+}
+
+// lookupGrace returns how long after a create attempt a lookup that finds nothing still waits for IBM to list the
+// cluster (rows 3 and 9): CreateGracePeriod in the normal flow, where the wait only delays the next step, and the
+// longer DeleteLookupGracePeriod in delete mode, where the end of the wait removes the finalizer without a DELETE and
+// a cluster IBM lists late would be left running.
+func (in BindingInput) lookupGrace() time.Duration {
+	if in.Deleting {
+		return DeleteLookupGracePeriod
+	}
+	return CreateGracePeriod
 }
 
 // relevantIntent reports whether status.createIntent records attempts for this control plane's name. An intent for

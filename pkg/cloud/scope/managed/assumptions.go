@@ -116,8 +116,8 @@ const CreatedDateSlack = 10 * time.Minute
 const CreateGracePeriod = 5 * time.Minute
 
 // DeleteLookupGracePeriod replaces CreateGracePeriod while a control plane with a create intent is deleted and the
-// lookup by name finds nothing: the finalizer stays this long, so that a cluster IBM lists late is still found and
-// deleted. Not yet verified against IBM Cloud: default 30 minutes; fallback: longer.
+// lookup finds nothing, by name or by the ID of a create IBM accepted: the finalizer stays this long, so that a cluster
+// IBM lists late is still found and deleted. Not yet verified against IBM Cloud: default 30 minutes; fallback: longer.
 const DeleteLookupGracePeriod = 30 * time.Minute
 
 // AdoptByEndpointMatch lets DecideBinding adopt a same-named cluster whose master URL matches
