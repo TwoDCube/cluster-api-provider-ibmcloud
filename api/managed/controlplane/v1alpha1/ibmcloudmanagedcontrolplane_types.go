@@ -69,7 +69,8 @@ const (
 	// PublicServiceEndpointEnabled gives the master a public service endpoint; it is also the meaning of an omitted
 	// endpoints.publicServiceEndpoint.
 	PublicServiceEndpointEnabled PublicServiceEndpointPolicy = "Enabled"
-	// PublicServiceEndpointDisabled makes the cluster private-only (not yet verified against IBM Cloud).
+	// PublicServiceEndpointDisabled makes the cluster private-only. Verified against IBM Cloud for IKS, managed from a
+	// management cluster inside the cluster's VPC; private-only OpenShift clusters are not yet verified.
 	PublicServiceEndpointDisabled PublicServiceEndpointPolicy = "Disabled"
 )
 
@@ -172,7 +173,9 @@ type COSInstanceReference struct {
 type EndpointsSpec struct {
 	// publicServiceEndpoint enables (when omitted) or disables the public master endpoint. With Disabled the cluster
 	// is private-only and the management cluster must reach the private master URL (VPN, Direct Link, Transit Gateway
-	// or running in IBM Cloud). Not yet verified against IBM Cloud. Immutable (spec-level rule compares effective values).
+	// or running in IBM Cloud). Verified against IBM Cloud for IKS with the management cluster inside the cluster's
+	// VPC; private-only OpenShift clusters and the other ways to reach the private URL are not yet verified. Immutable
+	// (spec-level rule compares effective values).
 	// +optional
 	PublicServiceEndpoint PublicServiceEndpointPolicy `json:"publicServiceEndpoint,omitempty"`
 }
