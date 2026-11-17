@@ -37,6 +37,7 @@ import (
 	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
 	infrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/v1alpha1"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/credentials"
+	managedscope "sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/scope/managed"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
 	ksmock "sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice/mock"
 
@@ -542,20 +543,85 @@ func TestControlPlaneDeleteBinding(t *testing.T) {
 		condition := expectCondition(g, expectDeleting(g, f, controlplanev1.IBMCloudManagedControlPlaneDeletingOwnershipNotProvenReason),
 			controlplanev1.IBMCloudManagedControlPlaneDeletingCondition, metav1.ConditionTrue,
 			controlplanev1.IBMCloudManagedControlPlaneDeletingOwnershipNotProvenReason)
+		// The Secret's cluster-id decided, so a fresh admin kubeconfig can still prove ownership: the message offers it.
+		g.Expect(condition.Message).To(ContainSubstring("put a fresh admin kubeconfig (ibmcloud ks cluster config --admin) into the kubeconfig Secret"))
 		g.Expect(condition.Message).To(HaveSuffix("or remove the finalizer ibmcloudmanagedcontrolplane.controlplane.cluster.x-k8s.io by hand to orphan the IBM cluster"))
 	})
 
-	t.Run("a binding mismatch keeps the finalizer and never deletes", func(t *testing.T) {
+	t.Run("a binding mismatch keeps the finalizer, never deletes and names only the ways out that work", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newCPFixture(t, newDeletingCPObjects())
 		other := cpCluster("normal")
 		other.Type = "openshift"
 		f.expectGetByID(other)
 
+		result, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		expectRequeue(g, result, 15*time.Minute)
+		condition := expectCondition(g, expectDeleting(g, f, controlplanev1.IBMCloudManagedControlPlaneDeletingOwnershipNotProvenReason),
+			controlplanev1.IBMCloudManagedControlPlaneDeletingCondition, metav1.ConditionTrue,
+			controlplanev1.IBMCloudManagedControlPlaneDeletingOwnershipNotProvenReason)
+		// status.clusterID decides this case, not the kubeconfig Secret, so a new Secret is never offered as the fix.
+		g.Expect(condition.Message).To(Equal("IBM cluster iksclusterid00000001, named by status.clusterID, does not match this " +
+			"control plane: its type is openshift, not kubernetes (spec.distribution Kubernetes); CAPIBM changes nothing on it " +
+			"and writes no kubeconfig Secret; CAPIBM never deletes it. Check it in IBM Cloud: if it belongs to this Cluster, " +
+			"delete it there, and CAPIBM removes the finalizer once it finds the cluster gone; otherwise remove the finalizer " +
+			"ibmcloudmanagedcontrolplane.controlplane.cluster.x-k8s.io by hand, which leaves the IBM cluster alone"))
+		g.Expect(condition.Message).NotTo(ContainSubstring("admin kubeconfig"))
+	})
+
+	t.Run("after a binding mismatch, deleting the IBM cluster removes the finalizer", func(t *testing.T) {
+		g := NewWithT(t)
+		objs := newDeletingCPObjects()
+		objs.cp.Status.Conditions = append(objs.cp.Status.Conditions, metav1.Condition{
+			Type: controlplanev1.IBMCloudManagedControlPlaneDeletingCondition, Status: metav1.ConditionTrue,
+			Reason: controlplanev1.IBMCloudManagedControlPlaneDeletingOwnershipNotProvenReason, LastTransitionTime: metav1.NewTime(cpTestStart),
+		})
+		f := newCPFixture(t, objs)
+		// The operator deleted the mismatched cluster in IBM Cloud: its ID answers 404 and no same-named cluster exists.
+		gomock.InOrder(f.expectGetByID(nil), f.expectLookupByName(nil))
+
 		_, err := f.reconcile()
 
 		g.Expect(err).NotTo(HaveOccurred())
-		expectDeleting(g, f, controlplanev1.IBMCloudManagedControlPlaneDeletingOwnershipNotProvenReason)
+		g.Expect(f.controlPlane()).To(BeNil(), "the way out the message names works")
+	})
+
+	// IBM accepted the create with 201 (status.clusterID recorded, the attempt still in flight) and the Cluster is
+	// deleted at once. While IBM does not list the new ID yet, the finalizer is all that stops the cluster from being
+	// orphaned, so the delete flow waits as long as for a lookup by name, not just CreateGracePeriod.
+	t.Run("a cluster IBM accepted but does not list yet keeps the finalizer for the delete lookup grace", func(t *testing.T) {
+		g := NewWithT(t)
+		objs := newDeletingCPObjects()
+		attempt := cpTestStart.Add(-6 * time.Minute)
+		objs.cp.Status.CreateIntent = controlplanev1.CreateIntent{ClusterName: cpTestName, InFlightAttemptTime: metav1.NewTime(attempt)}
+		f := newCPFixture(t, objs)
+		f.expectGetByID(nil) // no DeleteCluster expectation, and no lookup by name: row 3 waits
+
+		result, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		expectRequeue(g, result, time.Minute)
+		condition := expectCondition(g, expectDeleting(g, f, controlplanev1.IBMCloudManagedControlPlaneDeletingWaitingForIBMDeletionReason),
+			controlplanev1.IBMCloudManagedControlPlaneDeletingCondition, metav1.ConditionTrue,
+			controlplanev1.IBMCloudManagedControlPlaneDeletingWaitingForIBMDeletionReason)
+		g.Expect(condition.Message).To(Equal("IBM Cloud does not list cluster iksclusterid00000001 yet; CAPIBM sent its create " +
+			"request at 2026-11-16T02:59:30Z and waits until 2026-11-16T03:29:30Z for IBM to list it before it counts the cluster as gone"))
+		g.Expect(f.events()).To(BeEmpty(), "no deletion is claimed while IBM may still list the cluster")
+
+		// One second before the grace ends it still waits; at its end IBM's 404 counts, and the finalizer goes.
+		f.clock.SetTime(attempt.Add(managedscope.DeleteLookupGracePeriod - time.Second))
+		f.expectGetByID(nil)
+		_, err = f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+		expectDeleting(g, f, controlplanev1.IBMCloudManagedControlPlaneDeletingWaitingForIBMDeletionReason)
+
+		f.clock.SetTime(attempt.Add(managedscope.DeleteLookupGracePeriod))
+		gomock.InOrder(f.expectGetByID(nil), f.expectLookupByName(nil))
+		_, err = f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(f.controlPlane()).To(BeNil())
 	})
 
 	t.Run("a 401 on delete rebuilds only that identity", func(t *testing.T) {

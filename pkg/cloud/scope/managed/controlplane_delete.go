@@ -141,7 +141,7 @@ func (s *ControlPlaneScope) actOnDeleteBinding(ctx context.Context, clients *con
 	case BindingKnown:
 		return s.deleteKnownCluster(ctx, clients, decision)
 	case BindingWait:
-		// Row 3 or 9: a create of unknown outcome may still show up; DeleteLookupGracePeriod bounds row 9.
+		// Row 3 or 9: a create of CAPIBM's may still show up; DeleteLookupGracePeriod bounds both in delete mode.
 		s.setDeleting(controlplanev1.IBMCloudManagedControlPlaneDeletingWaitingForIBMDeletionReason, decision.Message)
 		return NotDone(IntervalDelete, controlplanev1.IBMCloudManagedControlPlaneDeletingWaitingForIBMDeletionReason), false
 	case BindingNothingToDelete:
@@ -155,8 +155,9 @@ func (s *ControlPlaneScope) actOnDeleteBinding(ctx context.Context, clients *con
 }
 
 // deleteUnprovenCluster handles a terminal binding decision in delete mode: the finalizer stays while the cluster may
-// be this control plane's (PossibleOwnClusterFound, OwnershipNotProven), and goes when it cannot be (a cluster that is
-// gone, or a same-named cluster with no create attempt of unknown outcome).
+// be this control plane's (PossibleOwnClusterFound, BindingMismatch, OwnershipNotProven), and goes when it cannot be
+// (a cluster that is gone, or a same-named cluster with no create attempt of unknown outcome). Each kept finalizer's
+// message names the ways out that can change the decision.
 //
 // Parameters:
 //   - ctx is the reconcile context.
@@ -165,16 +166,27 @@ func (s *ControlPlaneScope) actOnDeleteBinding(ctx context.Context, clients *con
 //   - name is the effective IBM cluster name.
 func (s *ControlPlaneScope) deleteUnprovenCluster(ctx context.Context, clients *controlPlaneClients, decision BindingDecision,
 	name string) (Outcome, bool) {
+	finalizer := controlplanev1.IBMCloudManagedControlPlaneFinalizer
 	switch decision.Reason {
 	case controlplanev1.IBMCloudManagedControlPlaneDeletingPossibleOwnClusterFoundReason:
 		s.setDeleting(decision.Reason, decision.Message)
 		return NotDone(IntervalTerminalRecheck, decision.Reason), false
-	case controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedBindingMismatchReason,
-		controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedOwnershipNotProvenReason:
+	case controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedBindingMismatchReason:
+		// Row 1b is decided from status.clusterID and IBM's answer alone; no kubeconfig Secret and no proof enter it, so
+		// a fresh admin kubeconfig changes nothing. The decision changes only when the cluster is deleted in IBM Cloud
+		// (a later check then finds it gone, row 4), or the finalizer goes by hand.
+		reason := controlplanev1.IBMCloudManagedControlPlaneDeletingOwnershipNotProvenReason
+		s.setDeleting(reason, decision.Message+fmt.Sprintf("; CAPIBM never deletes it. Check it in IBM Cloud: if it belongs to "+
+			"this Cluster, delete it there, and CAPIBM removes the finalizer once it finds the cluster gone; otherwise remove "+
+			"the finalizer %s by hand, which leaves the IBM cluster alone", finalizer))
+		return NotDone(IntervalTerminalRecheck, reason), false
+	case controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedOwnershipNotProvenReason:
+		// Row 2b is decided by the proof of possession with the kubeconfig Secret's credential, so a fresh admin
+		// kubeconfig of that cluster can still bind and then delete it.
 		reason := controlplanev1.IBMCloudManagedControlPlaneDeletingOwnershipNotProvenReason
 		s.setDeleting(reason, decision.Message+fmt.Sprintf("; CAPIBM never deletes it: put a fresh admin kubeconfig (ibmcloud ks "+
 			"cluster config --admin) into the kubeconfig Secret, or remove the finalizer %s by hand to orphan the IBM cluster",
-			controlplanev1.IBMCloudManagedControlPlaneFinalizer))
+			finalizer))
 		return NotDone(IntervalTerminalRecheck, reason), false
 	case controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMClusterNotFoundReason:
 		if decision.Row == "4" {
