@@ -331,7 +331,7 @@ func ManagementServerURL(d controlplanev1.Distribution, c *kubernetesservice.Clu
 //   - u: the parsed masterURL.
 func masterURLProblem(u *url.URL) string {
 	switch {
-	case u.Scheme != httpsScheme:
+	case u.Scheme != "https":
 		return fmt.Sprintf("uses scheme %q; CAPIBM connects to IBM masters only over https", u.Scheme)
 	case u.User != nil:
 		return "carries user information; a master URL names only a host and a port"
