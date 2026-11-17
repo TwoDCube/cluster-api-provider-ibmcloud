@@ -758,6 +758,9 @@ func (s *MachinePoolScope) reconcileSize(ctx context.Context, clients *poolClien
 		}
 		return outcome
 	case desired > pool.SizePerZone:
+		if err := s.releaseIdleToken(ctx, input.workload, input.marked); err != nil {
+			return Transient(err)
+		}
 		return s.growPool(ctx, clients, pool, desired)
 	case desired < pool.SizePerZone && !replacing:
 		rollout.reportHeldByScaleDown()

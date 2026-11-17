@@ -554,14 +554,39 @@ func (s *MachinePoolScope) reconcileScaleDown(ctx context.Context, in scaleDownI
 	if err != nil {
 		return Transient(err)
 	}
-	switch {
-	case len(sd.plan.Victims) > 0:
+	if len(sd.plan.Victims) > 0 {
 		return sd.run(ctx)
-	case in.triggerGone:
+	}
+	// No victim: no removal of this pool is in flight, and the resize without victims takes no token.
+	if err := s.releaseIdleToken(ctx, in.workload, in.marked); err != nil {
+		return Transient(err)
+	}
+	if in.triggerGone {
 		// A failing guard blocks every IBM mutation (PoolGuardResult), and the resize without victims is one.
 		return s.reportReadiness(in.pool, in.workers, in.desired)
 	}
 	return sd.resizeWithoutVictims(ctx)
+}
+
+// releaseIdleToken gives the Cluster's disruption token back when this pool holds it while no worker removal of the pool
+// is in flight: status.disruption is empty and no Node carries this pool's drain-owner marker. A removal takes the token
+// right before its first cordon and records itself only with that cordon; when the cordon fails, or the controller
+// stops, or the status patch is lost in between, nothing records the removal, and once its reason goes away (the
+// MachinePool's replicas restored, the worker no longer due) no removal step runs again to release the token. Every other
+// pool of the Cluster would then wait for it in WaitingForDisruptionToken until a human deleted the Lease. Release is a
+// no-op when another pool or no pool holds the token, so the idle paths call this on every reconcile, at the cost of one
+// read of the Lease. While the workload cluster is not connected the markers cannot be read, so a removal whose status
+// was lost cannot be ruled out and the token is kept, which fails closed.
+//
+// Parameters:
+//   - ctx is the reconcile context.
+//   - workload is the workload cluster as this reconcile read it (readWorkloadNodes); no client while not connected.
+//   - marked are the pool's workers whose Nodes carry this pool's drain-owner marker (markedWorkers).
+func (s *MachinePoolScope) releaseIdleToken(ctx context.Context, workload workloadNodes, marked []string) error {
+	if workload.client == nil || s.Pool.Status.Disruption.Operation != "" || len(marked) > 0 {
+		return nil
+	}
+	return s.releaseToken(ctx)
 }
 
 // newScaleDownInput gathers what the scale-down reads besides IBM's listings: the workload cluster's Nodes and the
@@ -617,6 +642,9 @@ func (s *MachinePoolScope) reconcileGuardBlocked(ctx context.Context, clients *p
 		return s.settleReplace(ctx, input, guards)
 	}
 	if inFlight == "" && len(input.marked) == 0 {
+		if err := s.releaseIdleToken(ctx, input.workload, input.marked); err != nil {
+			return Transient(err)
+		}
 		return s.guardOutcome(guards)
 	}
 	input.triggerGone = true
@@ -770,6 +798,12 @@ func (sd *scaleDown) observation(ctx context.Context) (DisruptionObservation, er
 	if err != nil {
 		return DisruptionObservation{}, err
 	}
+	// The drain-owner markers of a pool that no longer exists hold no drain: they are left out of the gate, and the drain
+	// step takes them over on a victim Node.
+	owners, err := sd.runner.drainingPools(ctx, sd.token, sd.workload.nodes)
+	if err != nil {
+		return DisruptionObservation{}, err
+	}
 	gate, err := sd.check(false)
 	if err != nil {
 		return DisruptionObservation{}, err
@@ -799,7 +833,7 @@ func (sd *scaleDown) observation(ctx context.Context) (DisruptionObservation, er
 			ClusterStateAllows: sd.runner.clusterStateCheck().Allowed,
 			Disruption:         gate,
 			Autoscaled:         sd.pool.AutoscaleEnabled,
-			OtherDrainOwners:   OtherDrainOwners(sd.workload.nodes, DrainOwner(sd.s.Pool)),
+			OtherDrainOwners:   owners,
 		},
 		PreCallGate: preCall,
 		IBM:         sd.verified.Progress,

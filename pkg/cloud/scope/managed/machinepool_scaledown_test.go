@@ -557,16 +557,45 @@ func TestMachinePoolScopeScaleDownGates(t *testing.T) {
 			g.Expect(f.cordoned()).To(BeEmpty())
 		})
 	}
+	markOtherNode := func(g Gomega, f *scaleDownFixture, owner string) {
+		node := &corev1.Node{}
+		g.Expect(f.workload.Get(context.Background(), client.ObjectKey{Name: "10.0.1.1"}, node)).To(Succeed())
+		node.Annotations = map[string]string{infrav1.NodeAnnotationPrefix + drain.MarkerDrainOwner: owner}
+		g.Expect(f.workload.Update(context.Background(), node)).To(Succeed())
+	}
 	t.Run("another pool's drain on a Node holds the scale-down", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newScaleDownFixture(t, nil)
-		node := &corev1.Node{}
-		g.Expect(f.workload.Get(context.Background(), client.ObjectKey{Name: "10.0.1.1"}, node)).To(Succeed())
-		node.Annotations = map[string]string{infrav1.NodeAnnotationPrefix + drain.MarkerDrainOwner: poolTestNamespace + "/other"}
-		g.Expect(f.workload.Update(context.Background(), node)).To(Succeed())
+		f.others = append(f.others, poolObject("other", "other"))
+		markOtherNode(g, f, poolTestNamespace+"/other")
 		f.expect()
 		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalGuarded, string(ReasonWaitingForDisruptionToken))))
 		g.Expect(f.ready().Message).To(ContainSubstring("Nodes are still drained by IBMCloudManagedMachinePool " + poolTestNamespace + "/other"))
+	})
+	t.Run("the_drain_marker_of_a_pool_that_no_longer_exists_holds_nothing", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newScaleDownFixture(t, nil)
+		markOtherNode(g, f, poolTestNamespace+"/gone")
+		f.expect()
+		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNode))))
+		g.Expect(f.cordoned()).To(Equal([]string{"10.0.0.1", "10.0.0.2"}))
+	})
+	// A pool that went mid-drain without reverting its cordons (its finalizer removed by hand) left its marker on a victim:
+	// the scale-down takes the token and drains that Node as its own, with the time limit counted from its own cordon.
+	t.Run("a_victim_marked_by_a_pool_that_no_longer_exists_is_drained_for_this_pool", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newScaleDownFixture(t, nil)
+		f.machinePool.Spec.Template.Spec.Deletion.NodeDrainTimeoutSeconds = ptr.To[int32](3600)
+		cordonForGonePool(t, f.workload, "10.0.0.1", poolTestNamespace+"/gone")
+		f.expect()
+		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNode))))
+		expectTakenOver(t, f.workload, "10.0.0.1", f.pool, poolTestNow)
+		expectTakenOver(t, f.workload, "10.0.0.2", f.pool, poolTestNow)
+		g.Expect(f.lease().Spec.HolderIdentity).To(Equal(ptr.To(DisruptionTokenHolder(f.pool))))
+		g.Expect(f.pool.Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseDraining))
+		g.Expect(f.pool.Status.Disruption.DrainStartTime.Time).To(BeTemporally("==", poolTestNow))
+		g.Expect(f.ready().Reason).To(Equal(string(ReasonDrainingNode)))
+		g.Expect(f.draining().Status).To(Equal(metav1.ConditionTrue))
 	})
 	t.Run("an autoscaled pool is not shrunk", func(t *testing.T) {
 		g := NewWithT(t)
@@ -1327,7 +1356,8 @@ func TestMachinePoolScopeScaleDownPreexistingRemoval(t *testing.T) {
 
 // TestMachinePoolScopeScaleDownGuardBlocked checks that a guard failing while a scale-down is in flight does not
 // freeze it: before the IBM call it is given up (uncordon, release), after the call it follows IBM, and the guard is
-// reported once nothing is in flight.
+// reported once nothing is in flight, when a disruption token this pool kept is released too. A pool name conflict is
+// the exception: no claimant may act, so the removal waits without an IBM call and says so.
 func TestMachinePoolScopeScaleDownGuardBlocked(t *testing.T) {
 	guards := []struct {
 		name       string
@@ -1409,6 +1439,65 @@ func TestMachinePoolScopeScaleDownGuardBlocked(t *testing.T) {
 		g.Expect(f.ready().Reason).To(Equal(infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyPoolNameConflictReason))
 		g.Expect(f.ready().Message).To(ContainSubstring("the ScaleDown removal of this pool is in flight; while the conflict lasts"))
 		g.Expect(f.cordoned()).To(Equal([]string{"10.0.0.1", "10.0.0.2"}))
+	})
+	t.Run("without_a_scale-down_in_flight_a_token_this_pool_kept_is_released", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newScaleDownFixture(t, nil)
+		// The token was taken for a removal that recorded nothing: its first cordon failed, then the replicas changed.
+		f.others = append(f.others, heldLease(DisruptionTokenHolder(f.pool)))
+		f.machinePool.Spec.Replicas = ptr.To[int32](3)
+		f.expect()
+		g.Expect(f.reconcile().Kind).To(Equal(OutcomeTerminal))
+		g.Expect(f.lease()).To(BeNil())
+	})
+}
+
+// TestMachinePoolScopeScaleDownReleasesAnIdleToken checks the sizing paths of a pool that run no removal (a resize
+// without victims, a growth): a token this pool took for a removal that recorded nothing (its first cordon failed, or
+// the controller stopped right after the Lease create) is released there, or every other pool of the Cluster would wait
+// for it until a human deleted the Lease. Without the workload cluster this pool's drain-owner markers cannot be read,
+// so the token is kept.
+func TestMachinePoolScopeScaleDownReleasesAnIdleToken(t *testing.T) {
+	t.Run("a_resize_without_victims_releases_it", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newScaleDownFixture(t, nil)
+		f.others = append(f.others, heldLease(DisruptionTokenHolder(f.pool)))
+		f.workers = f.workers[4:]
+		f.expect()
+		f.ibm.EXPECT().ResizeWorkerPool(gomock.Any(), poolTestClusterID, poolTestPoolID, int64(1)).Return(nil)
+		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalPoolTransition, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyResizingReason)))
+		g.Expect(f.lease()).To(BeNil())
+	})
+	t.Run("a_growth_releases_it", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newScaleDownFixture(t, nil)
+		f.others = append(f.others, heldLease(DisruptionTokenHolder(f.pool)))
+		f.machinePool.Spec.Replicas = ptr.To[int32](6)
+		f.expect()
+		f.ibm.EXPECT().ResizeWorkerPool(gomock.Any(), poolTestClusterID, poolTestPoolID, int64(3)).Return(nil)
+		g.Expect(f.reconcile()).To(Equal(NotDone(IntervalPoolTransition, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyResizingReason)))
+		g.Expect(f.lease()).To(BeNil())
+	})
+	t.Run("another_pool's_token_is_kept", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newScaleDownFixture(t, nil)
+		other := poolObject("other", "other")
+		f.others = append(f.others, other, heldLease(DisruptionTokenHolder(other)))
+		f.workers = f.workers[4:]
+		f.expect()
+		f.ibm.EXPECT().ResizeWorkerPool(gomock.Any(), poolTestClusterID, poolTestPoolID, int64(1)).Return(nil)
+		f.reconcile()
+		g.Expect(f.lease().Spec.HolderIdentity).To(Equal(ptr.To(DisruptionTokenHolder(other))))
+	})
+	t.Run("without_the_workload_cluster_it_is_kept", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newScaleDownFixture(t, nil)
+		f.others = append(f.others, heldLease(DisruptionTokenHolder(f.pool)))
+		f.clusterCache = clustercache.NewFakeEmptyClusterCache()
+		f.machinePool.Spec.Replicas = ptr.To[int32](3)
+		f.expect()
+		g.Expect(f.reconcile().Kind).To(Equal(OutcomeTerminal))
+		g.Expect(f.lease().Spec.HolderIdentity).To(Equal(ptr.To(DisruptionTokenHolder(f.pool))))
 	})
 }
 
