@@ -193,8 +193,9 @@ switch a cluster between public and private-only.
 * Worker flavors need at least 4 vCPU and 16 GB memory (for example `bx2.4x16`).
 * `entitlement: OCPEntitled` on a pool marks it as covered by an existing OpenShift entitlement (Cloud Pak); it is
   OpenShift only and immutable.
-* OperatorHub and public registries need egress: a public gateway on the subnets. Without one, IBM reports the ingress
-  as `critical`, which CAPIBM ignores.
+* OperatorHub and public registries need public egress: a public gateway on the subnets and IBM's outbound traffic
+  protection turned off ([Prerequisites](./prerequisites.md#vpc-and-other-ibm-resources)). Without a public gateway, IBM
+  reports the ingress as `critical`, which CAPIBM ignores.
 * IBM's default worker operating system is used (RHCOS on ROKS 4.21, Ubuntu 24 on IKS 1.36).
-* OpenShift 4.22 is **not verified** yet: its new port-443 master host names have not been tested with the admin
-  certificate.
+* OpenShift 4.22 adds port-443 host names for the master next to the NodePort. IBM's `masterURL` still names the
+  NodePort, and CAPIBM's kubeconfig uses it, so nothing changes for CAPIBM.

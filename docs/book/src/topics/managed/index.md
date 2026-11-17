@@ -6,8 +6,8 @@
 
 Managed Kubernetes support is **experimental**. Its API is `v1alpha1` and can change between releases, and it runs
 only when the `ManagedKubernetes` feature gate is on (Alpha, off by default; see
-[Prerequisites](./prerequisites.md#enable-the-feature-gate)). Red Hat OpenShift 4.22 clusters and clusters with a
-private-only master endpoint are **not verified** yet.
+[Prerequisites](./prerequisites.md#enable-the-feature-gate)). Clusters with a private-only master endpoint are
+**not verified** yet.
 
 </aside>
 

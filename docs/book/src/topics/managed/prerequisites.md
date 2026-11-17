@@ -130,6 +130,13 @@ CAPIBM creates none of these; they must exist before you create a cluster.
 * A **public gateway** on the subnets if the cluster needs public egress (for example ROKS OperatorHub or public image
   registries). It is optional: without one, `NetworkReady` stays `True` with an informational message, and IBM reports
   the ingress status as `warning` or `critical`, which CAPIBM ignores.
+* A public gateway alone does not give the workers public egress: IBM turns on **outbound traffic protection** for new
+  VPC clusters (IKS 1.30 and later, ROKS 4.15 and later), which blocks it. CAPIBM does not set or report this setting
+  yet and leaves it as IBM or you set it. To allow public egress, turn it off once IBM has created the cluster
+  (`ibmcloud ks vpc outbound-traffic-protection disable --cluster <cluster ID>`), or mirror the images to IBM Cloud
+  Container Registry instead; ROKS OperatorHub also needs a change on the cluster. See IBM's
+  [Managing outbound traffic protection in VPC clusters](https://cloud.ibm.com/docs/containers?topic=containers-sbd-allow-outbound)
+  ([ROKS](https://cloud.ibm.com/docs/openshift?topic=openshift-sbd-allow-outbound)).
 * For **ROKS**: a standard **Cloud Object Storage** instance for the internal image registry. IBM rejects a ROKS cluster
   on VPC without one (`E7278`), so `spec.openShift.imageRegistry.cos.instanceCRN` is required. IBM creates a bucket in
   it; the bucket is kept when the cluster is deleted.

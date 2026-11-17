@@ -17,7 +17,7 @@ Raise `spec.distributionVersion` by exactly **one** minor:
 kubectl patch ibmcmcp my-iks-control-plane -n default --type merge -p '{"spec":{"distributionVersion":"1.37"}}'
 ```
 
-For ROKS, for example `"4.22"` (OpenShift 4.22 is not verified yet). The admission webhook rejects a value below the
+For ROKS, for example `"4.22"`. The admission webhook rejects a value below the
 running minor or more than one minor above it, when the field changes; the controller checks again, because the master
 can move after admission. A minor can never go down: IBM cannot roll a master back.
 

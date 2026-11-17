@@ -43,9 +43,9 @@ keeps `KubeconfigReady=True`, warns in the message and emits the Warning event `
 re-read every 12 hours and before it expires. Every steady reconcile also probes the stored Secret; a probe failure
 makes `Available` `False` (`WorkloadAPIUnreachable`).
 
-If IBM's master URL changes after the cluster was created (for example the port-443 host names of ROKS 4.22), the
-kubeconfig follows IBM and `KubeconfigReady` says `EndpointChanged`; `spec.controlPlaneEndpoint` and the Cluster's
-endpoint are never changed, and Cluster API uses the Secret, so the old value is informational only.
+If IBM's master URL changes after the cluster was created (for example to the port-443 host names that ROKS 4.22
+added), the kubeconfig follows IBM and `KubeconfigReady` says `EndpointChanged`; `spec.controlPlaneEndpoint` and the
+Cluster's endpoint are never changed, and Cluster API uses the Secret, so the old value is informational only.
 
 ### Annotations on the Secret
 
