@@ -66,6 +66,7 @@ import (
 	managedscope "sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/scope/managed"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
 	ksmock "sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice/mock"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/ibmclustername"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/workloadprobe"
 
 	. "github.com/onsi/gomega"
@@ -842,6 +843,52 @@ func TestControlPlaneReconcileMakesNoIBMCall(t *testing.T) {
 			controlplanev1.IBMCloudManagedControlPlaneDeletingWaitingForInfrastructureReason)
 		expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionFalse,
 			controlplanev1.IBMCloudManagedControlPlaneAvailableDeletingReason)
+	})
+
+	// IBM refuses createCluster for a name that breaks its rule (HTTP 400, code E0125), so the controller checks the
+	// name before it resolves credentials, builds a client or calls IBM, and stops there for good: the name cannot
+	// change, so a create request could only be refused.
+	expectNameRefused := func(g Gomega, f *cpFixture, wantMessage ...string) {
+		result, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		expectRequeue(g, result, 15*time.Minute)
+		cp := f.controlPlane()
+		condition := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition,
+			metav1.ConditionFalse, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason)
+		for _, part := range wantMessage {
+			g.Expect(condition.Message).To(ContainSubstring(part))
+		}
+		g.Expect(condition.Message).To(ContainSubstring(ibmclustername.Rule), "the message names IBM's rule")
+		g.Expect(condition.Message).To(ContainSubstring("delete this Cluster and create it again with "+
+			"spec.ibmCloudClusterName set to a name that follows the rule"), "the message names the fix")
+		g.Expect(cp.Status.CreateIntent).To(BeZero(), "no create request was recorded")
+		g.Expect(cp.Status.ClusterID).To(BeEmpty())
+		g.Expect(f.events()).To(BeEmpty())
+	}
+
+	t.Run("a Cluster name longer than IBM's 32 characters is InvalidConfiguration", func(t *testing.T) {
+		// The 33-character name IBM refused live; the admission webhook could not tell the Cluster, so the controller
+		// is the check that remains.
+		const clusterName = "example-test-cluster-e01-mgmt-iks"
+		objs := newCPObjects()
+		objs.cluster.Name = clusterName
+		objs.cp.OwnerReferences[0].Name = clusterName
+		objs.cp.Labels[clusterv1.ClusterNameLabel] = clusterName
+		f := newNoCallFixture(t, objs)
+
+		expectNameRefused(NewWithT(t), f, `the IBM cluster name "`+clusterName+`", taken from the Cluster's `+
+			"metadata.name (spec.ibmCloudClusterName is omitted), has 33 characters, more than 32")
+	})
+
+	t.Run("an ibmCloudClusterName stored before the schema enforced IBM's rule is InvalidConfiguration", func(t *testing.T) {
+		// The fake client does not run the CRD schema, like an object stored while the schema still allowed 35
+		// characters.
+		objs := newCPObjects()
+		objs.cp.Spec.IBMCloudClusterName = "team-a-" + strings.Repeat("x", 27)
+		f := newNoCallFixture(t, objs)
+
+		expectNameRefused(NewWithT(t), f, "taken from spec.ibmCloudClusterName, has 34 characters, more than 32")
 	})
 
 	t.Run("a deleting control plane without an IBM cluster or IBMCloudManagedCluster loses its finalizer", func(t *testing.T) {
