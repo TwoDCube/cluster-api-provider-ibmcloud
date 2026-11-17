@@ -205,6 +205,9 @@ func TestVolumesDetachedErrors(t *testing.T) {
 		objects []client.Object
 		funcs   interceptor.Funcs
 		wantErr string
+		// wantUnnamed is true when the error must match ErrVolumeAttachmentWithoutPersistentVolume, which the caller
+		// matches to add its own remedy; every other error must not.
+		wantUnnamed bool
 	}{
 		{name: "nil Node", nilNode: true, wantErr: "VolumesDetached: node is nil"},
 		{
@@ -218,7 +221,17 @@ func TestVolumesDetachedErrors(t *testing.T) {
 			name:    "VolumeAttachment without a PersistentVolume name",
 			node:    newNode(testNode),
 			objects: []client.Object{newAttachment("csi-1", testNode, "", true)},
-			wantErr: "VolumeAttachment csi-1 has no spec.source.persistentVolumeName",
+			wantErr: "drain: Node 10.0.0.11: a VolumeAttachment attached to the Node names no PersistentVolume: " +
+				"VolumeAttachment csi-1 has no spec.source.persistentVolumeName, so the drain cannot tell which claim its volume belongs to",
+			wantUnnamed: true,
+		},
+		{
+			// Only an attached VolumeAttachment of this Node holds the drain; a detached one or one of another Node is
+			// ignored even without a PersistentVolume name.
+			name: "VolumeAttachment without a PersistentVolume name that is detached or elsewhere",
+			node: newNode(testNode),
+			objects: []client.Object{newAttachment("csi-detached", testNode, "", false),
+				newAttachment("csi-other", "10.0.0.99", "", true)},
 		},
 		{
 			name:    "VolumeAttachment list error",
@@ -248,7 +261,12 @@ func TestVolumesDetachedErrors(t *testing.T) {
 				node = nil
 			}
 			_, _, err := h.VolumesDetached(context.Background(), node)
+			if tc.wantErr == "" {
+				g.Expect(err).NotTo(HaveOccurred())
+				return
+			}
 			g.Expect(err).To(MatchError(ContainSubstring(tc.wantErr)))
+			g.Expect(errors.Is(err, ErrVolumeAttachmentWithoutPersistentVolume)).To(Equal(tc.wantUnnamed))
 		})
 	}
 }

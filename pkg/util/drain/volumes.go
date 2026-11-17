@@ -26,6 +26,7 @@ package drain
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -48,6 +49,14 @@ const (
 	maxVolumesPerLine = 5
 )
 
+// ErrVolumeAttachmentWithoutPersistentVolume is returned (wrapped) by VolumesDetached when a VolumeAttachment attached
+// to the Node has no spec.source.persistentVolumeName, as for an inline volume under CSI migration. The drain cannot
+// tell which claim such a volume belongs to, so, like Cluster API, it reports an error instead of guessing whether the
+// volume may stay attached. The error repeats until the volume is detached or the caller stops waiting, and how the
+// caller's users stop the wait (an annotation, a time limit) is the caller's setting, which this package does not
+// know: the caller matches the error with errors.Is and adds that remedy in its own terms.
+var ErrVolumeAttachmentWithoutPersistentVolume = errors.New("a VolumeAttachment attached to the Node names no PersistentVolume")
+
 // VolumesDetached reports whether the Node has no volume left attached that the drain has to wait for, so the caller
 // may ask IBM to remove the worker without risking file-system corruption (IBM documents that fsck corruption
 // typically follows node reloads or updates right after a drain that did not verify that the volumes are detached).
@@ -67,7 +76,7 @@ const (
 // It returns true and "" when nothing is left to wait for; otherwise false and a deterministic message listing the
 // PersistentVolumeClaims and volumes still attached, sorted and truncated. It returns an error when the inputs are
 // invalid, a list fails, or a VolumeAttachment does not name a PersistentVolume (as Cluster API does, rather than
-// guessing).
+// guessing); that last error wraps ErrVolumeAttachmentWithoutPersistentVolume.
 func (h *Helper) VolumesDetached(ctx context.Context, node *corev1.Node) (bool, string, error) {
 	if err := h.validate(); err != nil {
 		return false, "", err
@@ -121,9 +130,10 @@ func (h *Helper) attachedPersistentVolumeNames(ctx context.Context, nodeName str
 				continue
 			}
 			if attachment.Spec.Source.PersistentVolumeName == nil {
-				return nil, fmt.Errorf("VolumeAttachment %s has no spec.source.persistentVolumeName, so the drain "+
-					"cannot tell which claim it belongs to; detach it, or set the exclude-wait-for-node-volume-detach "+
-					"annotation to skip the wait", attachment.Name)
+				// The remedy is left to the caller (ErrVolumeAttachmentWithoutPersistentVolume): only it knows where its
+				// users skip or bound the wait.
+				return nil, fmt.Errorf("%w: VolumeAttachment %s has no spec.source.persistentVolumeName, so the drain "+
+					"cannot tell which claim its volume belongs to", ErrVolumeAttachmentWithoutPersistentVolume, attachment.Name)
 			}
 			names.Insert(*attachment.Spec.Source.PersistentVolumeName)
 		}
