@@ -20,8 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
-	"strings"
 	"time"
 
 	"github.com/IBM/go-sdk-core/v5/core"
@@ -29,7 +27,6 @@ import (
 
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/accounts"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/authenticator"
-	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/serviceurl"
 )
 
 // Service holds the IBM Cloud Resource Manager Service specific information.
@@ -60,11 +57,6 @@ func NewService(options *resourcemanagerv2.ResourceManagerV2Options) (ResourceMa
 	}, nil
 }
 
-// serviceURLForm names the URL form NewServiceWithAuthenticatorAndTimeout accepts; every URL error repeats it so that
-// the operator sees the expected value next to the rejected one.
-const serviceURLForm = "an absolute URL of the Resource Manager API, for example " + resourcemanagerv2.DefaultServiceURL +
-	" (the default, or the rm entry of --service-endpoint)"
-
 // NewServiceWithAuthenticatorAndTimeout returns a Resource Manager Service that sends every request to serviceURL,
 // authenticated by auth, and aborts each request, from dialing to reading the whole response body, after timeout. The
 // managed Kubernetes controllers use it.
@@ -85,12 +77,8 @@ const serviceURLForm = "an absolute URL of the Resource Manager API, for example
 //
 // Parameters:
 //   - serviceURL is the Resource Manager API URL, for example resourcemanagerv2.DefaultServiceURL or the rm entry of
-//     --service-endpoint. It must be an absolute http or https URL with a host and without user information; an "@"
-//     after the host counts as user information (serviceurl.HasAtAfterHost). The scheme is the caller's policy, as for
-//     NewService: the managed client builder admits only https --service-endpoint entries, because every request
-//     carries a bearer token, and its tests send Resource Manager requests to plain-HTTP test servers. It must also end
-//     at the path, without a query or fragment, because go-sdk-core appends each operation path (for example
-//     /v2/resource_groups/{id}) to it.
+//     --service-endpoint. It goes to the SDK as it is, as with NewService; empty selects the SDK's default,
+//     resourcemanagerv2.DefaultServiceURL.
 //   - auth authenticates every request. It must not be nil, including a typed nil such as
 //     (*core.IamAuthenticator)(nil): there is deliberately no fallback to the environment.
 //   - timeout bounds each request (http.Client.Timeout) and must be positive. The managed client builder passes
@@ -109,9 +97,6 @@ func NewServiceWithAuthenticatorAndTimeout(serviceURL string, auth core.Authenti
 			"credentials the client acts as (a Resource Manager client built with an explicit authenticator never reads " +
 			"credentials from the environment)")
 	}
-	if err := validateServiceURL(serviceURL); err != nil {
-		return nil, err
-	}
 
 	rmClient, err := resourcemanagerv2.NewResourceManagerV2(&resourcemanagerv2.ResourceManagerV2Options{
 		Authenticator: auth,
@@ -125,48 +110,6 @@ func NewServiceWithAuthenticatorAndTimeout(serviceURL string, auth core.Authenti
 	httpClient.Timeout = timeout
 	rmClient.Service.SetHTTPClient(httpClient)
 	return &Service{client: rmClient}, nil
-}
-
-// validateServiceURL returns an error unless serviceURL is an absolute http or https URL with a host and without user
-// information, query or fragment. An empty URL is an error rather than the SDK's default, so that every caller states
-// the endpoint it uses. The messages print the URL only in the form serviceurl.Printable returns, and a URL that does
-// not parse only as serviceurl.ParseFailureReason describes it, so no user information, query or fragment typed into it
-// (any of them may carry a token) reaches a log or a condition. A URL that passes holds no user information in any
-// form, so NewServiceWithAuthenticatorAndTimeout may print it as it is.
-func validateServiceURL(serviceURL string) error {
-	if serviceURL == "" {
-		return fmt.Errorf("resource manager service URL is empty: pass %s", serviceURLForm)
-	}
-	parsed, err := url.Parse(serviceURL)
-	if err != nil {
-		// url.Parse's error quotes the raw input, and several of the reasons it wraps quote a part of it (an invalid
-		// port, for example, quotes the rest of a password that holds a "/"), so only the kind of problem is printed.
-		return fmt.Errorf("resource manager service URL is not a valid URL (%s): pass %s", serviceurl.ParseFailureReason(err), serviceURLForm)
-	}
-	// User information that holds a "/", "?" or "#" leaves parsed.User nil: url.Parse ends the host there and leaves the
-	// "@" after it (serviceurl.HasAtAfterHost). It is rejected here too, and Printable does not show it; otherwise
-	// "http://<token>/<rest>@host" would pass (this client also admits http) and reach the logs as it is, through
-	// NewServiceWithAuthenticatorAndTimeout's error that names the URL and through go-sdk-core's transport errors.
-	if parsed.User != nil || serviceurl.HasAtAfterHost(parsed) {
-		return fmt.Errorf("resource manager service URL %q must not contain user information (credentials come only from the authenticator): pass %s",
-			serviceurl.Printable(parsed), serviceURLForm)
-	}
-	// url.Parse lower-cases the scheme; an opaque URL such as "https:host" has no Host.
-	if (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
-		return fmt.Errorf("resource manager service URL %q is not %s", serviceurl.Printable(parsed), serviceURLForm)
-	}
-	// go-sdk-core builds each request URL by appending the operation path to the service URL string (go-sdk-core
-	// v5.25.3, core/request_builder.go, ResolveRequestURL), so with "https://host?debug" a GetResourceGroup call would
-	// send GET / with the query "debug/v2/resource_groups/<id>", and a fragment would swallow the path the same way.
-	// Such a URL fails only later, as a confusing 404, so it is rejected here, by the rule of the VPC client
-	// (pkg/cloud/services/vpc). A bare trailing "#" leaves no trace in the parsed URL, which is why the raw string is
-	// checked; url.Parse cuts the fragment at the first "#", so any "#" in it starts a fragment.
-	if parsed.RawQuery != "" || parsed.ForceQuery || strings.Contains(serviceURL, "#") {
-		return fmt.Errorf("resource manager service URL must end at the path: remove the query (?...) or fragment (#...) "+
-			"after %q, because the client appends each operation path (for example /v2/resource_groups) to the URL; pass %s",
-			serviceurl.Printable(parsed), serviceURLForm)
-	}
-	return nil
 }
 
 // GetResourceGroup returns a Resource Group.

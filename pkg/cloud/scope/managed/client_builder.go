@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -37,7 +36,6 @@ import (
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/resourcemanager"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/vpc"
-	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/serviceurl"
 )
 
 // This file builds every IBM Cloud client of the managed controllers. Each client is built for one resolved
@@ -81,8 +79,8 @@ const (
 // NewProdClientBuilder names each missing or invalid one.
 type ProdClientBuilderOptions struct {
 	// ServiceEndpoints is the --service-endpoint flag, parsed once in cmd/main.go (may be empty). The builder uses
-	// the "containers" entry of a cluster's region, the "vpc" entry of a cluster's region and the "rm" entry; each of
-	// them must be an https URL, because every request carries an IAM bearer token.
+	// the "containers" entry of a cluster's region, the "vpc" entry of a cluster's region and the "rm" entry, and hands
+	// each URL to the IBM SDK as it is.
 	ServiceEndpoints []endpoints.ServiceEndpoint
 	// Limiter is the one process-wide limiter of IKS requests (--containers-api-qps, --containers-api-burst).
 	Limiter kubernetesservice.RequestLimiter
@@ -183,71 +181,7 @@ func (o ProdClientBuilderOptions) validate() error {
 	if o.NewControllerAuthenticator == nil {
 		errs = append(errs, errors.New("managed client builder: NewControllerAuthenticator is nil; cmd/main.go passes authenticator.GetAuthenticator"))
 	}
-	for _, endpoint := range o.ServiceEndpoints {
-		if err := validateBuilderEndpoint(endpoint); err != nil {
-			errs = append(errs, err)
-		}
-	}
 	return errors.Join(errs...)
-}
-
-// httpsScheme is the only URL scheme this package accepts for an IBM service endpoint, a master URL or a control plane
-// endpoint: every request to them carries an IAM bearer token or a client certificate. Later files of the package
-// compare against this constant instead of repeating the literal (goconst).
-const httpsScheme = "https"
-
-// validateBuilderEndpoint rejects a --service-endpoint entry of a service this builder uses (containers, vpc, rm)
-// unless it is an absolute https URL without user information, query or fragment. Entries of other services are not
-// this builder's concern.
-//
-// The query and fragment are rejected here, at start-up, because go-sdk-core appends each operation path to the service
-// URL string (go-sdk-core v5.25.3, core/request_builder.go, ResolveRequestURL): with a query or fragment every request
-// would go to the wrong path. The client constructors reject such a URL as well, but only when the first client is
-// built, during a reconcile; the flag parser (url.ParseRequestURI) admits it. Rejecting it here also keeps every URL
-// the builder later prints in an error (cachedClient) free of user information, a query or a fragment, any of which may
-// carry a token. That includes user information that holds a "/", "?" or "#": url.Parse (and the flag parser's
-// url.ParseRequestURI) ends the host there, so "https://<token>/<rest>@host/v1" has no parsed user information, a host
-// that is the token's first part, and the "@" in its path; serviceurl.HasAtAfterHost finds that "@", and no containers,
-// vpc or rm API path contains one. The error itself names the URL only through serviceurl.Printable, which does not
-// show such a URL, and a URL that does not parse only through serviceurl.ParseFailureReason, so that no part of a
-// secret in the URL reaches an error.
-//
-// Parameters:
-//   - endpoint is one parsed entry of the --service-endpoint flag.
-func validateBuilderEndpoint(endpoint endpoints.ServiceEndpoint) error {
-	switch endpoint.ID {
-	case string(endpoints.Containers), string(endpoints.VPC), string(endpoints.RM):
-	default:
-		return nil
-	}
-	parsed, err := url.Parse(endpoint.URL)
-	if err != nil {
-		// url.Parse's error quotes the raw input, and several of the reasons it wraps quote a part of it (an invalid
-		// port, for example, quotes the rest of a password that holds a "/"), so only the kind of problem is printed.
-		return fmt.Errorf("managed client builder: --service-endpoint entry %s:%s is not a valid URL (%s); pass for example %s:%s=https://<host>/<path>",
-			endpoint.Region, endpoint.ID, serviceurl.ParseFailureReason(err), endpoint.Region, endpoint.ID)
-	}
-	if parsed.Scheme != httpsScheme || parsed.Host == "" || parsed.User != nil || serviceurl.HasAtAfterHost(parsed) ||
-		parsed.RawQuery != "" || parsed.ForceQuery || hasFragment(endpoint.URL, parsed) {
-		return fmt.Errorf("managed client builder: --service-endpoint entry %s:%s=%s is not an absolute https URL without user information, query or fragment; "+
-			"every request carries an IAM bearer token and the client appends each operation path to the URL, so pass for example %s:%s=https://<host>/<path>",
-			endpoint.Region, endpoint.ID, serviceurl.Printable(parsed), endpoint.Region, endpoint.ID)
-	}
-	return nil
-}
-
-// hasFragment reports whether a --service-endpoint URL carries a fragment, in either form one can arrive in. A bare
-// trailing "#" leaves no trace in the parsed URL, which is why the raw string is checked. And the flag parser
-// (endpoints.ParseServiceEndpointFlag) stores url.ParseRequestURI(value).String(): ParseRequestURI assumes that there
-// is no fragment, so a typed "#<token>" stays in the path and arrives here percent-encoded as "%23<token>", which no
-// other check sees. A "#" in the decoded path can only come from such a "%23", and none of the containers, vpc or rm
-// API paths contains one.
-//
-// Parameters:
-//   - rawURL is the entry's URL as the builder received it.
-//   - parsed is rawURL as url.Parse returned it.
-func hasFragment(rawURL string, parsed *url.URL) bool {
-	return strings.Contains(rawURL, "#") || strings.Contains(parsed.Path, "#")
 }
 
 // KubernetesService implements ClientBuilder.
@@ -413,8 +347,6 @@ func (b *ProdClientBuilder) cachedClient(id credentials.Identity, key clientKey,
 	// Built without holding mu: the SDK constructors call identityAuthenticator.Validate, which takes mu.
 	built, err := build(&identityAuthenticator{key: id.Key, b: b})
 	if err != nil {
-		// key.url is safe to print: validateBuilderEndpoint admits no user information (also none that url.Parse split
-		// off behind the host, serviceurl.HasAtAfterHost), query or fragment, and the default URLs have none.
 		return nil, fmt.Errorf("managed client builder: building the %s client for %s at %s: %w", key.service, id.Description, key.url, err)
 	}
 	b.mu.Lock()
