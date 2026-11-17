@@ -77,12 +77,14 @@ const (
 	// backstop 10 m, inventory diff 45 m), so a lane can hold its cluster for up to its hard timeout plus 145 m.
 	// Ginkgo's --timeout (ci-e2e.sh) does not cut that short where it matters: Ginkgo v2 gives a cleanup node that
 	// starts after the suite timeout its full NodeTimeout, so the IBM backstop and the inventory diff still run.
-	// The IKS lane's steps take about 165 to 180 m: set-up 1, create 23 (measured 20 to 23), scale-down 4, pool add 5,
+	// The IKS lane's steps take about 170 to 185 m: set-up 1, create 23 (measured 20 to 23), scale-down 4, pool add 5,
 	// master upgrade 19 (measured 18.5 from 1.35 to 1.36) and 2 more until the pools see it, the blocked-drain check
 	// and hold 6, pool deletion 3, move 10 (not measured yet) and cluster deletion 18 (measured on ROKS), plus 9 worker
 	// replacements (6 when the workers of both pools follow the upgrade, 3 for rollout.after) of 8 to 10 m each (the
-	// estimate in test/e2e/config/ibmcloud-e2e-managed.yaml). 4 h leaves about an hour for a slower IBM. It must not
-	// exceed managedtools.JanitorMinimumAge, which assumes that no lane's steps last longer.
+	// estimate in test/e2e/config/ibmcloud-e2e-managed.yaml), plus about 1 m in each of the 4 drain steps for pinning a
+	// probe pod to every worker the step may remove and deleting the pods left afterwards (start-up, and up to 20 s of
+	// SIGTERM handling; not measured yet). 4 h still leaves about an hour for a slower IBM. It must not exceed
+	// managedtools.JanitorMinimumAge, which assumes that no lane's steps last longer.
 	iksLaneTimeout  = 4 * time.Hour
 	roksLaneTimeout = 4 * time.Hour
 
@@ -101,10 +103,10 @@ const (
 	scaledDownReplicas int32 = 3
 	// probeReplicas is the size of the spread probe Deployment, as many pods as the 6 workers it starts on. Its
 	// topologySpreadConstraint is only a preference (whenUnsatisfiable: ScheduleAnyway), and the scheduler does place
-	// the pods unevenly: a scale-down of 3 of the 6 workers has evicted a single pod. Only the scale-down counts on the
-	// spread for its evictions (it fails if the scheduler put all 6 pods on the 3 workers it keeps); the upgrade
-	// replaces the workers that hold every pod after the scale-down, the rollout.after recycle drains workers that each
-	// hold a blocker pod, and the pool deletion drains the worker that holds the pinned probe pod.
+	// the pods unevenly: a scale-down of 3 of the 6 workers has evicted a single pod in one run and none in another. So
+	// no step counts on the spread pods for the proof that it drained: the spread probe guards the PodDisruptionBudget
+	// (at most 1 of its pods away at a time), and each drain step proves its drain with a pinned probe pod on every
+	// worker it may remove (pinProbePods, stopAndExpectDrained).
 	probeReplicas int32 = 6
 	// blockedDrainHold is how long the IKS lane checks that no worker is replaced while a PodDisruptionBudget blocks
 	// the drain: longer than CAPIBM's DisruptionSettleDelay (3 m), so that a replace sent despite the block shows.
@@ -131,7 +133,8 @@ const (
 	varVPCURL          = "IBMCLOUD_VPC_URL"
 )
 
-// rollingPool is one of the IKS lane's worker pools while the lane has two.
+// rollingPool is one of the IKS lane's worker pools with its size at one point of the lane: the pools while the lane
+// has two (iksRollingPools), and the pools whose workers a drain step pins probe pods to (pinProbePods).
 type rollingPool struct {
 	// name is the pool's IBM name (spec.poolName) and the suffix of its MachinePool and IBMCloudManagedMachinePool.
 	name string
@@ -167,14 +170,17 @@ var _ = Describe("Managed Kubernetes (IKS and ROKS)", Label("managed"), func() {
 		// checks it first, waitForDrainableZones): the scale-down leaves the initial pool 1 worker per zone, the added
 		// pool gives every zone its second worker, and the initial pool is deleted only after the upgrade and the
 		// rollout.after recycle, as the last drain. A zone with 1 worker could never drain it through IBM's ALB budget.
+		// Each drain step proves its drain worker by worker: it pins a probe pod to every worker it may remove, and
+		// once the step has settled, the pod of each worker that went must have been evicted through the Eviction API
+		// and the pod of each worker that stayed must have been left alone (pinProbePods, stopAndExpectDrained).
 		It("creates an IKS cluster with 3 zones x 2 workers from the managed-iks flavor", lane.create)
 		It("has IBM's HA topology: three zones, two workers per zone, six provider IDs", lane.expectHATopology)
 		It("fulfils the CAPI control plane and MachinePool contracts", lane.expectContract)
-		It("scales the initial pool down to 1 worker per zone without a PodDisruptionBudget violation", lane.scaleDownInitialPool)
+		It("scales the initial pool down to 1 worker per zone, evicting the pods of exactly the removed workers through the Eviction API without a PodDisruptionBudget violation", lane.scaleDownInitialPool)
 		It("adds a worker pool", lane.addPool)
-		It("upgrades the master by one minor and the workers of both pools follow without a PodDisruptionBudget violation", lane.upgrade)
-		It("holds a worker replacement while a PodDisruptionBudget blocks the drain, then recycles every worker of the added pool after rollout.after", lane.rolloutAfterWithBlockedDrain)
-		It("deletes the initial worker pool after draining its workers", lane.deleteInitialPool)
+		It("upgrades the master by one minor and the workers of both pools follow, each drained through the Eviction API without a PodDisruptionBudget violation", lane.upgrade)
+		It("holds a worker replacement while a PodDisruptionBudget blocks the drain, then recycles every worker of the added pool after rollout.after, each drained through the Eviction API", lane.rolloutAfterWithBlockedDrain)
+		It("deletes the initial worker pool after draining each of its workers through the Eviction API", lane.deleteInitialPool)
 		It("re-adopts the cluster after clusterctl move without IBM writes", lane.move)
 		It("deletes the cluster: IBM answers 404 and the LeftoverResources event is recorded", lane.delete)
 	})
@@ -673,24 +679,56 @@ func (l *managedLane) deployProbe(ctx context.Context, workloadProxy framework.C
 	waitForProbeHealthy(ctx, workload, "spread", probeReplicas, l.intervals("wait-probe")...)
 }
 
-// pinProbePod applies the pinned probe Pod (no controller, no PodDisruptionBudget, a nodeSelector on the IBM pool) and
-// waits until it runs on a worker of poolName, so that a step that drains every worker of that pool evicts at least
-// this probe pod, wherever the scheduler has put the spread probe's pods. Nothing recreates the Pod once evicted.
+// pinProbePods pins one probe Pod to every worker of pools (pinned-probe.yaml: no controller, no PodDisruptionBudget,
+// a node affinity on the Node's name) and waits until each runs Ready there. A drain step calls it before it starts
+// its disruption probe, for every worker it may remove, and hands the pins to stopAndExpectDrained, which then requires
+// that the pod of every removed worker was evicted through the Eviction API and that the pods of the kept workers were
+// left alone, wherever the scheduler has put the spread probe's pods. Nothing recreates an evicted pinned Pod;
+// deletePinnedPods removes the rest after the step. The pins cannot hold up the drain or the step's preconditions:
+// no PodDisruptionBudget selects them, so their evictions are never refused, and neither waitForDrainableZones (Nodes)
+// nor waitForProbeHealthy (the budgets' pods) counts them.
 //
 // Parameters:
-//   - ctx bounds the wait.
+//   - ctx bounds the requests and the waits.
 //   - workloadProxy and workload are the workload cluster's proxy and client.
-//   - poolName is the IBM pool name (spec.poolName) whose workers must hold the Pod.
-func (l *managedLane) pinProbePod(ctx context.Context, workloadProxy framework.ClusterProxy, workload client.Client,
-	poolName string) {
-	applyProbeManifest(ctx, workloadProxy, "pinned-probe.yaml", map[string]string{
-		"PROBE_NAMESPACE":   probeNamespace,
-		"PROBE_LABEL":       probeLabel,
-		"PROBE_IMAGE":       e2eConfig.GetVariableOrEmpty(varProbeImage),
-		"WORKER_POOL_LABEL": workerPoolNameLabel,
-		"WORKER_POOL":       poolName,
-	})
-	waitForProbePodOnPool(ctx, workload, pinnedProbeName, poolName, l.intervals("wait-probe")...)
+//   - pools are the pools whose workers get a pinned Pod, each with its size before the step; pinProbePods first
+//     waits until each has exactly that many Nodes, so that no worker that is still coming or going is left without a
+//     pin.
+//
+// It returns the pins sorted by Node name, each with its Pod's UID and its Node's provider ID.
+func (l *managedLane) pinProbePods(ctx context.Context, workloadProxy framework.ClusterProxy, workload client.Client,
+	pools ...rollingPool) []managedtools.PinnedPod {
+	size := 0
+	for _, pool := range pools {
+		size += int(pool.replicas)
+	}
+	nodes := make([]corev1.Node, 0, size)
+	names := make([]string, 0, len(pools))
+	for _, pool := range pools {
+		nodes = append(nodes, waitForPoolNodes(ctx, workload, pool.name, int(pool.replicas), l.intervals("wait-contract")...)...)
+		names = append(names, pool.name)
+	}
+	slices.SortFunc(nodes, func(a, b corev1.Node) int { return strings.Compare(a.Name, b.Name) })
+	pins := make([]managedtools.PinnedPod, 0, len(nodes))
+	for i := range nodes {
+		pin := managedtools.PinnedPod{Name: fmt.Sprintf("%s-%d", pinnedProbeName, i+1), Node: nodes[i].Name,
+			ProviderID: nodes[i].Spec.ProviderID}
+		// Checked here as well as in EvaluatePins, so that a Node without its worker identity fails the step before
+		// the drain instead of after it.
+		Expect(pin.ProviderID).NotTo(BeEmpty(), "Node %s has no spec.providerID, by which the step tells a removed "+
+			"worker from a kept one", pin.Node)
+		applyProbeManifest(ctx, workloadProxy, "pinned-probe.yaml", map[string]string{
+			"PROBE_NAMESPACE": probeNamespace,
+			"PROBE_LABEL":     probeLabel,
+			"PROBE_IMAGE":     e2eConfig.GetVariableOrEmpty(varProbeImage),
+			"PINNED_NAME":     pin.Name,
+			"NODE_NAME":       pin.Node,
+		})
+		pins = append(pins, pin)
+	}
+	Byf("Pinned a probe pod to each of the %d workers of IBM pool(s) %s", len(pins), strings.Join(names, " and "))
+	waitForPinnedPods(ctx, workload, pins, l.intervals("wait-probe")...)
+	return pins
 }
 
 // scaleMachinePool sets a MachinePool's replicas.
@@ -709,7 +747,7 @@ func scaleMachinePool(ctx context.Context, c client.Client, key client.ObjectKey
 	Expect(c.Patch(ctx, mp, patch)).To(Succeed())
 }
 
-// waitForPoolNodes waits until the IBM pool has exactly count Nodes in the workload cluster.
+// waitForPoolNodes waits until the IBM pool has exactly count Nodes in the workload cluster and returns them.
 //
 // Parameters:
 //   - ctx bounds the wait.
@@ -717,30 +755,40 @@ func scaleMachinePool(ctx context.Context, c client.Client, key client.ObjectKey
 //   - poolName is the IBM pool name.
 //   - count is the expected number of Nodes.
 //   - intervals are the Eventually timeout and polling interval.
-func waitForPoolNodes(ctx context.Context, workload client.Client, poolName string, count int, intervals ...interface{}) {
+func waitForPoolNodes(ctx context.Context, workload client.Client, poolName string, count int, intervals ...interface{}) []corev1.Node {
+	var nodes []corev1.Node
 	eventually(ctx, func(g Gomega) {
-		nodes, err := poolNodes(ctx, workload, poolName)
+		var err error
+		nodes, err = poolNodes(ctx, workload, poolName)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(nodes).To(HaveLen(count), "Nodes of IBM pool %s", poolName)
 	}, intervals).Should(Succeed())
+	return nodes
 }
 
 // scaleDownInitialPool scales the initial pool from 6 to 3 workers while the spread probe runs: every removed worker
 // is drained first, through the Eviction API and within the probe's PodDisruptionBudget. Each zone keeps its other
-// worker while its victim drains.
+// worker while its victim drains. Which 3 workers go is CAPIBM's prediction of IBM's choice (the oldest worker of each
+// zone, when all run one version and are healthy), so the step pins a probe pod to all 6 workers: the pods of the 3
+// removed workers must have been evicted through the Eviction API, and the pods of the 3 kept workers left alone, which
+// also shows that CAPIBM drained the workers IBM removed and no others.
 func (l *managedLane) scaleDownInitialPool(specCtx SpecContext) {
 	ctx := l.stepContext(specCtx)
 	c := managedClient(l.mgmt)
 	workloadProxy, workload := l.workload(ctx)
 	waitForDrainableZones(ctx, workload, l.intervals("wait-contract")...)
 	l.deployProbe(ctx, workloadProxy, workload)
+	pins := l.pinProbePods(ctx, workloadProxy, workload,
+		rollingPool{name: initialPoolName, replicas: int32(iksWorkerMachineCount)})
 
 	probe := startDisruptionProbe(ctx, workload)
 	scaleMachinePool(ctx, c, l.poolKey(initialPoolName), scaledDownReplicas)
 	pool := waitForPoolSettled(ctx, c, l.poolKey(initialPoolName), int(scaledDownReplicas), l.intervals("wait-pool-change")...)
 	Expect(pool.Status.SizePerZone).To(HaveValue(Equal(int32(1))), "status.sizePerZone after the scale-down")
 	waitForPoolNodes(ctx, workload, pool.Spec.PoolName, int(scaledDownReplicas), l.intervals("wait-pool-change")...)
-	probe.stopAndExpectNoViolations("scale-down of the initial pool")
+	probe.stopAndExpectDrained(ctx, workload, "scale-down of the initial pool", pins,
+		int(iksWorkerMachineCount)-int(scaledDownReplicas))
+	deletePinnedPods(ctx, workload, l.intervals("wait-probe")...)
 }
 
 // addPool adds a pool of 1 worker per zone with the initial pool's flavor and zones.
@@ -810,8 +858,8 @@ func extraPoolObjects(cluster *clusterv1.Cluster, template *infrav1.IBMCloudMana
 // lane's last drain: while it drains, every zone still holds the added pool's worker next to the initial pool's, and
 // the 1 worker per zone it leaves could not be drained through IBM's ALB budgets. Whether spread pods sit on the
 // initial pool's workers by now depends on where the scheduler put the pods that the upgrade and the rollout.after
-// evicted, and their spread is only a preference, so the step first places the pinned probe pod on one of those
-// workers: the drain has to evict it, and stopAndExpectNoViolations requires that eviction to go through the Eviction
+// evicted, and their spread is only a preference, so the step first pins a probe pod to each of the initial pool's 3
+// workers: the drain has to evict all 3, and stopAndExpectDrained requires each eviction to go through the Eviction
 // API instead of hoping for a spread pod there.
 func (l *managedLane) deleteInitialPool(specCtx SpecContext) {
 	ctx := l.stepContext(specCtx)
@@ -819,7 +867,7 @@ func (l *managedLane) deleteInitialPool(specCtx SpecContext) {
 	workloadProxy, workload := l.workload(ctx)
 	waitForDrainableZones(ctx, workload, l.intervals("wait-contract")...)
 	waitForProbeHealthy(ctx, workload, "spread", probeReplicas, l.intervals("wait-probe")...)
-	l.pinProbePod(ctx, workloadProxy, workload, initialPoolName)
+	pins := l.pinProbePods(ctx, workloadProxy, workload, rollingPool{name: initialPoolName, replicas: scaledDownReplicas})
 
 	probe := startDisruptionProbe(ctx, workload)
 	Byf("Deleting the initial MachinePool %s", l.poolKey(initialPoolName).Name)
@@ -828,22 +876,24 @@ func (l *managedLane) deleteInitialPool(specCtx SpecContext) {
 	}})).To(Succeed())
 	waitForPoolGone(ctx, c, l.poolKey(initialPoolName), l.intervals("wait-pool-change")...)
 	waitForPoolNodes(ctx, workload, initialPoolName, 0, l.intervals("wait-pool-change")...)
-	probe.stopAndExpectNoViolations("deletion of the initial pool")
+	probe.stopAndExpectDrained(ctx, workload, "deletion of the initial pool", pins, int(scaledDownReplicas))
+	deletePinnedPods(ctx, workload, l.intervals("wait-probe")...)
 	waitForPoolSettled(ctx, c, l.poolKey(extraPoolName), int(extraPoolReplicas), l.intervals("wait-contract")...)
 }
 
 // upgrade raises spec.distributionVersion by one minor and waits for the master, then for the workers of both pools,
 // which follow the master's minor on their own, while the spread probe runs. CAPIBM replaces one worker at a time per
 // Cluster (its disruption token), so the follow replaces all 6 workers in turn, and while one is replaced, the other
-// pool's worker in its zone keeps the zone's ALB replica running. The initial pool's workers hold every probe pod
-// since the scale-down, so the follow evicts some.
+// pool's worker in its zone keeps the zone's ALB replica running. Each of the 6 workers holds a pinned probe pod, so
+// every replacement must show its drain as an eviction through the Eviction API.
 func (l *managedLane) upgrade(specCtx SpecContext) {
 	ctx := l.stepContext(specCtx)
 	c := managedClient(l.mgmt)
-	_, workload := l.workload(ctx)
+	workloadProxy, workload := l.workload(ctx)
 	target := e2eConfig.GetVariableOrEmpty(varIKSUpgradeTo)
 	waitForDrainableZones(ctx, workload, l.intervals("wait-contract")...)
 	waitForProbeHealthy(ctx, workload, "spread", probeReplicas, l.intervals("wait-probe")...)
+	pins := l.pinProbePods(ctx, workloadProxy, workload, iksRollingPools...)
 
 	probe := startDisruptionProbe(ctx, workload)
 	cp, err := getControlPlane(ctx, c, l.cluster())
@@ -868,7 +918,9 @@ func (l *managedLane) upgrade(specCtx SpecContext) {
 			expectWorkersOnMinor(ctx, g, c, workload, l.poolKey(pool.name), int(pool.replicas), target)
 		}
 	}, l.intervals("wait-worker-rollout")).Should(Succeed())
-	probe.stopAndExpectNoViolations("master upgrade and worker follow")
+	// The follow replaces every worker of both pools, so every pinned worker goes.
+	probe.stopAndExpectDrained(ctx, workload, "master upgrade and worker follow", pins, len(pins))
+	deletePinnedPods(ctx, workload, l.intervals("wait-probe")...)
 	l.expectContract(specCtx)
 }
 
@@ -907,8 +959,11 @@ func expectWorkersOnMinor(ctx context.Context, g Gomega, c, workload client.Clie
 // rolloutAfterWithBlockedDrain sets spec.rollout.after on the added pool while a PodDisruptionBudget allows no
 // disruption on any worker: CAPIBM must report DrainBlocked and replace nothing; once the budget is relaxed, every
 // worker of the added pool whose Node is older than rollout.after is replaced, one at a time, drained. The initial
-// pool's worker in each zone keeps the zone's ALB replica running meanwhile. Every drained worker holds a blocker pod,
-// which carries the probe label, so the recycle evicts probe pods whatever the spread pods' placement.
+// pool's worker in each zone keeps the zone's ALB replica running meanwhile. Each of the added pool's 3 workers holds a
+// pinned probe pod, so every replacement must show its drain as an eviction through the Eviction API. The pinned pod of
+// the first worker goes while the blocker still holds that drain: a drain evicts every pod no budget protects at once
+// and waits only for the refused ones, and the step's blocked-drain check is about the worker's replacement, not
+// about its pods.
 func (l *managedLane) rolloutAfterWithBlockedDrain(specCtx SpecContext) {
 	ctx := l.stepContext(specCtx)
 	c := managedClient(l.mgmt)
@@ -929,6 +984,7 @@ func (l *managedLane) rolloutAfterWithBlockedDrain(specCtx SpecContext) {
 	})
 	waitForProbeHealthy(ctx, workload, "blocker", blockers, l.intervals("wait-probe")...)
 	waitForProbeHealthy(ctx, workload, "spread", probeReplicas, l.intervals("wait-probe")...)
+	pins := l.pinProbePods(ctx, workloadProxy, workload, rollingPool{name: extraPoolName, replicas: extraPoolReplicas})
 
 	pool, err := getPool(ctx, c, l.poolKey(extraPoolName))
 	Expect(err).NotTo(HaveOccurred())
@@ -968,8 +1024,10 @@ func (l *managedLane) rolloutAfterWithBlockedDrain(specCtx SpecContext) {
 			g.Expect(replaced[i].CreationTimestamp.Before(&after)).To(BeFalse(), "Node %s predates rollout.after", replaced[i].Name)
 		}
 	}, l.intervals("wait-worker-rollout")).Should(Succeed())
-	probe.stopAndExpectNoViolations("rollout.after recycle with a blocking PodDisruptionBudget")
+	probe.stopAndExpectDrained(ctx, workload, "rollout.after recycle with a blocking PodDisruptionBudget", pins,
+		int(extraPoolReplicas))
 	deleteBlocker(ctx, workload, l.intervals("wait-probe")...)
+	deletePinnedPods(ctx, workload, l.intervals("wait-probe")...)
 }
 
 // move moves the cluster to a second kind management cluster with clusterctl and checks that CAPIBM there re-adopts

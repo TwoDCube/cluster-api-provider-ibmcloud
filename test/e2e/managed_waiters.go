@@ -61,9 +61,10 @@ const (
 	// probeLabel marks every probe pod; the disruption probe lists pods by it.
 	probeLabel = "capibm-e2e/probe"
 	// probeNameLabel is the label each probe manifest selects its pods by; its value names the probe workload: the
-	// Deployment and PodDisruptionBudget "spread" or "blocker", or the Pod pinnedProbeName.
+	// Deployment and PodDisruptionBudget "spread" or "blocker", or pinnedProbeName for every pinned probe Pod.
 	probeNameLabel = "app.kubernetes.io/name"
-	// pinnedProbeName is the name of the pinned probe Pod (test/e2e/data/managed/pinned-probe.yaml).
+	// pinnedProbeName is the probeNameLabel value of the pinned probe Pods (test/e2e/data/managed/pinned-probe.yaml)
+	// and the prefix of their names, pinned-1, pinned-2 and so on.
 	pinnedProbeName = "pinned"
 	// drainWorkersPerZone is the fewest Ready workers that every zone holding workers needs while an IKS lane step
 	// drains workers. IBM runs each zone's Ingress ALB with 2 replicas, at most one per worker, and a
@@ -326,38 +327,69 @@ func waitForProbeHealthy(ctx context.Context, workload client.Client, name strin
 	}, intervals).Should(Succeed())
 }
 
-// waitForProbePodOnPool waits until the probe Pod named name is Ready on a Node of the IBM pool poolName, so that a
-// drain of every worker of that pool must evict it. Ready, not only scheduled: a pod whose container has started keeps
-// terminating for about 20 seconds after the eviction (its SIGTERM handler), long enough for the disruption probe to
-// see it, while a pod that never started could be gone between two polls and be reported as vanished.
+// waitForPinnedPods waits until every pinned probe Pod is Ready on the Node it is pinned to and records each Pod's UID
+// in its pin, by which the disruption probe's recorder knows the Pod. Ready, not only scheduled: a pod whose container
+// has started keeps terminating for about 20 seconds after the eviction (its SIGTERM handler), long enough for the
+// disruption probe to see it, while a pod that never started could be gone between two polls and be reported as
+// vanished.
 //
 // Parameters:
 //   - ctx bounds the wait.
 //   - workload is a workload cluster client with managedScheme.
-//   - name is the Pod's name in probeNamespace.
-//   - poolName is the IBM pool name (spec.poolName) whose Nodes must hold the Pod.
+//   - pins are the pinned Pods, each with its name in probeNamespace and its Node; their UIDs are set here.
 //   - intervals are the Eventually timeout and polling interval.
-func waitForProbePodOnPool(ctx context.Context, workload client.Client, name, poolName string, intervals ...interface{}) {
-	By(fmt.Sprintf("Waiting for probe pod %s to run on a worker of pool %s", name, poolName))
+func waitForPinnedPods(ctx context.Context, workload client.Client, pins []managedtools.PinnedPod, intervals ...interface{}) {
+	By(fmt.Sprintf("Waiting for the %d pinned probe pods to run on their workers", len(pins)))
 	eventually(ctx, func(g Gomega) {
-		pod := &corev1.Pod{}
-		g.Expect(workload.Get(ctx, client.ObjectKey{Namespace: probeNamespace, Name: name}, pod)).To(Succeed())
-		g.Expect(pod.Spec.NodeName).NotTo(BeEmpty(), "Node of probe pod %s: not scheduled yet (conditions %v)", name,
-			pod.Status.Conditions)
-		node := &corev1.Node{}
-		g.Expect(workload.Get(ctx, client.ObjectKey{Name: pod.Spec.NodeName}, node)).To(Succeed())
-		g.Expect(node.Labels).To(HaveKeyWithValue(workerPoolNameLabel, poolName), "pool of Node %s, which holds probe "+
-			"pod %s", node.Name, name)
-		g.Expect(pod.Status.Conditions).To(ContainElement(And(HaveField("Type", corev1.PodReady),
-			HaveField("Status", corev1.ConditionTrue))), "probe pod %s on Node %s is not Ready (if it cannot pull its "+
-			"image because the workers have no public egress, set %s to a copy the workers reach over private "+
-			"endpoints)", name, node.Name, varProbeImage)
+		for i := range pins {
+			pod := &corev1.Pod{}
+			g.Expect(workload.Get(ctx, client.ObjectKey{Namespace: probeNamespace, Name: pins[i].Name}, pod)).To(Succeed())
+			g.Expect(pod.Spec.NodeName).To(Equal(pins[i].Node), "Node of pinned probe pod %s (conditions %v)",
+				pins[i].Name, pod.Status.Conditions)
+			g.Expect(pod.DeletionTimestamp).To(BeNil(), "pinned probe pod %s is terminating before the step", pins[i].Name)
+			g.Expect(pod.Status.Conditions).To(ContainElement(And(HaveField("Type", corev1.PodReady),
+				HaveField("Status", corev1.ConditionTrue))), "pinned probe pod %s on Node %s is not Ready (if it "+
+				"cannot pull its image because the workers have no public egress, set %s to a copy the workers reach "+
+				"over private endpoints)", pins[i].Name, pins[i].Node, varProbeImage)
+			pins[i].UID = pod.UID
+		}
+	}, intervals).Should(Succeed())
+}
+
+// deletePinnedPods deletes the pinned probe Pods that a step left (those on the workers it kept) and waits until no
+// pinned Pod is left. A step calls it after its disruption probe has stopped: the deletion bypasses the Eviction API,
+// so a probe that still ran would report it, and the next step pins its own pods under the same names.
+//
+// Parameters:
+//   - ctx bounds the request and the wait.
+//   - workload is a workload cluster client with managedScheme.
+//   - intervals are the Eventually timeout and polling interval of the wait for the pods.
+func deletePinnedPods(ctx context.Context, workload client.Client, intervals ...interface{}) {
+	Expect(workload.DeleteAllOf(ctx, &corev1.Pod{}, client.InNamespace(probeNamespace),
+		client.MatchingLabels{probeNameLabel: pinnedProbeName})).To(Succeed(), "deleting the pinned probe pods")
+	waitForProbePodsGone(ctx, workload, pinnedProbeName, intervals...)
+}
+
+// waitForProbePodsGone waits until no pod of the probe workload name is left, terminating ones included.
+//
+// Parameters:
+//   - ctx bounds the wait.
+//   - workload is a workload cluster client with managedScheme.
+//   - name is the probeNameLabel value of the workload's pods, for example "blocker" or pinnedProbeName.
+//   - intervals are the Eventually timeout and polling interval.
+func waitForProbePodsGone(ctx context.Context, workload client.Client, name string, intervals ...interface{}) {
+	By(fmt.Sprintf("Waiting for the %s probe pods to be gone", name))
+	eventually(ctx, func(g Gomega) {
+		pods := &corev1.PodList{}
+		g.Expect(workload.List(ctx, pods, client.InNamespace(probeNamespace),
+			client.MatchingLabels{probeNameLabel: name})).To(Succeed())
+		g.Expect(pods.Items).To(BeEmpty(), "%s probe pods left after their deletion", name)
 	}, intervals).Should(Succeed())
 }
 
 // disruptionProbe polls the probe pods and budgets of a workload cluster in the background while a step drains
 // workers, and feeds a managedtools.DisruptionRecorder. Start it with startDisruptionProbe and end it with
-// stopAndExpectNoViolations.
+// stopAndExpectDrained.
 type disruptionProbe struct {
 	cancel     context.CancelFunc
 	done       chan struct{}
@@ -408,22 +440,37 @@ func (p *disruptionProbe) poll(ctx context.Context, workload client.Client) {
 	p.recorder.ObserveBudgets(budgets.Items, time.Now())
 }
 
-// stopAndExpectNoViolations stops the probe and fails the step unless every budget held, every removed probe pod was
-// evicted through the Eviction API, and at least one probe pod was evicted (a step that evicted nothing proved
-// nothing about draining).
+// stopAndExpectDrained stops the probe once the step has settled and fails the step unless its drain is proven and
+// kept every budget: no probe budget was violated and every probe pod that left went through the Eviction API
+// (managedtools.DisruptionRecorder.Result), and the pinned probe pods prove the drain worker by worker
+// (managedtools.EvaluatePins): the pod of each of the wantRemoved pinned workers that the step removed or replaced was
+// evicted through the Eviction API, and the pods of the pinned workers it kept still run untouched. The proof does not
+// depend on where the scheduler put the spread probe's pods, whose spread is only a preference, so the step needs no
+// spread pod on a removed worker.
 //
 // Parameters:
-//   - step names the step in the failure message.
-func (p *disruptionProbe) stopAndExpectNoViolations(step string) {
+//   - ctx bounds the Node listing.
+//   - workload is a workload cluster client with managedScheme.
+//   - step names the step in the messages.
+//   - pins are the step's pinned probe pods (managedLane.pinProbePods), one per worker the step may remove.
+//   - wantRemoved is the number of pinned workers the step removes or replaces.
+func (p *disruptionProbe) stopAndExpectDrained(ctx context.Context, workload client.Client, step string,
+	pins []managedtools.PinnedPod, wantRemoved int) {
 	p.cancel()
 	<-p.done
 	result := p.recorder.Result()
-	By(fmt.Sprintf("PodDisruptionBudget probe for %q: %d listings, %d failed listings, %d pods evicted", step,
-		result.Polls, p.listErrors, result.Evicted))
-	Expect(result.Problems).To(BeEmpty(), "PodDisruptionBudget violations during %q:\n%s", step,
-		strings.Join(result.Problems, "\n"))
-	Expect(result.Evicted).To(BeNumerically(">", 0), "no probe pod was evicted during %q, so the step did not "+
-		"exercise the drain", step)
+	// The Nodes are listed after the step has settled (its own waits saw the removed Nodes go), so a pinned worker
+	// whose provider ID is missing here was removed or replaced by the step.
+	nodes := &corev1.NodeList{}
+	Expect(workload.List(ctx, nodes)).To(Succeed(), "listing the Nodes after %q", step)
+	pinned, err := managedtools.EvaluatePins(pins, p.recorder.Fate, nodes.Items, wantRemoved)
+	Expect(err).NotTo(HaveOccurred(), "the pinned probe pods of %q", step)
+	By(fmt.Sprintf("Drain probe for %q: %d listings, %d failed listings, %d probe pods evicted; of %d pinned probe "+
+		"pods, %d evicted from removed workers and %d untouched on kept workers", step, result.Polls, p.listErrors,
+		result.Evicted, len(pins), pinned.Evicted, pinned.Kept))
+	problems := slices.Concat(result.Problems, pinned.Problems)
+	Expect(problems).To(BeEmpty(), "the drain during %q is not proven, or it broke a PodDisruptionBudget:\n%s", step,
+		strings.Join(problems, "\n"))
 }
 
 // expectNoEventWithReason fails unless no Event in the namespace has the reason.
@@ -489,13 +536,7 @@ func deleteBlocker(ctx context.Context, workload client.Client, intervals ...int
 	meta := metav1.ObjectMeta{Namespace: probeNamespace, Name: "blocker"}
 	Expect(client.IgnoreNotFound(workload.Delete(ctx, &appsv1.Deployment{ObjectMeta: meta}))).To(Succeed())
 	Expect(client.IgnoreNotFound(workload.Delete(ctx, &policyv1.PodDisruptionBudget{ObjectMeta: meta}))).To(Succeed())
-	By("Waiting for the blocker pods to be gone")
-	eventually(ctx, func(g Gomega) {
-		pods := &corev1.PodList{}
-		g.Expect(workload.List(ctx, pods, client.InNamespace(probeNamespace),
-			client.MatchingLabels{probeNameLabel: meta.Name})).To(Succeed())
-		g.Expect(pods.Items).To(BeEmpty(), "blocker pods left after the deletion of their Deployment")
-	}, intervals).Should(Succeed())
+	waitForProbePodsGone(ctx, workload, meta.Name, intervals...)
 }
 
 // ownershipFacts are the IBM facts that a clusterctl move must not change: CAPIBM re-adopts the same IBM cluster and

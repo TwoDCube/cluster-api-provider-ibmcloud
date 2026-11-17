@@ -148,3 +148,63 @@ func TestDisruptionRecorderIgnoresFalseDisruptionTarget(t *testing.T) {
 
 	g.Expect(recorder.Result().Problems).To(ConsistOf(HavePrefix(`pod a terminated with DisruptionTarget reason ""`)))
 }
+
+func TestDisruptionRecorderFate(t *testing.T) {
+	testCases := []struct {
+		name string
+		pods [][]corev1.Pod
+		want PodFate
+	}{
+		{name: "never listed", pods: [][]corev1.Pod{{probePod("other", false, "")}}, want: PodNotObserved},
+		{name: "no listing at all", want: PodNotObserved},
+		{name: "running in every listing", pods: [][]corev1.Pod{
+			{probePod("a", false, "")}, {probePod("a", false, "")},
+		}, want: PodRunning},
+		{name: "evicted, then gone", pods: [][]corev1.Pod{
+			{probePod("a", false, "")}, {probePod("a", true, EvictionReason)}, {},
+		}, want: PodEvicted},
+		{name: "evicted, with the reason only on a later listing", pods: [][]corev1.Pod{
+			{probePod("a", true, "")}, {probePod("a", true, EvictionReason)},
+		}, want: PodEvicted},
+		{name: "deleted by the taint manager", pods: [][]corev1.Pod{
+			{probePod("a", false, "")}, {probePod("a", true, "DeletionByTaintManager")}, {},
+		}, want: PodDeletedOtherwise},
+		{name: "deleted without any DisruptionTarget condition", pods: [][]corev1.Pod{
+			{probePod("a", true, "")}, {},
+		}, want: PodDeletedOtherwise},
+		{name: "gone unseen", pods: [][]corev1.Pod{
+			{probePod("a", false, "")}, {},
+		}, want: PodVanished},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			recorder := NewDisruptionRecorder()
+			for _, listing := range tc.pods {
+				recorder.ObservePods(listing)
+			}
+
+			g.Expect(recorder.Fate(types.UID("uid-a"))).To(Equal(tc.want))
+		})
+	}
+}
+
+// TestDisruptionRecorderFateMatchesResult guards the shared classification: a pod Result counts as evicted has the
+// fate PodEvicted, and a pod Result reports has another, so that the pinned check never contradicts Result.
+func TestDisruptionRecorderFateMatchesResult(t *testing.T) {
+	g := NewWithT(t)
+	recorder := NewDisruptionRecorder()
+	recorder.ObservePods([]corev1.Pod{probePod("evicted", false, ""), probePod("deleted", false, ""), probePod("gone", false, ""),
+		probePod("running", false, "")})
+	recorder.ObservePods([]corev1.Pod{probePod("evicted", true, EvictionReason), probePod("deleted", true, "DeletionByPodGC"),
+		probePod("running", false, "")})
+
+	result := recorder.Result()
+
+	g.Expect(result.Evicted).To(Equal(1))
+	g.Expect(result.Problems).To(ConsistOf(HavePrefix("pod deleted terminated"), HavePrefix("pod gone disappeared")))
+	g.Expect(recorder.Fate("uid-evicted")).To(Equal(PodEvicted))
+	g.Expect(recorder.Fate("uid-deleted")).To(Equal(PodDeletedOtherwise))
+	g.Expect(recorder.Fate("uid-gone")).To(Equal(PodVanished))
+	g.Expect(recorder.Fate("uid-running")).To(Equal(PodRunning))
+}

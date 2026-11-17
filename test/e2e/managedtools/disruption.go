@@ -130,14 +130,14 @@ type DisruptionResult struct {
 func (r *DisruptionRecorder) Result() DisruptionResult {
 	result := DisruptionResult{Polls: r.polls, Problems: slices.Clone(r.violations)}
 	for _, record := range r.pods {
-		switch {
-		case record.terminating && record.disruptionReason == EvictionReason:
+		switch record.fate() {
+		case PodEvicted:
 			result.Evicted++
-		case record.terminating:
+		case PodDeletedOtherwise:
 			result.Problems = append(result.Problems, fmt.Sprintf("pod %s terminated with DisruptionTarget reason %q, "+
 				"not %s: it was removed without the Eviction API, so no PodDisruptionBudget was asked",
 				record.name, record.disruptionReason, EvictionReason))
-		case record.vanished:
+		case PodVanished:
 			result.Problems = append(result.Problems, fmt.Sprintf("pod %s disappeared without being seen terminating: "+
 				"it was force-deleted, or the workload API server was unreachable for longer than its grace period",
 				record.name))
@@ -145,6 +145,54 @@ func (r *DisruptionRecorder) Result() DisruptionResult {
 	}
 	slices.Sort(result.Problems)
 	return result
+}
+
+// PodFate is what a DisruptionRecorder saw happen to one pod. Its values read as the end of a sentence about the pod
+// ("pod x was <fate>"), because EvaluatePins puts them into its messages as they are.
+type PodFate string
+
+const (
+	// PodNotObserved means that no recorded listing contained the pod.
+	PodNotObserved PodFate = "never listed by the disruption probe"
+	// PodRunning means that the pod was in every listing since its first one and never seen terminating.
+	PodRunning PodFate = "running untouched"
+	// PodEvicted means that the pod was seen terminating with the DisruptionTarget reason EvictionReason.
+	PodEvicted PodFate = "evicted through the Eviction API"
+	// PodDeletedOtherwise means that the pod was seen terminating without the DisruptionTarget reason EvictionReason,
+	// so no PodDisruptionBudget was asked.
+	PodDeletedOtherwise PodFate = "deleted without the Eviction API"
+	// PodVanished means that the pod left the listings without ever being seen terminating: it was force-deleted, or
+	// the API server was unreachable for longer than the pod's termination.
+	PodVanished PodFate = "gone without being seen terminating"
+)
+
+// Fate returns what the recorder saw happen to one pod, so that a lane can hold single pods (the IKS lane's pinned
+// probe pods, EvaluatePins) to an expectation of their own on top of the rules Result applies to every probe pod.
+//
+// Parameters:
+//   - uid is the pod's UID; a pod recreated under the same name has another UID and is another pod.
+func (r *DisruptionRecorder) Fate(uid types.UID) PodFate {
+	record, ok := r.pods[uid]
+	if !ok {
+		return PodNotObserved
+	}
+	return record.fate()
+}
+
+// fate classifies one record. Result and Fate both use it, so that the pinned check and the check of every probe pod
+// can never disagree about whether a pod was evicted. A pod once seen terminating keeps that fate after it left the
+// listings, because a terminating pod is on its way out by definition.
+func (record *podRecord) fate() PodFate {
+	switch {
+	case record.terminating && record.disruptionReason == EvictionReason:
+		return PodEvicted
+	case record.terminating:
+		return PodDeletedOtherwise
+	case record.vanished:
+		return PodVanished
+	default:
+		return PodRunning
+	}
 }
 
 // disruptionTargetReason returns the reason of the pod's DisruptionTarget condition when its status is True, or "".

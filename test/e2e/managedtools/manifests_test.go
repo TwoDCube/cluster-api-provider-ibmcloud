@@ -69,16 +69,17 @@ var probeVars = map[string]string{
 	"PROBE_IMAGE":      "registry.k8s.io/e2e-test-images/busybox:1.36.1-1",
 	"PROBE_REPLICAS":   "6",
 	"BLOCKER_REPLICAS": "3",
-	// The pinned probe pod's nodeSelector: IBM's worker pool label on the Nodes, and the initial pool's name.
-	"WORKER_POOL_LABEL": "ibm-cloud.kubernetes.io/worker-pool-name",
-	"WORKER_POOL":       "default",
+	// One pinned probe pod: the lane names them pinned-1, pinned-2, ... and pins each to one Node by its name, which
+	// is the worker's private IP address on IKS.
+	"PINNED_NAME": "pinned-1",
+	"NODE_NAME":   "10.243.0.12",
 }
 
 // TestProbeManifests renders the real probe manifests of test/e2e/data/managed with the lanes' values and checks the
 // properties the lanes rely on, offline: the spread budget allows one disruption, the blocker budget allows none,
-// every probe pod carries the probe label, and every pod stays terminating well beyond the 2-second poll. The pinned
-// pod must have no controller and no budget and stay on the named IBM pool, so that a drain of that pool always
-// evicts it at once and nothing puts it back.
+// every probe pod carries the probe label, and every pod stays terminating well beyond the 2-second poll. A pinned
+// pod must have no controller and no budget and stay on the one Node it is pinned to, so that a drain of that Node
+// always evicts it at once, a drain of any other Node never touches it, and nothing puts it back.
 func TestProbeManifests(t *testing.T) {
 	g := NewWithT(t)
 	objects := map[string][]byte{}
@@ -112,12 +113,19 @@ func TestProbeManifests(t *testing.T) {
 	g.Expect(blocker.Spec.Template.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution).To(
 		ConsistOf(HaveField("TopologyKey", corev1.LabelHostname)), "one blocker pod per worker")
 
-	pinned := decodePod(g, objects["Pod/pinned"])
-	expectProbePod(g, "Pod/pinned", pinned.Labels, &pinned.Spec)
+	pinned := decodePod(g, objects["Pod/pinned-1"])
+	expectProbePod(g, "Pod/pinned-1", pinned.Labels, &pinned.Spec)
 	g.Expect(pinned.OwnerReferences).To(BeEmpty(), "the pinned pod has no controller, so nothing recreates it")
-	g.Expect(pinned.Spec.NodeSelector).To(Equal(map[string]string{
-		probeVars["WORKER_POOL_LABEL"]: probeVars["WORKER_POOL"],
-	}), "the pinned pod stays on the workers of one IBM pool")
+	// The lane deletes the pinned pods left after a step by this label.
+	g.Expect(pinned.Labels).To(HaveKeyWithValue("app.kubernetes.io/name", "pinned"))
+	g.Expect(pinned.Spec.NodeName).To(BeEmpty(), "the scheduler binds the pinned pod, so that it checks the Node's room")
+	g.Expect(pinned.Spec.NodeSelector).To(BeEmpty(), "the node affinity alone pins the pod")
+	g.Expect(pinned.Spec.Affinity).NotTo(BeNil())
+	g.Expect(pinned.Spec.Affinity.NodeAffinity).NotTo(BeNil())
+	g.Expect(pinned.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution).To(Equal(
+		&corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchFields: []corev1.NodeSelectorRequirement{{
+			Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{probeVars["NODE_NAME"]},
+		}}}}}), "the pinned pod stays on the one Node it is pinned to")
 	for _, budget := range []*policyv1.PodDisruptionBudget{spreadBudget, blockerBudget} {
 		selector, err := metav1.LabelSelectorAsSelector(budget.Spec.Selector)
 		g.Expect(err).NotTo(HaveOccurred(), budget.Name)

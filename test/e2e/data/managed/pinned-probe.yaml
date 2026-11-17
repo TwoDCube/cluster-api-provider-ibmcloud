@@ -1,23 +1,33 @@
-# Pinned probe pod of the managed IKS lane (test/e2e/managed_test.go): one Pod without a controller and without a
-# PodDisruptionBudget, kept on the workers of one IBM pool by its nodeSelector. The spread probe's pods are spread only
-# as a preference, so a step that drains every worker of a pool cannot count on finding one of them there; this pod is
-# always there. A drain evicts a pod without a controller like any other (it leaves only DaemonSet pods, mirror pods and
-# pods that the cluster.x-k8s.io/drain label exempts), so the step always sees at least this eviction. Nothing
-# recreates the pod after it.
+# Pinned probe pod of the managed IKS lane (test/e2e/managed_test.go): a Pod without a controller and without a
+# PodDisruptionBudget, kept on one Node by a node affinity on the Node's name (the pin a DaemonSet gives its pods).
+# Before each step that drains workers, the lane applies one per worker the step may remove, as PINNED_NAME on
+# NODE_NAME, so that the step proves its drain worker by worker: the pod of every removed worker must be evicted through
+# the Eviction API, and the pod of every kept worker must be left alone. The spread probe's pods (pdb-probe.yaml)
+# cannot prove that, because their spread is only a preference.
+# The pin never holds up a drain: no PodDisruptionBudget selects the pod (its app.kubernetes.io/name is "pinned"), and
+# a drain evicts a pod without a controller like any other (it leaves only DaemonSet pods, mirror pods and pods that
+# the cluster.x-k8s.io/drain label exempts). Nothing recreates the pod after its eviction; the lane deletes the pinned
+# pods that are left after each step, so that the next step starts from its own pins.
 # The placeholders (a dollar sign and a name in braces) are filled by the suite (applyProbeManifest with
 # managedtools.ExpandPlaceholders), not by envsubst; pdb-probe.yaml describes the image.
 apiVersion: v1
 kind: Pod
 metadata:
-  name: pinned
+  name: ${PINNED_NAME}
   namespace: ${PROBE_NAMESPACE}
   labels:
     app.kubernetes.io/name: pinned
     ${PROBE_LABEL}: "true"
 spec:
   terminationGracePeriodSeconds: 60
-  nodeSelector:
-    ${WORKER_POOL_LABEL}: "${WORKER_POOL}"
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchFields:
+              - key: metadata.name
+                operator: In
+                values: ["${NODE_NAME}"]
   securityContext:
     runAsNonRoot: true
     runAsUser: 65534

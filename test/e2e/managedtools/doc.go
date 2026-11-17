@@ -35,6 +35,9 @@ limitations under the License.
 //     clusters and the VPC resources of its own VPC, so it can run next to other runs that use VPCs of their own.
 //   - The disruption recorder (disruption.go) and the version helpers (versions.go): the pure parts of the
 //     PodDisruptionBudget probe and of the upgrade checks, so that the lanes only orchestrate.
+//   - The pinned check (pins.go): the worker-by-worker proof of a drain. A drain step pins a probe pod to every worker
+//     it may remove; the pod of each removed worker must have been evicted through the Eviction API and the pod of
+//     each kept worker left alone, wherever the scheduler put the spread probe's pods.
 //   - The timeout limit (timeouts.go): it lowers every wait's timeout to the time left until the lane's hard timeout,
 //     because the CAPI framework helpers the lanes call poll without a context.
 //   - The zone check (zones.go): the Ready workers per zone that a drain through IBM's Ingress ALB budgets needs, so

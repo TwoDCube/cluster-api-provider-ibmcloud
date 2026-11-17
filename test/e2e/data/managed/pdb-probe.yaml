@@ -1,10 +1,10 @@
 # PodDisruptionBudget probe of the managed IKS lane (test/e2e/managed_test.go): a Deployment spread over the workers
 # and a budget that allows one disruption at a time. The spread is only a preference (whenUnsatisfiable:
-# ScheduleAnyway): the scheduler may stack several pods on one worker and leave another without any, so a step that
-# needs an eviction on given workers places the pinned probe pod (pinned-probe.yaml) there. The lane records every
-# probe pod that leaves while CAPIBM drains workers and requires the DisruptionTarget reason EvictionByEvictionAPI and
-# no budget violation. The placeholders (a dollar sign and a name in braces) are filled by the suite
-# (applyProbeManifest with managedtools.ExpandPlaceholders), not by envsubst.
+# ScheduleAnyway): the scheduler may stack several pods on one worker and leave another without any, so no step counts
+# on these pods for the proof that it drained a given worker; the pinned probe pods (pinned-probe.yaml) give that
+# proof. The lane records every probe pod that leaves while CAPIBM drains workers and requires the DisruptionTarget
+# reason EvictionByEvictionAPI and no budget violation. The placeholders (a dollar sign and a name in braces) are
+# filled by the suite (applyProbeManifest with managedtools.ExpandPlaceholders), not by envsubst.
 # A pod keeps running for about 20 seconds after SIGTERM, so the lane's 2-second polling sees it terminating.
 # PROBE_IMAGE needs a POSIX shell (default registry.k8s.io/e2e-test-images/busybox); a VPC without a public gateway
 # needs a copy in a registry the workers reach over private endpoints (MANAGED_E2E_PROBE_IMAGE).
