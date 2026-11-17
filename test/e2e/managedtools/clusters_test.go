@@ -35,25 +35,14 @@ func TestClientOptionsValidate(t *testing.T) {
 	}
 	valid := ClientOptions{URL: "https://containers.cloud.ibm.com/global", Authenticator: auth, HTTPClient: &http.Client{}}
 	testCases := []struct {
-		name     string
-		mutate   func(*ClientOptions)
-		wantErr  []string
-		mustHide string
+		name    string
+		mutate  func(*ClientOptions)
+		wantErr []string
 	}{
 		{name: "valid", mutate: func(*ClientOptions) {}},
-		{name: "empty URL", mutate: func(o *ClientOptions) { o.URL = "" }, wantErr: []string{"the service URL is empty"}},
-		{name: "plain http", mutate: func(o *ClientOptions) { o.URL = "http://containers.cloud.ibm.com/global" },
-			wantErr: []string{`"http://containers.cloud.ibm.com/global" is not an absolute https URL`}},
-		{name: "relative URL", mutate: func(o *ClientOptions) { o.URL = "containers.cloud.ibm.com/global" },
-			wantErr: []string{"is not an absolute https URL"}},
-		{name: "user information is redacted", mutate: func(o *ClientOptions) { o.URL = "https://apikey:s3cr3t@containers.cloud.ibm.com/global" },
-			wantErr: []string{`"https://containers.cloud.ibm.com/global" contains user information`}, mustHide: "s3cr3t"},
-		{name: "query is refused and not printed", mutate: func(o *ClientOptions) { o.URL = "https://containers.cloud.ibm.com/global?token=s3cr3t" },
-			wantErr: []string{"must end at the API path, without a query or fragment"}, mustHide: "s3cr3t"},
-		{name: "fragment", mutate: func(o *ClientOptions) { o.URL = "https://containers.cloud.ibm.com/global#s3cr3t" },
-			wantErr: []string{"without a query or fragment"}, mustHide: "s3cr3t"},
-		{name: "unparsable URL", mutate: func(o *ClientOptions) { o.URL = "https://%zz/global" },
-			wantErr: []string{"the service URL does not parse"}},
+		// The URL goes to the SDK as it is: no scheme or form rule of this package, and empty selects the SDK default.
+		{name: "a plain-http URL is the caller's choice", mutate: func(o *ClientOptions) { o.URL = "http://127.0.0.1:8080/global" }},
+		{name: "an empty URL is left to the SDK", mutate: func(o *ClientOptions) { o.URL = "" }},
 		{name: "nil authenticator and nil client are both reported", mutate: func(o *ClientOptions) {
 			o.Authenticator = nil
 			o.HTTPClient = nil
@@ -74,9 +63,6 @@ func TestClientOptionsValidate(t *testing.T) {
 			for _, want := range tc.wantErr {
 				g.Expect(err).To(MatchError(ContainSubstring(want)))
 			}
-			if tc.mustHide != "" {
-				g.Expect(err.Error()).NotTo(ContainSubstring(tc.mustHide))
-			}
 		})
 	}
 }
@@ -84,9 +70,9 @@ func TestClientOptionsValidate(t *testing.T) {
 func TestNewServicesRejectInvalidOptions(t *testing.T) {
 	g := NewWithT(t)
 	_, err := NewClusterService(ClientOptions{})
-	g.Expect(err).To(MatchError(ContainSubstring("IBM Cloud Kubernetes Service client: the service URL is empty")))
+	g.Expect(err).To(MatchError(ContainSubstring("IBM Cloud Kubernetes Service client: the authenticator is nil")))
 	_, err = NewVPCService(ClientOptions{})
-	g.Expect(err).To(MatchError(ContainSubstring("VPC client: the service URL is empty")))
+	g.Expect(err).To(MatchError(ContainSubstring("VPC client: the authenticator is nil")))
 }
 
 func TestClusterServiceListClusters(t *testing.T) {

@@ -20,8 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
-	"strings"
 
 	"github.com/IBM/go-sdk-core/v5/core"
 )
@@ -34,8 +32,8 @@ const DefaultUserAgent = "cluster-api-provider-ibmcloud-e2e"
 // the lanes build the authenticator from the identity fixture's credentials and pass the service URL and the HTTP
 // client themselves.
 type ClientOptions struct {
-	// URL is the absolute https base URL of the service, for example https://containers.cloud.ibm.com/global or
-	// https://eu-de.iaas.cloud.ibm.com/v1. Required.
+	// URL is the base URL of the service, for example https://containers.cloud.ibm.com/global or
+	// https://eu-de.iaas.cloud.ibm.com/v1. It goes to the SDK as it is; empty selects the SDK's default.
 	URL string
 	// Authenticator signs every request. Required; there is no fallback to the environment.
 	Authenticator core.Authenticator
@@ -48,13 +46,10 @@ type ClientOptions struct {
 	ResourceGroupID string
 }
 
-// validate returns one error naming every invalid field of o and the accepted form. service names the client in the
-// messages, for example "IBM Cloud Kubernetes Service".
+// validate returns one error naming every invalid field of o and the accepted form; the URL is the SDK's to check.
+// service names the client in the messages, for example "IBM Cloud Kubernetes Service".
 func (o ClientOptions) validate(service string) error {
 	var errs []error
-	if err := validateServiceURL(service, o.URL); err != nil {
-		errs = append(errs, err)
-	}
 	if core.IsNil(o.Authenticator) {
 		errs = append(errs, fmt.Errorf("%s client: the authenticator is nil; pass the authenticator of the identity "+
 			"fixture's credentials (this package never reads credentials from the environment)", service))
@@ -64,49 +59,6 @@ func (o ClientOptions) validate(service string) error {
 			"&http.Client{Timeout: time.Minute}", service))
 	}
 	return errors.Join(errs...)
-}
-
-// validateServiceURL returns an error unless rawURL is an absolute https URL with a host and without user information,
-// query or fragment: the rule of CAPIBM's own IBM clients. The SDK appends each operation path to the URL string, so a
-// query or fragment would swallow the path, and the bearer token must never travel in plain text. Rejected URLs are
-// printed without user information, query and fragment, because those may carry a token.
-//
-// Parameters:
-//   - service names the client in the message.
-//   - rawURL is ClientOptions.URL.
-func validateServiceURL(service, rawURL string) error {
-	accepted := "pass the absolute https base URL of the service, for example https://containers.cloud.ibm.com/global " +
-		"or https://eu-de.iaas.cloud.ibm.com/v1"
-	parsed, err := url.Parse(rawURL)
-	switch {
-	case rawURL == "":
-		return fmt.Errorf("%s client: the service URL is empty; %s", service, accepted)
-	case err != nil:
-		return fmt.Errorf("%s client: the service URL does not parse; %s", service, accepted)
-	case parsed.User != nil:
-		return fmt.Errorf("%s client: the service URL %q contains user information; credentials come only from the "+
-			"authenticator; %s", service, printableURL(parsed), accepted)
-	case parsed.Scheme != "https" || parsed.Host == "":
-		return fmt.Errorf("%s client: the service URL %q is not an absolute https URL; %s", service, printableURL(parsed), accepted)
-	case parsed.RawQuery != "" || parsed.ForceQuery || strings.Contains(rawURL, "#"):
-		return fmt.Errorf("%s client: the service URL %q must end at the API path, without a query or fragment; %s",
-			service, printableURL(parsed), accepted)
-	}
-	return nil
-}
-
-// printableURL returns parsed without user information, query and fragment, the form error messages print.
-//
-// Parameters:
-//   - parsed is the URL as url.Parse returned it; it is not modified.
-func printableURL(parsed *url.URL) string {
-	shown := *parsed
-	shown.User = nil
-	shown.RawQuery = ""
-	shown.ForceQuery = false
-	shown.Fragment = ""
-	shown.RawFragment = ""
-	return shown.String()
 }
 
 // APIError is an HTTP error answer of an IBM API: the status code and IBM's error code and description, never the
