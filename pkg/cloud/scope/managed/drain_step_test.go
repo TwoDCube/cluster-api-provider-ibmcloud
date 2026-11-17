@@ -571,6 +571,8 @@ func TestDrainStepMessageIsBounded(t *testing.T) {
 		g := NewWithT(t)
 		objs, _ := victims(5, false)
 		f := newDrainStepFixture(t, nil, objs...)
+		// Check reads the volumes only once the detach wait has begun, so the message lists Nodes only from then.
+		f.detachWaitSince(poolTestNow)
 		result, err := f.step(t, DrainKnobs{}).Check(context.Background(), sortedNodes(t, f.workload))
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(result.Progress).To(Equal(DrainProgress{Done: true}))
