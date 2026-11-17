@@ -74,6 +74,22 @@ const (
 	PublicServiceEndpointDisabled PublicServiceEndpointPolicy = "Disabled"
 )
 
+// PersistentStoragePolicy selects what CAPIBM asks IBM to do with the persistent storage of the cluster when CAPIBM
+// deletes the IBM cluster. It sets the deleteResources parameter of IBM's cluster DELETE, the API form of
+// "ibmcloud ks cluster rm --delete-storage".
+// +kubebuilder:validation:Enum=Retain;Delete
+type PersistentStoragePolicy string
+
+const (
+	// PersistentStorageRetain asks IBM to keep the persistent storage (deleteResources=false); it is also the meaning of
+	// an omitted deletion.persistentStorage.
+	PersistentStorageRetain PersistentStoragePolicy = "Retain"
+	// PersistentStorageDelete asks IBM to delete the persistent storage with the cluster (deleteResources=true). Deleted
+	// data cannot be recovered, but IBM may keep some of the storage, VPC Block volumes among it (see
+	// DeletionSpec.PersistentStorage).
+	PersistentStorageDelete PersistentStoragePolicy = "Delete"
+)
+
 // TODO: the distribution rule below admits only OpenShift 4.x, and the distributionVersion documentation says to raise
 // it by exactly one minor. IBM's OpenShift line forks after 4.22 into 4.23 and 5.0, so the next version is no longer
 // the next minor in IBM's /versions list but a node of an upgrade graph. IBM is developing a per-cluster upgrade-path
@@ -133,6 +149,11 @@ type IBMCloudManagedControlPlaneSpec struct {
 	// +optional
 	Endpoints EndpointsSpec `json:"endpoints,omitempty,omitzero"`
 
+	// deletion configures what CAPIBM asks IBM to delete together with the IBM cluster when CAPIBM deletes it. Mutable:
+	// CAPIBM reads it each time it sends IBM's cluster DELETE.
+	// +optional
+	Deletion DeletionSpec `json:"deletion,omitempty,omitzero"`
+
 	// controlPlaneEndpoint is the CAPI contract field. The controller sets it once from the IBM master URL; do not set
 	// it. Once set, CAPIBM treats the IBM cluster as existing and never creates one.
 	// +optional
@@ -149,8 +170,9 @@ type OpenShiftSpec struct {
 	ImageRegistry ImageRegistrySpec `json:"imageRegistry,omitempty,omitzero"`
 }
 
-// ImageRegistrySpec configures the internal registry. A struct (not a bare CRN) so that later options, such as
-// deleting the bucket with the cluster, are additive.
+// ImageRegistrySpec configures the internal registry. A struct (not a bare CRN) so that later registry options are
+// additive. Deleting the bucket with the cluster is a deletion option and belongs in spec.deletion, which stays
+// mutable, while imageRegistry is immutable.
 type ImageRegistrySpec struct {
 	// cos references the existing standard Cloud Object Storage instance in which IBM creates the registry bucket.
 	// The bucket is retained when the cluster is deleted.
@@ -178,6 +200,32 @@ type EndpointsSpec struct {
 	// (spec-level rule compares effective values).
 	// +optional
 	PublicServiceEndpoint PublicServiceEndpointPolicy `json:"publicServiceEndpoint,omitempty"`
+}
+
+// DeletionSpec configures the deletion of the IBM cluster. A struct, so that later deletion options, such as deleting
+// the OpenShift registry bucket, are additive and stay mutable (imageRegistry is immutable).
+// +kubebuilder:validation:MinProperties=1
+type DeletionSpec struct {
+	// persistentStorage is Retain (also when omitted) or Delete: what CAPIBM asks IBM to do with the cluster's
+	// persistent storage when it deletes the IBM cluster.
+	// Retain sends IBM's DELETE with deleteResources=false: IBM keeps the storage of the cluster's persistent volumes,
+	// such as their VPC Block volumes, and it stays in the account, and is billed, until you delete it.
+	// Delete sends deleteResources=true, the API form of "ibmcloud ks cluster rm --delete-storage": CAPIBM asks IBM to
+	// delete the cluster's persistent storage, and what IBM deletes cannot be recovered. What IBM deletes is not certain,
+	// because IBM's documentation conflicts: its page on removing VPC Block storage says that IBM deletes the storage
+	// that a storage class with reclaimPolicy Delete provisioned, while its newer page on removing clusters says that
+	// VPC Block Storage is not removed automatically, even with such a storage class. Both pages say that statically
+	// provisioned storage and storage of a storage class with reclaimPolicy Retain remain; the first adds that the
+	// storage of a cluster deleted in an unhealthy state may remain too. So with Delete, VPC Block volumes may remain
+	// and stay billed: check for them after the deletion and delete those that remain. Which volumes IBM deletes is not
+	// yet verified against IBM Cloud. On VPC, Delete asks for nothing else: IBM deletes subnets with a cluster only on
+	// classic infrastructure, and CAPIBM never deletes VPC resources.
+	// Neither value deletes the OpenShift registry bucket in the Cloud Object Storage instance.
+	// CAPIBM reads this field each time it sends IBM's DELETE, so set it before the Cluster is deleted: a change made
+	// after CAPIBM sent its DELETE takes effect only if CAPIBM sends the DELETE again, which it does when IBM does not
+	// show the cluster as deleting 10 minutes later.
+	// +optional
+	PersistentStorage PersistentStoragePolicy `json:"persistentStorage,omitempty"`
 }
 
 // APIEndpoint mirrors the CAPI APIEndpoint JSON shape. Both fields are required when it is set, because CAPI copies only

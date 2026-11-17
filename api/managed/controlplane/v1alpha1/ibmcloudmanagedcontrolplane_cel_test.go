@@ -23,6 +23,8 @@ import (
 	. "github.com/onsi/gomega"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
 
 	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
@@ -85,7 +87,8 @@ func openShiftWithCOS(crn string) controlplanev1.OpenShiftSpec {
 
 // TestIBMCloudManagedControlPlaneCreateValidation covers the create-time CEL and OpenAPI rules: the distribution and
 // distributionVersion pairing with openShift presence, the MAJOR.MINOR grammar, the required COS instance for
-// OpenShift, the IBM name rules, and the controlPlaneEndpoint shape (allowed at create for move).
+// OpenShift, the IBM name rules, the controlPlaneEndpoint shape (allowed at create for move), and the enum of
+// deletion.persistentStorage.
 func TestIBMCloudManagedControlPlaneCreateValidation(t *testing.T) {
 	namespace := newTestNamespace(t, "ibmcmcp-create")
 
@@ -108,8 +111,45 @@ func TestIBMCloudManagedControlPlaneCreateValidation(t *testing.T) {
 				cp := newIKSControlPlane(namespace)
 				cp.Spec.IBMCloudClusterName = "ns-1.my-cluster"
 				cp.Spec.Endpoints.PublicServiceEndpoint = controlplanev1.PublicServiceEndpointDisabled
+				cp.Spec.Deletion.PersistentStorage = controlplanev1.PersistentStorageDelete
 				return cp
 			},
+		},
+		{
+			name: "persistent_storage_retain_valid",
+			object: func() *controlplanev1.IBMCloudManagedControlPlane {
+				cp := newROKSControlPlane(namespace)
+				cp.Spec.Deletion.PersistentStorage = controlplanev1.PersistentStorageRetain
+				return cp
+			},
+		},
+		{
+			name: "persistent_storage_delete_valid",
+			object: func() *controlplanev1.IBMCloudManagedControlPlane {
+				cp := newROKSControlPlane(namespace)
+				cp.Spec.Deletion.PersistentStorage = controlplanev1.PersistentStorageDelete
+				return cp
+			},
+		},
+		{
+			// IBM's own word for the parameter is a boolean; only the two enum values are accepted.
+			name: "persistent_storage_not_in_enum_rejected",
+			object: func() *controlplanev1.IBMCloudManagedControlPlane {
+				cp := newIKSControlPlane(namespace)
+				cp.Spec.Deletion.PersistentStorage = "true"
+				return cp
+			},
+			wantErr: "Unsupported value: \"true\"",
+		},
+		{
+			// Enum values are case-sensitive: a lower-case value is a typo, not Delete.
+			name: "persistent_storage_lower_case_rejected",
+			object: func() *controlplanev1.IBMCloudManagedControlPlane {
+				cp := newIKSControlPlane(namespace)
+				cp.Spec.Deletion.PersistentStorage = "delete"
+				return cp
+			},
+			wantErr: "spec.deletion.persistentStorage",
 		},
 		{
 			name: "kubernetes_with_openshift_major_rejected",
@@ -296,6 +336,22 @@ func TestIBMCloudManagedControlPlaneCreateValidation(t *testing.T) {
 	}
 }
 
+// TestIBMCloudManagedControlPlaneEmptyDeletionRejected checks that spec.deletion is either omitted or names an option:
+// "deletion: {}" says nothing and is refused, like an empty endpoints. A Go client never sends it (omitzero), so the
+// object is sent unstructured, as kubectl apply of a manifest would send it.
+func TestIBMCloudManagedControlPlaneEmptyDeletionRejected(t *testing.T) {
+	g := NewWithT(t)
+	namespace := newTestNamespace(t, "ibmcmcp-deletion")
+	content, err := runtime.DefaultUnstructuredConverter.ToUnstructured(newIKSControlPlane(namespace))
+	g.Expect(err).NotTo(HaveOccurred())
+	cp := &unstructured.Unstructured{Object: content}
+	cp.SetAPIVersion(controlplanev1.GroupVersion.String())
+	cp.SetKind("IBMCloudManagedControlPlane")
+	g.Expect(unstructured.SetNestedMap(cp.Object, map[string]any{}, "spec", "deletion")).To(Succeed())
+
+	expectAPIResult(g, testEnv.Create(ctx, cp), "spec.deletion: Invalid value")
+}
+
 // TestIBMCloudManagedControlPlaneDistributionVersionGrammar checks the MAJOR.MINOR rule of spec.distributionVersion: only
 // an IBM product minor is accepted; patch versions, a v prefix, the IBM _openshift suffix and leading zeros are not.
 func TestIBMCloudManagedControlPlaneDistributionVersionGrammar(t *testing.T) {
@@ -331,9 +387,9 @@ func TestIBMCloudManagedControlPlaneDistributionVersionGrammar(t *testing.T) {
 
 // TestIBMCloudManagedControlPlaneUpdateValidation covers the transition rules: immutability of distribution,
 // ibmCloudClusterName and imageRegistry; presence symmetry of ibmCloudClusterName; effective-value immutability of
-// endpoints.publicServiceEndpoint; and controlPlaneEndpoint add-once. The minor step rule (+1 only, never down) needs
-// the old and new values together with the gate and is the validating webhook's job, so here a raise and a lowering
-// both pass CEL.
+// endpoints.publicServiceEndpoint; controlPlaneEndpoint add-once; and that deletion.persistentStorage stays mutable
+// within its enum. The minor step rule (+1 only, never down) needs the old and new values together with the gate and is
+// the validating webhook's job, so here a raise and a lowering both pass CEL.
 func TestIBMCloudManagedControlPlaneUpdateValidation(t *testing.T) {
 	namespace := newTestNamespace(t, "ibmcmcp-update")
 	endpoint := controlplanev1.APIEndpoint{Host: "c111.us-south.containers.cloud.ibm.com", Port: 30101}
@@ -358,6 +414,41 @@ func TestIBMCloudManagedControlPlaneUpdateValidation(t *testing.T) {
 			name:    "distribution_version_raise_passes_cel",
 			initial: func() *controlplanev1.IBMCloudManagedControlPlane { return newIKSControlPlane(namespace) },
 			update:  func(cp *controlplanev1.IBMCloudManagedControlPlane) { cp.Spec.DistributionVersion = "1.37" },
+		},
+		{
+			// deletion.persistentStorage is mutable: CAPIBM reads it only when it sends IBM's DELETE, so it can be set
+			// or changed at any time before the Cluster is deleted.
+			name:    "persistent_storage_omitted_to_delete_allowed",
+			initial: func() *controlplanev1.IBMCloudManagedControlPlane { return newIKSControlPlane(namespace) },
+			update: func(cp *controlplanev1.IBMCloudManagedControlPlane) {
+				cp.Spec.Deletion.PersistentStorage = controlplanev1.PersistentStorageDelete
+			},
+		},
+		{
+			name: "persistent_storage_delete_to_retain_allowed",
+			initial: func() *controlplanev1.IBMCloudManagedControlPlane {
+				cp := newROKSControlPlane(namespace)
+				cp.Spec.Deletion.PersistentStorage = controlplanev1.PersistentStorageDelete
+				return cp
+			},
+			update: func(cp *controlplanev1.IBMCloudManagedControlPlane) {
+				cp.Spec.Deletion.PersistentStorage = controlplanev1.PersistentStorageRetain
+			},
+		},
+		{
+			name: "persistent_storage_delete_to_omitted_allowed",
+			initial: func() *controlplanev1.IBMCloudManagedControlPlane {
+				cp := newIKSControlPlane(namespace)
+				cp.Spec.Deletion.PersistentStorage = controlplanev1.PersistentStorageDelete
+				return cp
+			},
+			update: func(cp *controlplanev1.IBMCloudManagedControlPlane) { cp.Spec.Deletion = controlplanev1.DeletionSpec{} },
+		},
+		{
+			name:    "persistent_storage_not_in_enum_on_update_rejected",
+			initial: func() *controlplanev1.IBMCloudManagedControlPlane { return newIKSControlPlane(namespace) },
+			update:  func(cp *controlplanev1.IBMCloudManagedControlPlane) { cp.Spec.Deletion.PersistentStorage = "Keep" },
+			wantErr: "Unsupported value: \"Keep\"",
 		},
 		{
 			name:    "distribution_version_to_patch_rejected",
