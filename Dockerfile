@@ -39,6 +39,7 @@ COPY api/ api/
 COPY pkg/ pkg/
 COPY internal/ internal/
 COPY webhooks/ webhooks/
+COPY feature/ feature/
 
 # Build
 ARG TARGETOS
