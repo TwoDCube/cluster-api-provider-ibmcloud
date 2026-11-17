@@ -171,6 +171,17 @@ func (f *fakeIBM) deletes() []string {
 	return paths
 }
 
+// deleteQueries returns the query strings of the recorded DELETE requests, in order: the deleteResources choice.
+func (f *fakeIBM) deleteQueries() []string {
+	var queries []string
+	for _, r := range f.recorded() {
+		if r.Method == http.MethodDelete {
+			queries = append(queries, r.Query)
+		}
+	}
+	return queries
+}
+
 // serve routes one request.
 func (f *fakeIBM) serve(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()

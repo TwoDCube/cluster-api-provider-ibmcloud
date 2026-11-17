@@ -25,6 +25,8 @@ import (
 
 	"github.com/IBM/go-sdk-core/v5/core"
 
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
+
 	. "github.com/onsi/gomega"
 )
 
@@ -164,21 +166,48 @@ func TestClusterServiceListClustersError(t *testing.T) {
 }
 
 func TestClusterServiceDeleteCluster(t *testing.T) {
-	g := NewWithT(t)
-	fake := newFakeIBM(t)
+	testCases := []struct {
+		name      string
+		storage   kubernetesservice.PersistentStorage
+		wantQuery string
+	}{
+		// The janitor asks IBM to keep the persistent storage of stale clusters; the inventory diff reports what IBM leaves.
+		{name: "Retain asks IBM to keep the storage", storage: kubernetesservice.RetainPersistentStorage, wantQuery: "deleteResources=false"},
+		// The backstop asks IBM to delete the storage of the run's own clusters, so that a run leaves no volumes behind.
+		{name: "Delete asks IBM to delete the storage", storage: kubernetesservice.DeletePersistentStorage, wantQuery: "deleteResources=true"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeIBM(t)
 
-	err := fake.clusterService("rg-e2e").DeleteCluster(context.Background(), "c0aaaaaaaaaaaaaaaaaa")
+			err := fake.clusterService("rg-e2e").DeleteCluster(context.Background(), "c0aaaaaaaaaaaaaaaaaa", tc.storage)
 
-	g.Expect(err).NotTo(HaveOccurred())
-	requests := fake.recorded()
-	g.Expect(requests).To(HaveLen(1))
-	g.Expect(requests[0].Method).To(Equal(http.MethodDelete))
-	g.Expect(requests[0].Path).To(Equal("/global/v1/clusters/c0aaaaaaaaaaaaaaaaaa"))
-	// deleteResources=false: never the persistent storage or VPC resources, as with CAPIBM's own delete; the inventory
-	// diff reports them.
-	g.Expect(requests[0].Query).To(Equal("deleteResources=false"))
-	g.Expect(requests[0].Header.Get("Authorization")).To(Equal("Bearer " + testToken))
-	g.Expect(requests[0].Header.Get("X-Auth-Resource-Group")).To(Equal("rg-e2e"))
+			g.Expect(err).NotTo(HaveOccurred())
+			requests := fake.recorded()
+			g.Expect(requests).To(HaveLen(1))
+			g.Expect(requests[0].Method).To(Equal(http.MethodDelete))
+			g.Expect(requests[0].Path).To(Equal("/global/v1/clusters/c0aaaaaaaaaaaaaaaaaa"))
+			g.Expect(requests[0].Query).To(Equal(tc.wantQuery))
+			g.Expect(requests[0].Header.Get("Authorization")).To(Equal("Bearer " + testToken))
+			g.Expect(requests[0].Header.Get("X-Auth-Resource-Group")).To(Equal("rg-e2e"))
+		})
+	}
+}
+
+func TestClusterServiceDeleteClusterRefusesAnInvalidStorageChoiceWithoutARequest(t *testing.T) {
+	for _, storage := range []kubernetesservice.PersistentStorage{"", "delete", "true"} {
+		t.Run(fmt.Sprintf("%q", storage), func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeIBM(t)
+
+			err := fake.clusterService("").DeleteCluster(context.Background(), "c0aaaaaaaaaaaaaaaaaa", storage)
+
+			g.Expect(err).To(MatchError(ContainSubstring(fmt.Sprintf(`the persistent storage choice %q is neither "Retain" `+
+				`nor "Delete"`, storage))))
+			g.Expect(fake.recorded()).To(BeEmpty())
+		})
+	}
 }
 
 func TestClusterServiceDeleteClusterRefusesNamesWithoutARequest(t *testing.T) {
@@ -187,7 +216,7 @@ func TestClusterServiceDeleteClusterRefusesNamesWithoutARequest(t *testing.T) {
 			g := NewWithT(t)
 			fake := newFakeIBM(t)
 
-			err := fake.clusterService("").DeleteCluster(context.Background(), value)
+			err := fake.clusterService("").DeleteCluster(context.Background(), value, kubernetesservice.RetainPersistentStorage)
 
 			g.Expect(err).To(MatchError(ContainSubstring("is not an IBM cluster ID")))
 			g.Expect(err).To(MatchError(ContainSubstring("never by name")))
@@ -212,7 +241,7 @@ func TestClusterServiceDeleteClusterErrors(t *testing.T) {
 			fake := newFakeIBM(t)
 			fake.deleteStatus["c0aaaaaaaaaaaaaaaaaa"] = tc.status
 
-			err := fake.clusterService("").DeleteCluster(context.Background(), "c0aaaaaaaaaaaaaaaaaa")
+			err := fake.clusterService("").DeleteCluster(context.Background(), "c0aaaaaaaaaaaaaaaaaa", kubernetesservice.RetainPersistentStorage)
 
 			g.Expect(err).To(MatchError(ContainSubstring(fmt.Sprintf("DeleteCluster: IBM Cloud answered HTTP %d", tc.status))))
 			g.Expect(IsNotFound(err)).To(Equal(tc.wantNotFound))
@@ -236,4 +265,16 @@ func TestValidateClusterID(t *testing.T) {
 	name, err := ClusterName(DefaultNamePrefix, "abc123", LaneIKS)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(ValidateClusterID(name)).NotTo(Succeed())
+}
+
+func TestValidateLanePersistentStorage(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(ValidateLanePersistentStorage("Delete")).To(Succeed())
+	// The templates' default, an empty value (the variable unset in the configuration) and a typo all ask IBM to keep
+	// the volumes or fail the template, so each stops the lane before it creates anything.
+	for _, value := range []string{"Retain", "", "delete"} {
+		err := ValidateLanePersistentStorage(value)
+		g.Expect(err).To(MatchError(ContainSubstring(fmt.Sprintf(`DELETION_PERSISTENT_STORAGE is %q; the managed lanes need "Delete"`, value))))
+		g.Expect(err).To(MatchError(ContainSubstring("test/e2e/config/ibmcloud-e2e-managed.yaml sets it")))
+	}
 }

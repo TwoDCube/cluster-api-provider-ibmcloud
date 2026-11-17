@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/scope/managed"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
 )
 
 const (
@@ -56,11 +57,19 @@ type DeletionPlan struct {
 	Delete []Cluster
 	// Skipped are the matching clusters that stay.
 	Skipped []SkippedCluster
+	// PersistentStorage is what each DELETE asks IBM to do with the persistent storage of every cluster in Delete.
+	// PlanRunClusters sets Delete: the run's own clusters are test clusters, and their volumes must not outlive them
+	// (IBM's documentation conflicts on whether VPC Block volumes go even then). PlanStaleClusters sets Retain: it
+	// selects by a name prefix and an age only, weaker evidence than the run's whole names and start time, and a
+	// deleted volume cannot be recovered, so a cluster it deletes by mistake keeps its data. ExecutePlan refuses a plan
+	// with any other value.
+	PersistentStorage kubernetesservice.PersistentStorage
 }
 
 // PlanStaleClusters selects the clusters a crashed or interrupted run left behind: the name starts with
 // "<prefix>-", IBM's createdDate is at least minAge before now, and the cluster is not already being deleted.
-// A cluster whose createdDate does not parse stays (fail safe).
+// A cluster whose createdDate does not parse stays (fail safe). The plan asks IBM to keep the persistent storage of the
+// clusters it deletes (see DeletionPlan.PersistentStorage).
 //
 // Parameters:
 //   - clusters is a ListClusters result.
@@ -76,7 +85,7 @@ func PlanStaleClusters(clusters []Cluster, prefix string, minAge time.Duration, 
 		return DeletionPlan{}, fmt.Errorf("janitor minimum age %s is shorter than %s: the janitor deletes only clusters "+
 			"of runs that have ended, never a young cluster", minAge, JanitorMinimumAge)
 	}
-	var plan DeletionPlan
+	plan := DeletionPlan{PersistentStorage: kubernetesservice.RetainPersistentStorage}
 	for _, cluster := range clusters {
 		if !strings.HasPrefix(cluster.Name, prefix+"-") {
 			continue
@@ -98,7 +107,8 @@ func PlanStaleClusters(clusters []Cluster, prefix string, minAge time.Duration, 
 
 // PlanRunClusters selects the clusters of the current run for the backstop of a lane's cleanup: the name is exactly
 // one of names, the cluster was created after the run started (less RunCleanupClockSkew), and it is not already being
-// deleted. It is the only selection without a minimum age, so it matches whole names, never a prefix.
+// deleted. It is the only selection without a minimum age, so it matches whole names, never a prefix. The plan asks
+// IBM to delete the persistent storage of the clusters it deletes, so that a run leaves no volumes behind.
 //
 // Parameters:
 //   - clusters is a ListClusters result.
@@ -112,7 +122,7 @@ func PlanRunClusters(clusters []Cluster, names []string, runStart time.Time) (De
 		return DeletionPlan{}, errors.New("run cleanup needs the run's start time, got the zero time")
 	}
 	earliest := runStart.Add(-RunCleanupClockSkew)
-	var plan DeletionPlan
+	plan := DeletionPlan{PersistentStorage: kubernetesservice.DeletePersistentStorage}
 	for _, cluster := range clusters {
 		if !slices.Contains(names, cluster.Name) {
 			continue
@@ -170,17 +180,25 @@ type DeletionReport struct {
 	Failed []FailedDeletion
 	// Skipped are the plan's skipped clusters, repeated for the log.
 	Skipped []SkippedCluster
+	// PersistentStorage is what the plan's DELETEs asked IBM to do with the persistent storage of the deleted clusters.
+	PersistentStorage kubernetesservice.PersistentStorage
 }
 
-// String renders the report for the suite log: names, IDs and reasons, one line per cluster.
+// String renders the report for the suite log: names, IDs and reasons, one line per cluster. A deletion that also asks
+// IBM to delete the persistent storage says so, because that is the one part of it that cannot be undone or
+// recovered; it says "asking", because what IBM deletes is not certain (see kubernetesservice.DeletePersistentStorage).
 func (r DeletionReport) String() string {
 	var b strings.Builder
 	verb := "deleted"
 	if r.DryRun {
 		verb = "would delete (dry run)"
 	}
+	storage := ""
+	if r.PersistentStorage == kubernetesservice.DeletePersistentStorage {
+		storage = ", asking IBM to delete its persistent storage"
+	}
 	for _, c := range r.Deleted {
-		fmt.Fprintf(&b, "%s %s (ID %s, created %s)\n", verb, c.Name, c.ID, c.CreatedDate)
+		fmt.Fprintf(&b, "%s %s (ID %s, created %s)%s\n", verb, c.Name, c.ID, c.CreatedDate, storage)
 	}
 	for _, c := range r.AlreadyGone {
 		fmt.Fprintf(&b, "already gone: %s (ID %s)\n", c.Name, c.ID)
@@ -199,22 +217,26 @@ func (r DeletionReport) String() string {
 
 // ExecutePlan deletes every cluster of plan.Delete by its ID, one request each, and continues after a failure so
 // that one refused deletion does not keep the others alive. The returned error joins every failure; a 404 is not a
-// failure (the cluster is gone).
+// failure (the cluster is gone). A plan whose PersistentStorage is neither Retain nor Delete is refused before any
+// request, also in a dry run, so that no DELETE ever leaves the fate of the data to a missing value.
 //
 // Parameters:
 //   - ctx bounds the requests.
 //   - api is the IBM Cloud Kubernetes Service client.
-//   - plan comes from PlanStaleClusters or PlanRunClusters.
+//   - plan comes from PlanStaleClusters or PlanRunClusters; its PersistentStorage goes with every DELETE.
 //   - dryRun reports the plan without sending any request.
 func ExecutePlan(ctx context.Context, api ClusterAPI, plan DeletionPlan, dryRun bool) (DeletionReport, error) {
-	report := DeletionReport{DryRun: dryRun, Skipped: plan.Skipped}
+	if _, err := deleteResourcesQuery(plan.PersistentStorage); err != nil {
+		return DeletionReport{}, fmt.Errorf("deletion plan: %w", err)
+	}
+	report := DeletionReport{DryRun: dryRun, Skipped: plan.Skipped, PersistentStorage: plan.PersistentStorage}
 	var errs []error
 	for _, cluster := range plan.Delete {
 		if dryRun {
 			report.Deleted = append(report.Deleted, cluster)
 			continue
 		}
-		err := api.DeleteCluster(ctx, cluster.ID)
+		err := api.DeleteCluster(ctx, cluster.ID, plan.PersistentStorage)
 		switch {
 		case err == nil:
 			report.Deleted = append(report.Deleted, cluster)
@@ -259,7 +281,8 @@ func RunJanitor(ctx context.Context, api ClusterAPI, opts JanitorOptions) (Delet
 }
 
 // DeleteRunClusters lists the clusters and deletes, by ID, those PlanRunClusters selects: the backstop that removes
-// the run's own clusters when the lane's CAPI deletion did not finish.
+// the run's own clusters, asking IBM to delete their persistent storage too, when the lane's CAPI deletion did not
+// finish.
 //
 // Parameters:
 //   - ctx bounds the requests.

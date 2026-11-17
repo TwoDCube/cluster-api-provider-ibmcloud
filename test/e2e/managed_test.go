@@ -443,9 +443,9 @@ func (l *managedLane) setUp(specCtx SpecContext) {
 	l.clusterctlVariables = vars
 }
 
-// validateVariables fails unless every required variable is set, the janitor switch and the leftover scope are valid
-// and, for the IKS lane, the upgrade is one minor. It also reads the path through which the CI heartbeat reports a
-// lost Boskos lease.
+// validateVariables fails unless every required variable is set, the janitor switch and the leftover scope are valid,
+// the templates will ask IBM to delete the cluster's persistent storage with the cluster and, for the IKS lane, the
+// upgrade is one minor. It also reads the path through which the CI heartbeat reports a lost Boskos lease.
 func (l *managedLane) validateVariables() {
 	var missing []string
 	for _, name := range l.input.RequiredVariables {
@@ -460,6 +460,8 @@ func (l *managedLane) validateVariables() {
 	Expect(err).NotTo(HaveOccurred())
 	l.leftoverScope, err = managedtools.ParseLeftoverScope(e2eConfig.GetVariableOrEmpty(managedtools.LeftoverScopeVariable))
 	Expect(err).NotTo(HaveOccurred())
+	Expect(managedtools.ValidateLanePersistentStorage(
+		e2eConfig.GetVariableOrEmpty(managedtools.PersistentStorageVariable))).To(Succeed())
 	l.leaseLostFile = e2eConfig.GetVariableOrEmpty(managedtools.LeaseLostFileVariable)
 	if l.input.Lane == managedtools.LaneIKS {
 		Expect(managedtools.ValidateUpgradeStep(e2eConfig.GetVariableOrEmpty(varIKSVersion),
@@ -571,7 +573,10 @@ func (l *managedLane) snapshot(ctx context.Context) (managedtools.Snapshot, erro
 	return l.scope.Apply(snapshot), nil
 }
 
-// create applies the lane's flavor and waits for the control plane and the initial MachinePool.
+// create applies the lane's flavor and waits for the control plane and the initial MachinePool. It then checks that
+// the control plane carries spec.deletion.persistentStorage Delete, so that a template that drops or misspells
+// DELETION_PERSISTENT_STORAGE fails the lane before its long steps, not only after the deletion: validateVariables
+// checks the variable, this checks what the rendered template made of it.
 func (l *managedLane) create(specCtx SpecContext) {
 	ctx := l.stepContext(specCtx)
 	l.result = new(clusterctl.ApplyClusterTemplateAndWaitResult)
@@ -606,6 +611,11 @@ func (l *managedLane) create(specCtx SpecContext) {
 		),
 	}, l.result)
 	Expect(l.result.MachinePools).To(HaveLen(1), "the managed flavors have exactly one MachinePool")
+	cp, err := getControlPlane(ctx, managedClient(l.mgmt), l.cluster())
+	Expect(err).NotTo(HaveOccurred())
+	Expect(cp.Spec.Deletion.PersistentStorage).To(Equal(controlplanev1.PersistentStorageDelete),
+		"spec.deletion.persistentStorage of the control plane: the lane's cluster must be deleted with Delete (%s)",
+		managedtools.PersistentStorageVariable)
 }
 
 // cluster returns the lane's CAPI Cluster as the create step left it (name and namespace).
@@ -1233,7 +1243,9 @@ func (l *managedLane) createMoveTarget(ctx context.Context) {
 
 // delete deletes the Cluster and checks that IBM reports the cluster as gone (404 from CAPIBM's own client) and that
 // CAPIBM recorded the LeftoverResources warning naming what IKS leaves in the VPC (the shared VPE gateways and
-// security group, which IKS never deletes).
+// security group, which IKS never deletes). The control plane must ask IBM to delete the persistent storage too
+// (DELETION_PERSISTENT_STORAGE=Delete in the flavor template; create checks the rendered control plane), and the
+// warning must say that CAPIBM's DELETE asked for that, never that IBM deleted it: CAPIBM cannot know.
 func (l *managedLane) delete(specCtx SpecContext) {
 	ctx := l.stepContext(specCtx)
 	c := managedClient(l.mgmt)
@@ -1261,6 +1273,9 @@ func (l *managedLane) delete(specCtx SpecContext) {
 	event, err := findEvent(ctx, c, l.namespace.Name, cp.Name, managed.EventReasonLeftoverResources)
 	Expect(err).NotTo(HaveOccurred())
 	Expect(event.Message).To(ContainSubstring(clusterID), "the LeftoverResources event names the deleted cluster")
+	Expect(event.Message).To(ContainSubstring("CAPIBM's last DELETE asked IBM to delete the cluster's persistent storage "+
+		"(spec.deletion.persistentStorage Delete, deleteResources=true), but VPC Block volumes may remain"),
+		"the LeftoverResources event says that the DELETE asked IBM to delete the persistent storage")
 }
 
 // capiCleanup dumps the namespace's resources and, unless -e2e.skip-resource-cleanup is set, deletes every Cluster
@@ -1286,8 +1301,9 @@ func (l *managedLane) capiCleanup(ctx SpecContext) {
 	})
 }
 
-// ibmBackstop deletes, by ID, the run's own IBM cluster if it still exists after the CAPI deletion: an interrupted
-// or failed lane must not leave a billable cluster until the janitor's next run. It fails the lane when the CAPI
+// ibmBackstop deletes, by ID and asking IBM to delete its persistent storage too, the run's own IBM cluster if it still
+// exists after the CAPI deletion: an interrupted or failed lane must not leave a billable cluster until the janitor's
+// next run, nor billable volumes at all, because the janitor asks IBM to keep those. It fails the lane when the CAPI
 // deletion had reported success, because then CAPIBM let the Cluster go while IBM still had the cluster.
 func (l *managedLane) ibmBackstop(ctx SpecContext) {
 	if l.runStart.IsZero() {

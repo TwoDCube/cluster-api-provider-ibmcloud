@@ -24,6 +24,9 @@ import (
 
 	"github.com/IBM-Cloud/container-services-go-sdk/kubernetesserviceapiv1"
 	"github.com/IBM/go-sdk-core/v5/core"
+
+	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
 )
 
 // Cluster is one IBM Cloud Kubernetes Service cluster (IKS or ROKS on VPC Gen2) as the cluster list returns it, with
@@ -52,8 +55,51 @@ type ClusterLister interface {
 // ClusterAPI is what the janitor needs from IBM Cloud Kubernetes Service. ClusterService implements it.
 type ClusterAPI interface {
 	ClusterLister
-	// DeleteCluster deletes one cluster by its IBM cluster ID; a name is refused (see ValidateClusterID).
-	DeleteCluster(ctx context.Context, clusterID string) error
+	// DeleteCluster deletes one cluster by its IBM cluster ID; a name is refused (see ValidateClusterID). storage is
+	// what the DELETE asks IBM to do with the cluster's persistent storage; a value that is neither choice is refused
+	// (see deleteResourcesQuery).
+	DeleteCluster(ctx context.Context, clusterID string, storage kubernetesservice.PersistentStorage) error
+}
+
+// PersistentStorageVariable is the e2e configuration variable that the managed flavor templates read into the control
+// plane's spec.deletion.persistentStorage.
+const PersistentStorageVariable = "DELETION_PERSISTENT_STORAGE"
+
+// ValidateLanePersistentStorage returns an error unless value, the value of PersistentStorageVariable, is "Delete". The
+// templates default to Retain, which asks IBM to keep the persistent storage of a deleted cluster, but every e2e
+// cluster is a test cluster: a volume it left behind would stay billed until someone deletes it by hand. Delete only
+// asks IBM to delete the storage; IBM's documentation conflicts on whether VPC Block volumes go with the cluster.
+//
+// Parameters:
+//   - value is the variable's value as the lane reads it from the e2e configuration or the environment.
+func ValidateLanePersistentStorage(value string) error {
+	if value != string(controlplanev1.PersistentStorageDelete) {
+		return fmt.Errorf("%s is %q; the managed lanes need %q (test/e2e/config/ibmcloud-e2e-managed.yaml sets it), so "+
+			"that the DELETE of every e2e cluster asks IBM to delete its persistent storage instead of keeping it "+
+			"billed; unset it in the environment", PersistentStorageVariable, value,
+			controlplanev1.PersistentStorageDelete)
+	}
+	return nil
+}
+
+// deleteResourcesQuery returns IBM's deleteResources query value for storage: "false" asks IBM to keep the cluster's
+// persistent storage, "true" asks IBM to delete it (on VPC nothing else: IBM removes subnets with a cluster only on
+// classic infrastructure). Any other value is an error, so that no DELETE leaves the storage to IBM's default or to a
+// forgotten argument.
+//
+// Parameters:
+//   - storage is the persistent storage choice of the deletion.
+func deleteResourcesQuery(storage kubernetesservice.PersistentStorage) (string, error) {
+	switch storage {
+	case kubernetesservice.RetainPersistentStorage:
+		return "false", nil
+	case kubernetesservice.DeletePersistentStorage:
+		return "true", nil
+	default:
+		return "", fmt.Errorf("the persistent storage choice %q is neither %q nor %q; the janitor asks IBM to keep the "+
+			"storage of stale clusters, the backstop asks IBM to delete the storage of the run's own clusters", storage,
+			kubernetesservice.RetainPersistentStorage, kubernetesservice.DeletePersistentStorage)
+	}
 }
 
 // clusterIDPattern accepts IBM cluster IDs: lowercase letters and digits only (20 of them in every ID observed on IBM
@@ -145,21 +191,27 @@ func (s *ClusterService) ListClusters(ctx context.Context) ([]Cluster, error) {
 	return clusters, nil
 }
 
-// DeleteCluster implements ClusterAPI with DELETE /v1/clusters/{clusterID}?deleteResources=false. It refuses, without
-// a request, every value that is not an IBM cluster ID (ValidateClusterID). deleteResources=false keeps the persistent
-// storage and VPC resources, as CAPIBM's own delete does (CAPIBM only references the user's VPC): the inventory diff
-// reports them instead.
+// DeleteCluster implements ClusterAPI with DELETE /v1/clusters/{clusterID}?deleteResources=<false|true>. It refuses,
+// without a request, every value that is not an IBM cluster ID (ValidateClusterID) and every storage choice that is
+// neither Retain nor Delete (deleteResourcesQuery). On VPC, deleteResources=true asks IBM to delete only the cluster's
+// persistent storage, so the VPC resources stay either way and the inventory diff reports what IBM leaves behind.
 //
 // Parameters:
 //   - ctx bounds the request.
 //   - clusterID is the IBM cluster ID from a ListClusters result, never its name.
-func (s *ClusterService) DeleteCluster(ctx context.Context, clusterID string) error {
+//   - storage is what the DELETE asks IBM to do with the cluster's persistent storage: RetainPersistentStorage sends
+//     deleteResources=false, DeletePersistentStorage deleteResources=true.
+func (s *ClusterService) DeleteCluster(ctx context.Context, clusterID string, storage kubernetesservice.PersistentStorage) error {
 	if err := ValidateClusterID(clusterID); err != nil {
+		return err
+	}
+	deleteResources, err := deleteResourcesQuery(storage)
+	if err != nil {
 		return err
 	}
 	options := &kubernetesserviceapiv1.RemoveClusterOptions{
 		IdOrName:        core.StringPtr(clusterID),
-		DeleteResources: core.StringPtr("false"),
+		DeleteResources: core.StringPtr(deleteResources),
 	}
 	if s.resourceGroupID != "" {
 		options.XAuthResourceGroup = core.StringPtr(s.resourceGroupID)

@@ -30,6 +30,7 @@ import (
 
 // managedE2EConfig is the part of test/e2e/config/ibmcloud-e2e-managed.yaml these tests read.
 type managedE2EConfig struct {
+	Variables map[string]string   `json:"variables"`
 	Intervals map[string][]string `json:"intervals"`
 	Providers []struct {
 		Name     string `json:"name"`
@@ -69,6 +70,19 @@ func TestManagedE2EInstallsASupportedClusterAPI(t *testing.T) {
 		}
 	}
 	g.Expect(seen).To(HaveLen(1), "the cluster-api and kubeadm providers must use one release, got %v", seen)
+}
+
+// TestManagedE2EDeletesPersistentStorage guards the variable that the managed flavor templates read into the control
+// plane's spec.deletion.persistentStorage: the lanes must delete their clusters with Delete, so that their DELETEs ask
+// IBM to delete the persistent storage too. The configuration sets a fixed value, not a ${...:-default} form, because
+// no run has a reason to keep the volumes; an environment variable of that name still wins in the lanes, which then
+// stop before they create anything (ValidateLanePersistentStorage in validateVariables).
+func TestManagedE2EDeletesPersistentStorage(t *testing.T) {
+	g := NewWithT(t)
+	cfg := loadManagedE2EConfig(t)
+	value, ok := cfg.Variables[PersistentStorageVariable]
+	g.Expect(ok).To(BeTrue(), "the managed e2e config must set %s", PersistentStorageVariable)
+	g.Expect(ValidateLanePersistentStorage(value)).To(Succeed())
 }
 
 // loadManagedE2EConfig reads the managed e2e configuration that the managed lanes run with.

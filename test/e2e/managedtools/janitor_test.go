@@ -19,9 +19,12 @@ package managedtools
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
+
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
 
 	. "github.com/onsi/gomega"
 )
@@ -65,6 +68,11 @@ func TestRunJanitorDeletesOnlyStalePrefixedClustersByID(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	// Exactly the two stale prefixed clusters, each addressed by its ID.
 	g.Expect(fake.deletes()).To(ConsistOf("/global/v1/clusters/c0stale1aaaaaaaaaaaa", "/global/v1/clusters/c0stale2aaaaaaaaaaaa"))
+	// The janitor asks IBM to keep the persistent storage: its selection by prefix and age proves less than the
+	// backstop's.
+	g.Expect(fake.deleteQueries()).To(Equal([]string{"deleteResources=false", "deleteResources=false"}))
+	g.Expect(report.PersistentStorage).To(Equal(kubernetesservice.RetainPersistentStorage))
+	g.Expect(report.String()).NotTo(ContainSubstring("persistent storage"))
 	for _, path := range fake.deletes() {
 		for _, cluster := range janitorFixture() {
 			g.Expect(path).NotTo(HaveSuffix("/"+cluster["name"].(string)), "a DELETE addressed a cluster by name")
@@ -256,6 +264,14 @@ func TestDeleteRunClusters(t *testing.T) {
 
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(fake.deletes()).To(ConsistOf(toAny(tc.wantDeletes)...))
+			// The backstop asks IBM to delete the persistent storage of the run's own clusters, so that the run leaves no
+			// volumes, and its report says that it asked, not that IBM deleted it.
+			for _, query := range fake.deleteQueries() {
+				g.Expect(query).To(Equal("deleteResources=true"))
+			}
+			if len(tc.wantDeletes) > 0 {
+				g.Expect(report.String()).To(MatchRegexp(`^deleted capibm-e2e-abc123-iks \(ID c0runaaaaaaaaaaaaaaa, created [^)]+\), asking IBM to delete its persistent storage\n`))
+			}
 			skipped := make([]string, 0, len(report.Skipped))
 			for _, s := range report.Skipped {
 				skipped = append(skipped, s.Cluster.Name)
@@ -303,14 +319,48 @@ func TestExecutePlanWithFakeAPI(t *testing.T) {
 	plan := DeletionPlan{Delete: []Cluster{
 		{ID: "c0aaaaaaaaaaaaaaaaaa", Name: "capibm-e2e-a-iks"},
 		{ID: "c0bbbbbbbbbbbbbbbbbb", Name: "capibm-e2e-b-iks"},
-	}}
+	}, PersistentStorage: kubernetesservice.DeletePersistentStorage}
 
 	report, err := ExecutePlan(context.Background(), api, plan, false)
 
 	g.Expect(api.deleted).To(Equal([]string{"c0aaaaaaaaaaaaaaaaaa", "c0bbbbbbbbbbbbbbbbbb"}))
+	g.Expect(api.storage).To(Equal([]kubernetesservice.PersistentStorage{kubernetesservice.DeletePersistentStorage,
+		kubernetesservice.DeletePersistentStorage}), "every DELETE carries the plan's storage choice")
 	g.Expect(err).To(MatchError(ContainSubstring("deleting cluster capibm-e2e-b-iks (ID c0bbbbbbbbbbbbbbbbbb): connection reset")))
 	g.Expect(names(report.Deleted)).To(ConsistOf("capibm-e2e-a-iks"))
 	g.Expect(report.Failed).To(HaveLen(1))
+}
+
+// TestExecutePlanRefusesAPlanWithoutAStorageChoice checks that a plan that does not say what happens to the
+// persistent storage sends nothing, not even in a dry run: only PlanStaleClusters and PlanRunClusters build plans, and
+// each sets the choice, so a plan without one is a programming error that must not reach IBM.
+func TestExecutePlanRefusesAPlanWithoutAStorageChoice(t *testing.T) {
+	for _, dryRun := range []bool{false, true} {
+		t.Run(fmt.Sprintf("dry run %t", dryRun), func(t *testing.T) {
+			g := NewWithT(t)
+			api := &recordingAPI{}
+			plan := DeletionPlan{Delete: []Cluster{{ID: "c0aaaaaaaaaaaaaaaaaa", Name: "capibm-e2e-a-iks"}}}
+
+			report, err := ExecutePlan(context.Background(), api, plan, dryRun)
+
+			g.Expect(err).To(MatchError(ContainSubstring(`deletion plan: the persistent storage choice "" is neither "Retain" nor "Delete"`)))
+			g.Expect(api.deleted).To(BeEmpty())
+			g.Expect(report.Deleted).To(BeEmpty())
+		})
+	}
+}
+
+// TestPlansChooseThePersistentStorage locks which plan asks IBM to delete the persistent storage: the backstop's plan of
+// the run's own clusters asks IBM to delete it, the janitor's plan of stale clusters to keep it, also when they select
+// nothing.
+func TestPlansChooseThePersistentStorage(t *testing.T) {
+	g := NewWithT(t)
+	stale, err := PlanStaleClusters(nil, DefaultNamePrefix, JanitorMinimumAge, janitorNow)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(stale.PersistentStorage).To(Equal(kubernetesservice.RetainPersistentStorage))
+	run, err := PlanRunClusters(nil, []string{"capibm-e2e-abc123-iks"}, janitorNow)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(run.PersistentStorage).To(Equal(kubernetesservice.DeletePersistentStorage))
 }
 
 func TestDeletionReportStringEmpty(t *testing.T) {
@@ -318,16 +368,18 @@ func TestDeletionReportStringEmpty(t *testing.T) {
 	g.Expect(DeletionReport{}.String()).To(Equal("no matching cluster\n"))
 }
 
-// recordingAPI is a ClusterAPI that records the deleted IDs and fails the ones in errs.
+// recordingAPI is a ClusterAPI that records the deleted IDs and their storage choices and fails the IDs in errs.
 type recordingAPI struct {
 	deleted []string
+	storage []kubernetesservice.PersistentStorage
 	errs    map[string]error
 }
 
 func (a *recordingAPI) ListClusters(context.Context) ([]Cluster, error) { return nil, nil }
 
-func (a *recordingAPI) DeleteCluster(_ context.Context, clusterID string) error {
+func (a *recordingAPI) DeleteCluster(_ context.Context, clusterID string, storage kubernetesservice.PersistentStorage) error {
 	a.deleted = append(a.deleted, clusterID)
+	a.storage = append(a.storage, storage)
 	return a.errs[clusterID]
 }
 

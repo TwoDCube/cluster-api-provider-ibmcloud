@@ -109,6 +109,12 @@ variables:
   # cluster without one, E7278).
   COS_INSTANCE_CRN: "${COS_INSTANCE_CRN:-}"
   WORKER_UPDATE_POLICY: "Manual"
+  # The templates read it into the control plane's spec.deletion.persistentStorage (default Retain). Every lane deletes
+  # its cluster with Delete, so that its DELETE asks IBM to delete the cluster's persistent storage too, as a test
+  # cluster's should; the lanes stop before they create anything when it is not Delete. Whether IBM then removes VPC
+  # Block volumes is not checked: IBM's documentation conflicts on it, and the lanes create no PersistentVolumeClaim
+  # (docs/book/src/topics/managed/deleting.md, "Persistent storage").
+  DELETION_PERSISTENT_STORAGE: "Delete"
   # Image of the PodDisruptionBudget probe pods (test/e2e/data/managed); it needs a POSIX shell. The default is pulled
   # over public egress, so the workers' subnets need a public gateway; without one, set a copy in a registry the
   # workers reach over private endpoints, or the IKS lane fails at its first PodDisruptionBudget step (wait-probe).
