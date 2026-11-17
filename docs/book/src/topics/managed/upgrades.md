@@ -69,8 +69,7 @@ of service on IBM's schedule (in November 2026 IBM listed 2027-01-20 for IKS 1.3
   <id>, which CAPIBM cannot parse, ...". CAPIBM cannot tell which minor the master runs, so it requests no master update
   and leaves `RollingOut` as it is; the cluster itself is not affected. CAPIBM looks again at every poll and continues
   as soon as IBM reports a version it can parse. If the condition stays, IBM uses a version format that CAPIBM does not
-  know yet: report the quoted value to the Cluster API Provider IBM Cloud project. Until a CAPIBM release parses it, the
-  master minor of this cluster cannot be updated through CAPIBM.
+  know yet, and until a CAPIBM release parses it, the master minor of this cluster cannot be updated through CAPIBM.
 
 <aside class="note warning">
 

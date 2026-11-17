@@ -206,7 +206,7 @@ per zone ([Topology](./topology.md#smaller-topologies-are-not-ha)). CAPIBM ignor
   `PermissionDenied` a failed listing replaced, once the listing works again; the retry time stays the same.
 * **`UnparsableMasterVersion`** (`MasterVersionUpToDate=Unknown`): IBM reports a master version CAPIBM cannot parse,
   and the message quotes it; no master update is requested until IBM reports a version CAPIBM can parse. If it stays,
-  report the quoted value ([Upgrades](./upgrades.md#when-ibm-does-not-take-the-update)).
+  see [Upgrades](./upgrades.md#when-ibm-does-not-take-the-update).
 * **`BlockedByWorkerSkew`**: some workers are too many minors behind; let the workers catch up (they follow the master
   minor automatically; see `WaitingForCapacity` below).
 * **`BlockedByCARotation`**, **`BlockedByClusterState`**: wait for the CA rotation or for IBM's cluster state; the
