@@ -23,7 +23,7 @@ kubectl apply -f my-iks.yaml
 Always pass `--worker-machine-count` (6 for the HA flavors, 2 for the single-zone flavors, or another multiple of
 the zone count): without the flag or a `WORKER_MACHINE_COUNT` variable, `clusterctl generate cluster` sets
 `WORKER_MACHINE_COUNT` to 0, so the template default does not apply and the control plane stops in
-`InvalidConfiguration` ("MachinePool <name> spec.replicas=0 is not a positive multiple of the 3 zone(s) ...") before
+`InvalidConfiguration` ("MachinePool \<name\> spec.replicas=0 is not a positive multiple of the 3 zone(s) ...") before
 any IBM call.
 
 For ROKS use `--flavor managed-roks`, `ROKS_DISTRIBUTION_VERSION` (for example `4.21`) and
@@ -114,14 +114,14 @@ spec:
 * Its `poolName` becomes the IBM pool name (IBM honours custom names), and its `MachinePool.spec.replicas` divided by
   its zone count becomes IBM's per-zone worker count.
 * **None marked**: `IBMClusterProvisioned=False`, reason `WaitingForInitialWorkerPool`, message "No
-  IBMCloudManagedMachinePool of Cluster <name> has spec.creation: WithCluster; mark exactly one pool, it is created
+  IBMCloudManagedMachinePool of Cluster \<name\> has spec.creation: WithCluster; mark exactly one pool, it is created
   together with the IBM cluster". Fix: set `creation: WithCluster` on one pool; the control plane reacts at once.
 * **Not yet linked**: the same reason while Cluster API has not yet set the pool's owner reference to its `MachinePool`;
   it clears by itself.
 * **Several marked**: `IBMClusterProvisioned=False`, reason `InvalidConfiguration`, message
-  "IBMCloudManagedMachinePools <a>, <b> of Cluster <name> all have spec.creation: WithCluster; IBM creates the cluster
-  with one initial pool, so keep exactly one of them WithCluster and set spec.creation: AfterCluster on the others (or
-  omit it)". Fix: remove the marker from all but one.
+  "IBMCloudManagedMachinePools \<a\>, \<b\> of Cluster \<name\> all have spec.creation: WithCluster; IBM creates the
+  cluster with one initial pool, so keep exactly one of them WithCluster and set spec.creation: AfterCluster on the
+  others (or omit it)". Fix: remove the marker from all but one.
 * In all three cases CAPIBM makes no IBM call.
 * The marker is read **only until the IBM cluster exists**. Adding, moving or removing it later changes nothing (a
   second marked pool after the create is not an error), and it never decides which IBM pool an object manages: every

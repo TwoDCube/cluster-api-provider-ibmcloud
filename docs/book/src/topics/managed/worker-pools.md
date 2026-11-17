@@ -55,7 +55,10 @@ Rules checked before any IBM call (each a `WorkerPoolReady=False` reason, see th
   being resolved).
 * `entitlement` is OpenShift only (`InvalidForDistribution`).
 * No other `IBMCloudManagedMachinePool` of the Cluster may use the same `poolName` (`PoolNameConflict` on **every**
-  object that claims it; none of them publishes or changes anything until one is renamed or removed).
+  object that claims it; none of them creates, sizes or publishes the IBM pool while more than one claims it).
+  `poolName` is immutable, so a claimant cannot be renamed: delete all but one of them
+  ([Troubleshooting](./troubleshooting.md#workers-do-not-roll-or-scale)). A claimant's deletion leaves the IBM pool
+  alone only while another claimant that is not being deleted itself remains, so deleting all of them removes it.
 * `MachinePool.spec.template.spec.version` is ignored (workers follow the master minor), and so is
   `MachinePool.spec.failureDomains` (`spec.zones` is used); the condition message says so.
 * IBM's cluster state can block pool changes: `unavailable` and `scaled_down` block every change, `unsupported` blocks
@@ -70,7 +73,7 @@ An `IBMCloudManagedMachinePool` whose `poolName` matches an IBM pool that alread
 one created with the IBM Cloud CLI) takes it over:
 
 * **Same flavor**: CAPIBM adopts it and emits the Normal event `WorkerPoolAdopted` ("CAPIBM now sizes IBM worker pool
-  <name> (<pool-id>) and removes it when this object is deleted"). From then on CAPIBM sizes it to
+  \<name\> (\<pool-id\>) and removes it when this object is deleted"). From then on CAPIBM sizes it to
   `MachinePool.spec.replicas` (a smaller value drains and removes workers), rolls its workers and **removes the IBM pool
   when the object is deleted**. Set `replicas` to the pool's current size and list the same zones before you apply.
 * **Another flavor**: `WorkerPoolReady=False`, reason `PoolConflict`. CAPIBM treats the pool as not its own: it

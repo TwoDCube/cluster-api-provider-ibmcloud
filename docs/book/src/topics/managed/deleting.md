@@ -26,8 +26,8 @@ off, because a deletion cannot be taken back: a control plane keeps its finalize
 once the gate is on again, while the `IBMCloudManagedCluster`, which has no finalizer, goes at once and leaves the
 control plane unable to manage or delete its IBM cluster. The rejections read:
 
-* control plane: "delete Cluster <name> instead; deleting the control plane alone would delete the IBM cluster";
-* `IBMCloudManagedCluster`: "delete Cluster <name> instead; IBMCloudManagedControlPlane/<cp> still needs this
+* control plane: "delete Cluster \<name\> instead; deleting the control plane alone would delete the IBM cluster";
+* `IBMCloudManagedCluster`: "delete Cluster \<name\> instead; IBMCloudManagedControlPlane/\<cp\> still needs this
   IBMCloudManagedCluster to manage and delete its IBM cluster".
 
 The control plane's deletion is allowed when the `Cluster` is being deleted or is gone, during `clusterctl move`, and
@@ -37,9 +37,9 @@ while no IBM cluster can exist yet. The `IBMCloudManagedCluster`'s deletion is a
 While the `Cluster` is being deleted, the `IBMCloudManagedCluster` stays until its control plane is gone, because the
 control plane needs its resource group to prove which IBM cluster to delete; Cluster API itself deletes it only after
 the control plane. A tool that deletes every object at once, such as `kubectl delete -f` on the cluster's manifest or a
-GitOps prune, gets "leave this deletion to Cluster API: Cluster <name> is being deleted, and
-IBMCloudManagedControlPlane/<cp> still needs this IBMCloudManagedCluster to delete IBM cluster <id>; ..." for that one
-object. Nothing needs to be done: the rest of the deletion goes on, and the `IBMCloudManagedCluster` goes last.
+GitOps prune, gets "leave this deletion to Cluster API: Cluster \<name\> is being deleted, and
+IBMCloudManagedControlPlane/\<cp\> still needs this IBMCloudManagedCluster to delete IBM cluster \<id\>; ..." for that
+one object. Nothing needs to be done: the rest of the deletion goes on, and the `IBMCloudManagedCluster` goes last.
 
 If a control plane is deleted without its `Cluster` anyway, CAPIBM waits until all `MachinePool`s of its Cluster are
 gone (`WaitingForWorkersDeletion`) and deletes nothing before that.
@@ -150,7 +150,7 @@ own a cluster it cannot see. These states need a person:
 | `OwnershipNotProven` | the IBM cluster that the kubeconfig Secret's `cluster-id` names differs in name, resource group, distribution or provider, or the Secret's credential does not pass the cluster-admin access review there | put a fresh `ibmcloud ks cluster config --admin` kubeconfig into the Secret ([clusterctl move](./clusterctl-move.md#recovering-from-ownershipnotproven)), or remove the finalizer by hand to leave the IBM cluster alone |
 | `OwnershipNotProven` (message "... named by status.clusterID, does not match this control plane: ...") | the IBM cluster that `status.clusterID` names differs in name, resource group, distribution or provider; `status.clusterID` decides this, not the kubeconfig Secret, so a new Secret changes nothing | check that cluster in IBM Cloud: if it belongs to this Cluster, delete it there, and CAPIBM removes the finalizer once it finds the cluster gone; otherwise remove the finalizer by hand to leave the IBM cluster alone |
 | `PossibleOwnClusterFound` | a create attempt's outcome was unknown, and a same-named IBM cluster appeared whose creation time does not prove it is ours | check in IBM Cloud: if it is this Cluster's, delete it there; otherwise remove the finalizer by hand |
-| `IBMClusterNotVisible` | IBM says the cluster does not exist, but the stored kubeconfig still works against it: "The credentials of the CAPIBM controller identity cannot see IBM cluster <id> in account <account-id>, but its kubeconfig Secret still authenticates against it; check the account and IAM scope of those credentials. ..."; once reported, it stays while the kubeconfig cannot be checked ("... authenticated against it before but cannot be checked now (...); ...") | give CAPIBM's credentials access to that account and resource group (for example after a move to a management cluster with other credentials), or remove the finalizer by hand to leave the IBM cluster alone |
+| `IBMClusterNotVisible` | IBM says the cluster does not exist, but the stored kubeconfig still works against it: "The credentials of the CAPIBM controller identity cannot see IBM cluster \<id\> in account \<account-id\>, but its kubeconfig Secret still authenticates against it; check the account and IAM scope of those credentials. ..."; once reported, it stays while the kubeconfig cannot be checked ("... authenticated against it before but cannot be checked now (...); ...") | give CAPIBM's credentials access to that account and resource group (for example after a move to a management cluster with other credentials), or remove the finalizer by hand to leave the IBM cluster alone |
 | `WaitingForInfrastructure` | the `IBMCloudManagedCluster` is gone while an IBM cluster may exist; CAPIBM needs its resource group to prove which cluster to delete | re-apply it from its manifest, or remove the finalizer by hand to leave the IBM cluster alone |
 | `DeleteFailed` | IBM reports `delete_failed` | open an IBM support case; CAPIBM never sends `DELETE` again for it |
 | `PermissionDenied` | IBM refused a call of the deletion with 403: the lookup of the cluster, the CA fetch of the ownership proof, or the `DELETE`; the message names the call | grant the Kubernetes Service role ([Prerequisites](./prerequisites.md#iam-permissions)); CAPIBM checks again every 15 minutes |
@@ -158,15 +158,15 @@ own a cluster it cannot see. These states need a person:
 
 When IBM answers 404 for a known cluster before CAPIBM sent its `DELETE` and the stored kubeconfig cannot be checked
 (the API server does not answer, or answers with a 5xx), CAPIBM cannot tell a cluster its credentials cannot see from
-one that is gone. It reports `WaitingForIBMDeletion` ("IBM answers 404 for cluster <id>, and its kubeconfig Secret
+one that is gone. It reports `WaitingForIBMDeletion` ("IBM answers 404 for cluster \<id\>, and its kubeconfig Secret
 could not be checked against it (...); ...") and checks again every minute until 30 minutes after the deletion started;
 then it counts the cluster as deleted out of band and removes the finalizer. A kubeconfig that is rejected (401, a
 certificate that no longer verifies) removes the finalizer at once.
 
 A Cluster deleted right after its create request may name an IBM cluster that IBM does not list yet: one IBM accepted
-("IBM Cloud does not list cluster <id> yet; CAPIBM sent its create request at <time> and waits until <time> for IBM to
-list it before it counts the cluster as gone"), or one whose create answer was lost ("IBM Cloud lists no cluster named
-<name> yet; a create request sent at <time> may still have created it, ..."). Either way CAPIBM reports
+("IBM Cloud does not list cluster \<id\> yet; CAPIBM sent its create request at \<time\> and waits until \<time\> for
+IBM to list it before it counts the cluster as gone"), or one whose create answer was lost ("IBM Cloud lists no cluster
+named \<name\> yet; a create request sent at \<time\> may still have created it, ..."). Either way CAPIBM reports
 `WaitingForIBMDeletion` and keeps the finalizer until 30 minutes after that create request, so that a cluster IBM lists
 late is still found and deleted instead of left running.
 
@@ -176,17 +176,17 @@ any, keeps running and billing until you delete it in IBM Cloud.
 
 If an IBM cluster with the Cluster's name exists that CAPIBM did not create (for example after `ClusterNameConflict`),
 deleting the Cluster removes the finalizer with a Warning event `IBMClusterNotDeleted` naming that cluster ("IBM cluster
-<name> (ID <id>, created <date>) was not deleted: CAPIBM cannot prove it created it for this Cluster"). Delete it in IBM
-Cloud yourself if it is yours.
+\<name\> (ID \<id\>, created \<date\>) was not deleted: CAPIBM cannot prove it created it for this Cluster"). Delete it
+in IBM Cloud yourself if it is yours.
 
 Likewise, deleting a pool object leaves the IBM pool alone, with the Warning event `WorkerPoolNotRemoved`, when another
-`IBMCloudManagedMachinePool` of the Cluster still claims the same `poolName`, or when the IBM pool has another flavor
-and so is not this object's pool (`PoolConflict`). A scale-down or replacement this object left unfinished ends with
-it: CAPIBM reverts its cordons on the Nodes (the event says how many) and releases the disruption token before the
-finalizer goes. When that operation already asked IBM to remove workers, the deletion first waits in
-`WaitingForWorkerRemoval` (`Deleting`) until IBM has removed them or 60 minutes have passed; while the workload cluster
-is not connected it waits in `WaitingForWorkloadCluster`, unless both
-[exclusion annotations](./worker-pools.md#drain-settings) are set.
+`IBMCloudManagedMachinePool` of the Cluster that is not being deleted itself still claims the same `poolName` (so
+deleting every claimant removes the IBM pool), or when the IBM pool has another flavor and so is not this object's pool
+(`PoolConflict`). A scale-down or replacement this object left unfinished ends with it: CAPIBM reverts its cordons on
+the Nodes (the event says how many) and releases the disruption token before the finalizer goes. When that operation
+already asked IBM to remove workers, the deletion first waits in `WaitingForWorkerRemoval` (`Deleting`) until IBM has
+removed them or 60 minutes have passed; while the workload cluster is not connected it waits in
+`WaitingForWorkloadCluster`, unless both [exclusion annotations](./worker-pools.md#drain-settings) are set.
 
 ## Keep the gate on until the deletion is done
 

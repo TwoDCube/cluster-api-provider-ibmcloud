@@ -36,11 +36,11 @@ disappears sets `NetworkReady` to `False` but does not affect the running cluste
 | `VPCNotFound` | no VPC with that name or ID in `spec.region` |
 | `SubnetNotFound` | a zone's subnet does not exist in the VPC |
 | `SubnetNotInVPC` | the subnet belongs to another VPC |
-| `SubnetZoneMismatch` | the subnet lies in another zone than the one it is listed for, for example "subnet dev-sn-2 (<subnet-id>) is in zone us-south-1, but IBMCloudManagedCluster/dev lists it for us-south-2" |
+| `SubnetZoneMismatch` | the subnet lies in another zone than the one it is listed for, for example "subnet dev-sn-2 (\<subnet-id\>) is in zone us-south-1, but IBMCloudManagedCluster/dev lists it for us-south-2" |
 | `SubnetNameAmbiguous` | several subnets in the VPC have that name; give the subnet `id` instead |
 | `IBMAPIError` | another IBM error; see the HTTP status in the message and the controller log; a refusal of the credentials by IAM has neither an HTTP status nor an IBM code (below) |
 
-`IBMAPIError` with "The IAM token service of IBM Cloud rejected the credentials of <identity> while <call>, so the
+`IBMAPIError` with "The IAM token service of IBM Cloud rejected the credentials of \<identity\> while \<call\>, so the
 request was not sent; ..." means that IAM refused the API key before any VPC or Resource Manager request was made: the
 key was deleted, disabled or mistyped, so no role or network fix helps. The message has no HTTP status and no IBM code,
 because no request reached those services. Put a valid API key into the `IBMCLOUD_APIKEY` line of `ibm-credentials.env`
@@ -57,7 +57,7 @@ Region, resource group and VPC cannot change after creation; zones can only be a
 
 ### The control plane is rejected because of its IBM cluster name
 
-"spec.ibmCloudClusterName: Required value: without it the IBM cluster would be named after Cluster "<name>", and IBM
+"spec.ibmCloudClusterName: Required value: without it the IBM cluster would be named after Cluster "\<name\>", and IBM
 would refuse that name: it has 33 characters, more than 32; ...", or "spec.ibmCloudClusterName: Invalid value: ...":
 the name breaks IBM's cluster name rule, **1 to 32 characters, a letter (`a-z`, `A-Z`) first, then letters, digits,
 `-`, `_` and `.`** ([Naming the IBM cluster](./creating-a-cluster.md#naming-the-ibm-cluster)). IBM would refuse the
@@ -74,12 +74,12 @@ The control plane waits until the `IBMCloudManagedCluster` has resolved the netw
 Exactly one `IBMCloudManagedMachinePool` of the Cluster must have `spec.creation: WithCluster` before the IBM cluster is
 created:
 
-* `WaitingForInitialWorkerPool`, "No IBMCloudManagedMachinePool of Cluster <name> has spec.creation: WithCluster ...":
+* `WaitingForInitialWorkerPool`, "No IBMCloudManagedMachinePool of Cluster \<name\> has spec.creation: WithCluster ...":
   set the marker on the pool IBM should create with the cluster. The control plane continues at once.
-* `WaitingForInitialWorkerPool`, "IBMCloudManagedMachinePool <p> is not linked to its MachinePool yet ...": the pool's
+* `WaitingForInitialWorkerPool`, "IBMCloudManagedMachinePool \<p\> is not linked to its MachinePool yet ...": the pool's
   `MachinePool` is missing, or Cluster API has not set the owner reference yet. Check that a `MachinePool` references
   the pool in `spec.template.spec.infrastructureRef`.
-* `InvalidConfiguration`, "IBMCloudManagedMachinePools <a>, <b> of Cluster <name> all have spec.creation:
+* `InvalidConfiguration`, "IBMCloudManagedMachinePools \<a\>, \<b\> of Cluster \<name\> all have spec.creation:
   WithCluster ...": keep the marker on one pool.
 
 None of these makes an IBM call. Once the IBM cluster exists the marker is ignored. See
@@ -97,7 +97,7 @@ ranges) or to the `IBMCloudManagedCluster` is picked up at the next check. After
 change to the spec of the `IBMCloudManagedControlPlane` ends the [create hold](#the-create-hold-after-a-refusal) before
 that check.
 
-An invalid cluster name ("the IBM cluster name "<name>", taken from the Cluster's metadata.name
+An invalid cluster name ("the IBM cluster name "\<name\>", taken from the Cluster's metadata.name
 (spec.ibmCloudClusterName is omitted), has 33 characters, more than 32; ...") breaks IBM's rule of 1 to 32 characters,
 a letter first, then letters, digits, `-`, `_` and `.`. It reaches the controller when the admission webhook could not
 tell the `Cluster` whose name is the default, for example because the control plane was created before its `Cluster`.
@@ -107,9 +107,9 @@ creation), so delete the `Cluster` and create it again with `spec.ibmCloudCluste
 
 ### PermissionDenied on create
 
-* **`A0656`**: "IBM cannot create the infrastructure API key for region <r> and resource group <rg> with the credentials
-  of the CAPIBM controller identity (IBM code A0656); ...". The service ID lacks the IAM Identity Service roles, or an
-  account administrator has to pre-set the key with `ibmcloud ks api-key reset`
+* **`A0656`**: "IBM cannot create the infrastructure API key for region \<r\> and resource group \<rg\> with the
+  credentials of the CAPIBM controller identity (IBM code A0656); ...". The service ID lacks the IAM Identity Service
+  roles, or an account administrator has to pre-set the key with `ibmcloud ks api-key reset`
   ([Prerequisites](./prerequisites.md#the-infrastructure-key-of-a-region-and-resource-group)).
 * **403**: a missing role ([IAM permissions](./prerequisites.md#iam-permissions)), or the stored infrastructure key of
   the region and resource group belongs to an identity with insufficient permissions. Check whose key it is with
@@ -169,7 +169,7 @@ repeated within milliseconds.
 
 ### ClusterNameConflict
 
-"IBM Cloud cluster <name> (ID <id>, created <date>) already exists and CAPIBM cannot prove it created it for this
+"IBM Cloud cluster \<name\> (ID \<id\>, created \<date\>) already exists and CAPIBM cannot prove it created it for this
 Cluster ...". IBM names are unique per account, so another namespace or management cluster (or a person) uses the name.
 CAPIBM created nothing and never touches that cluster.
 
@@ -200,7 +200,7 @@ CAPIBM created nothing and never touches that cluster.
 | Condition and reason | Meaning |
 |---|---|
 | `KubeconfigReady=False` `WaitingForMaster` | normal for 16 to 25 minutes after the create |
-| `KubeconfigReady=False` `EndpointUnreachable` | "The management cluster cannot reach <url> (...); private-only clusters need private connectivity": check firewalls, CBR rules on the cluster API, and private connectivity for private-only clusters |
+| `KubeconfigReady=False` `EndpointUnreachable` | "The management cluster cannot reach \<url\> (...); private-only clusters need private connectivity": check firewalls, CBR rules on the cluster API, and private connectivity for private-only clusters |
 | `KubeconfigReady=False` `CredentialFetchFailed` | IBM's admin kubeconfig or CA could not be fetched (often the Administrator role is missing; the message carries IBM's code only, and CAPIBM tries again after 5 minutes for a 401 and 15 minutes for a 403 or 400), or it held no client certificate |
 | `KubeconfigReady=False` `VerificationFailed` | a new credential failed the check against the master (the previous Secret is kept), the stored credential is rejected with 401 (CAPIBM fetches IBM's admin credential again with a backoff of 1 to 10 minutes), or the master's certificate no longer verifies with the stored trust (both trust modes are tried again at most once every 10 minutes) |
 | `KubeconfigReady=False` `UserProvidedSecretInvalid` | your Secret lacks the `cluster.x-k8s.io/cluster-name` label or a non-empty `value` key |
@@ -267,9 +267,19 @@ per zone ([Topology](./topology.md#smaller-topologies-are-not-ha)). CAPIBM ignor
   `ibmcloud ks worker-pool rebalance --cluster <cluster> --worker-pool <pool>`.
 * **`ReplacementNotCreated`**: IBM created no new worker 30 minutes after deleting the old one; check auto-rebalance and
   the zone's capacity and quota.
-* **`PoolNameConflict`**: two pool objects of the Cluster use the same `poolName`; rename or remove one.
-* **`PoolConflict`**: an IBM pool with that name has another flavor; it is not CAPIBM's and is never touched. Use
-  another `poolName`.
+* **`PoolNameConflict`**: two or more pool objects of the Cluster use the same `poolName`, so none of them creates,
+  sizes or publishes that IBM pool. `poolName` is immutable, so editing it is rejected. Delete the `MachinePool` of
+  every claimant but one (Cluster API deletes its `IBMCloudManagedMachinePool` with it); keep the one whose
+  `status.poolID` is set, if any, because it already manages the IBM pool. A claimant's deletion makes no IBM call and
+  leaves the IBM pool alone (Warning event `WorkerPoolNotRemoved`) only while another claimant that is not being
+  deleted itself remains. Deleting every claimant, at the same time or one after another, drains and removes the IBM
+  pool and its workers like any other pool deletion, so keep one instead of deleting all and applying one again. The
+  one left stays in `PoolNameConflict` until the deletions of the others have finished; then it manages the IBM pool
+  by name as usual and sizes it to its own `MachinePool`'s `replicas`. To have a deleted pool as a separate IBM pool,
+  create it again with another `poolName`.
+* **`PoolConflict`**: an IBM pool with that name has another flavor; it is not CAPIBM's and is never touched.
+  `poolName` is immutable: delete the pool object, which leaves that IBM pool alone (Warning event
+  `WorkerPoolNotRemoved`), and create it again with another `poolName`.
 * **`PoolNameBeingReleased`**: IBM still lists a deleted pool with that name; it clears by itself.
 * **`ExternallyAutoscaled`**: IBM's autoscaler add-on manages the pool; CAPIBM does not resize it.
 
@@ -306,7 +316,7 @@ the annotations above.
 
 ## A deletion is rejected
 
-* "delete Cluster <name> instead; ...": the control plane or the `IBMCloudManagedCluster` was deleted on its own while
+* "delete Cluster \<name\> instead; ...": the control plane or the `IBMCloudManagedCluster` was deleted on its own while
   its `Cluster` lives. Delete the `Cluster` instead ([Deleting a cluster](./deleting.md)).
 * "leave this deletion to Cluster API: ...": the `Cluster` is being deleted, and its control plane still needs the
   `IBMCloudManagedCluster` to delete the IBM cluster. Nothing needs to be done: Cluster API deletes the

@@ -36,8 +36,8 @@ CAPIBM then:
 
 `MasterVersionUpToDate` is `True` whenever the master runs the requested minor, whatever patch IBM chose. When IBM's
 end of support for the minor is less than 45 days away, the message mentions it; once IBM marks the version
-`unsupported` the message says "IBM no longer supports <minor>: upgrade one minor at a time, starting with
-spec.distributionVersion <next-minor>". Minors reach their end
+`unsupported` the message says "IBM no longer supports \<minor\>: upgrade one minor at a time, starting with
+spec.distributionVersion \<next-minor\>". Minors reach their end
 of service on IBM's schedule (in November 2026 IBM listed 2027-01-20 for IKS 1.34), so plan regular upgrades; on an
 `unsupported` cluster IBM adds and replaces no workers until the master is upgraded.
 
@@ -60,21 +60,21 @@ asked for, and CAPIBM updates nothing until you raise `spec.distributionVersion`
 * If IBM cannot be asked, the list keeps its last value (without a minor the master has reached since), and CAPIBM asks
   again a few minutes later, after a 429 not before IBM's `Retry-After`.
 * Master patches are not listed: IBM applies them itself, and `RollingOut=True` (`MasterUpdateInProgress`, "IBM is
-  applying master patch <version>") shows one in progress. A master patch that IBM offers but has not applied yet is not
-  reported.
+  applying master patch \<version\>") shows one in progress. A master patch that IBM offers but has not applied yet is
+  not reported.
 
 ### When IBM does not take the update
 
 * If the master is still on the old minor some time after the request and IBM shows no update in progress, the reason
-  is `UpgradeFailed`: "the master update to <new> that CAPIBM requested at <time> has not taken effect: the master
-  still runs <old> and IBM shows no update in progress; CAPIBM requests it again at <retry time>". CAPIBM requests the
-  update again with a backoff of 1 hour, then 2, 4, ... hours, at most 24 hours between attempts.
+  is `UpgradeFailed`: "the master update to \<new\> that CAPIBM requested at \<time\> has not taken effect: the master
+  still runs \<old\> and IBM shows no update in progress; CAPIBM requests it again at \<retry time\>". CAPIBM requests
+  the update again with a backoff of 1 hour, then 2, 4, ... hours, at most 24 hours between attempts.
 * If IBM refuses the request with HTTP 403, the reason is `PermissionDenied`. The message names the missing Kubernetes
   Service role, the credentials ("the CAPIBM controller identity") and the time of the next attempt.
 * Before the request, CAPIBM lists the versions IBM offers in the region and the workers of the cluster. If IBM refuses
   one of these listings, CAPIBM sends no request, and `MasterVersionUpToDate=False` names the listing:
-  * HTTP 403, reason `PermissionDenied`: "IBM Cloud Kubernetes Service refused listing the workers of IBM cluster <id>
-    with HTTP 403 (IBM code <c>), so the master update to <minor> waits: the credentials of the CAPIBM controller
+  * HTTP 403, reason `PermissionDenied`: "IBM Cloud Kubernetes Service refused listing the workers of IBM cluster \<id\>
+    with HTTP 403 (IBM code \<c\>), so the master update to \<minor\> waits: the credentials of the CAPIBM controller
     identity need ...". Grant those credentials the Administrator platform role and the Manager service role of
     Kubernetes Service on the cluster's resource group ([IAM permissions](./prerequisites.md#iam-permissions)).
   * HTTP 400 or 404, reason `IBMAPIError`, with IBM's code. Look the code up together with IBM's description and
@@ -85,13 +85,14 @@ asked for, and CAPIBM updates nothing until you raise `spec.distributionVersion`
   credentials, waits for IBM's `Retry-After`, or retries with a backoff. Once the listings succeed, the
   update continues; a request already on record keeps its retry time. A refused `UpdateMaster` that the condition
   showed before the listing failed is not shown again: the reason then reads `UpgradeFailed` ("... CAPIBM requests it
-  again at <retry time>"), with the same retry time, so no request is lost or added.
+  again at \<retry time\>"), with the same retry time, so no request is lost or added.
 * If IBM reports a master version that CAPIBM cannot parse, `MasterVersionUpToDate` is `Unknown` with the reason
-  `UnparsableMasterVersion`, and the message quotes the value: "IBM reports master version "<value>" for IBM cluster
-  <id>, which CAPIBM cannot parse, ...". CAPIBM cannot tell which minor the master runs, so it requests no master update
-  and leaves `RollingOut` as it is; the cluster itself is not affected. CAPIBM looks again at every poll and continues
-  as soon as IBM reports a version it can parse. If the condition stays, IBM uses a version format that CAPIBM does not
-  know yet, and until a CAPIBM release parses it, the master minor of this cluster cannot be updated through CAPIBM.
+  `UnparsableMasterVersion`, and the message quotes the value: "IBM reports master version "\<value\>" for IBM cluster
+  \<id\>, which CAPIBM cannot parse, ...". CAPIBM cannot tell which minor the master runs, so it requests no master
+  update and leaves `RollingOut` as it is; the cluster itself is not affected. CAPIBM looks again at every poll and
+  continues as soon as IBM reports a version it can parse. If the condition stays, IBM uses a version format that CAPIBM
+  does not know yet, and until a CAPIBM release parses it, the master minor of this cluster cannot be updated through
+  CAPIBM.
 
 <aside class="note warning">
 
@@ -170,9 +171,9 @@ during the replacement must still hold IBM's cluster minimum (1 on IKS, 2 on ROK
 
 * An **IKS** cluster needs at least **2** workers to roll a worker; a **ROKS** cluster at least **3**.
 * Below that, replacements wait with `WorkersUpToDate=False`, reason `WaitingForCapacity`, and the message names the fix:
-  "...; scale MachinePool <name> to <n> to allow a rolling replacement". `<n>` adds whole workers per zone of the pool
-  (IBM sizes pools per zone), so a single-zone pool grows by one. Scale to it, let the rollout finish, then scale back
-  down.
+  "...; scale MachinePool \<name\> to \<n\> to allow a rolling replacement". `<n>` adds whole workers per zone of the
+  pool (IBM sizes pools per zone), so a single-zone pool grows by one. Scale to it, let the rollout finish, then scale
+  back down.
 * A 1-worker IKS cluster can never roll a worker, and after two master minors its next master upgrade is
   `BlockedByWorkerSkew`. A 2-worker ROKS cluster (for example `managed-roks-single-zone`) needs the temporary third
   worker for every rollout.
@@ -184,7 +185,7 @@ for `minReadySeconds`.
 On IKS, a worker also drains only while its zone holds at least **2 workers** of any pool. Each zone's Ingress ALB
 runs 2 replicas, at most one per worker ([Topology](./topology.md#ibms-ha-topology-3-zones--2-workers-per-zone)), and
 IBM's PodDisruptionBudget for it keeps one available: in a zone with 1 worker only one replica runs, its eviction is
-refused, and the drain stays `DrainBlocked` ("... the disruption budget public-cr<cluster ID>-alb1 needs 1 healthy
+refused, and the drain stays `DrainBlocked` ("... the disruption budget public-cr\<cluster ID\>-alb1 needs 1 healthy
 pods and has 1 currently") until you set `nodeDrainTimeoutSeconds` in the `MachinePool`'s `spec.template.spec.deletion`
 ([drain settings](./worker-pools.md#drain-settings)). After that time CAPIBM continues without the eviction, and the
 zone has no running ALB replica until the replacement is up. To roll a pool of 1 worker per zone without that, first
