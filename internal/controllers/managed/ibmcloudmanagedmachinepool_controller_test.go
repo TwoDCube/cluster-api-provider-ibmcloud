@@ -26,6 +26,7 @@ import (
 
 	"go.uber.org/mock/gomock"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -42,6 +43,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/config"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -646,4 +648,309 @@ func TestIBMCloudManagedMachinePoolMapFunctions(t *testing.T) {
 	unlabelled := f.cp.DeepCopy()
 	unlabelled.Labels = nil
 	g.Expect(r.controlPlaneToIBMCloudManagedMachinePools(context.Background(), unlabelled)).To(BeEmpty())
+	g.Expect(r.infraClusterToIBMCloudManagedMachinePools(context.Background(), f.infra)).To(Equal(want),
+		"the IBMCloudManagedCluster's zones decide the zone guards of every pool of its Cluster")
+	unlabelledInfra := f.infra.DeepCopy()
+	unlabelledInfra.Labels = nil
+	g.Expect(r.infraClusterToIBMCloudManagedMachinePools(context.Background(), unlabelledInfra)).To(BeEmpty())
+}
+
+// TestIBMCloudManagedMachinePoolPoolNameClaimants checks the map function of the watch that re-triggers the other
+// claimants of a pool's spec.poolName: only the pools of the same Cluster with the same spec.poolName, never the pool
+// itself, also for a pool the cache no longer holds (a delete event).
+func TestIBMCloudManagedMachinePoolPoolNameClaimants(t *testing.T) {
+	g := NewWithT(t)
+	f := newMachinePoolFixture(t)
+	r := f.reconciler()
+	create := func(name, poolName, clusterName string) *infrav1.IBMCloudManagedMachinePool {
+		pool := f.pool.DeepCopy()
+		pool.Name, pool.ResourceVersion, pool.Spec.PoolName = name, "", poolName
+		pool.Labels = map[string]string{clusterv1.ClusterNameLabel: clusterName}
+		g.Expect(f.mgmt.Create(context.Background(), pool)).To(Succeed())
+		return pool
+	}
+	claimant := create("claimant", "workers", mpTestCluster)
+	otherName := create("gpu", "gpu", mpTestCluster)
+	create("foreign", "workers", "prod")
+	request := func(name string) ctrl.Request {
+		return ctrl.Request{NamespacedName: client.ObjectKey{Namespace: mpTestNamespace, Name: name}}
+	}
+
+	g.Expect(r.poolNameClaimants(context.Background(), f.pool)).To(Equal([]ctrl.Request{request("claimant")}))
+	g.Expect(r.poolNameClaimants(context.Background(), claimant)).To(Equal([]ctrl.Request{request("workers")}))
+	g.Expect(r.poolNameClaimants(context.Background(), otherName)).To(BeEmpty(), "no other pool claims gpu")
+
+	// A delete event carries the last state of a pool the cache no longer holds.
+	gone := f.pool.DeepCopy()
+	gone.Name = "gone"
+	g.Expect(r.poolNameClaimants(context.Background(), gone)).To(Equal([]ctrl.Request{request("claimant"), request("workers")}))
+
+	unlabelled := f.pool.DeepCopy()
+	unlabelled.Labels = nil
+	g.Expect(r.poolNameClaimants(context.Background(), unlabelled)).To(BeEmpty(), "a pool of no Cluster has no claimants")
+	g.Expect(r.poolNameClaimants(context.Background(), f.infra)).To(BeEmpty(), "another kind maps to nothing")
+}
+
+// TestIBMCloudManagedMachinePoolWatchPredicates checks which events of an IBMCloudManagedCluster and of another pool
+// reach the pools: the ones that can change what a guard decides or what a worker pool create request sends, and no
+// other, so that the conditions and revalidations of the IBMCloudManagedCluster do not repeat every pool's IBM
+// observation calls.
+func TestIBMCloudManagedMachinePoolWatchPredicates(t *testing.T) {
+	f := newMachinePoolFixture(t)
+
+	t.Run("IBMCloudManagedCluster", func(t *testing.T) {
+		g := NewWithT(t)
+		p := infraClusterPoolInputsChanged()
+		g.Expect(p.Create(event.CreateEvent{Object: f.infra})).To(BeTrue(), "a pool may wait for the IBMCloudManagedCluster to exist")
+		g.Expect(p.Delete(event.DeleteEvent{Object: f.infra})).To(BeFalse())
+		g.Expect(p.Generic(event.GenericEvent{Object: f.infra})).To(BeFalse())
+		g.Expect(p.Update(event.UpdateEvent{ObjectOld: f.pool, ObjectNew: f.pool})).To(BeTrue(),
+			"an object of another kind passes, so that a pool is never left waiting for its terminal recheck")
+
+		// The status the IBMCloudManagedCluster controller publishes from a subnet read: besides the name and subnet ID
+		// that the pools read, every zone carries the informational fields that a revalidation rewrites.
+		published := f.infra.DeepCopy()
+		published.Status.VPC.Name = "dev-vpc"
+		cidrs := []string{"10.240.0.0/24", "10.240.64.0/24"}
+		g.Expect(published.Status.Zones).To(HaveLen(len(cidrs)))
+		for i := range published.Status.Zones {
+			zone := &published.Status.Zones[i]
+			zone.Subnet.Name = zone.Name + "-subnet"
+			zone.IPv4CIDRBlock = cidrs[i]
+			zone.PublicGateway = infrav1.PublicGatewayStateAttached
+			zone.AvailableIPv4Addresses = ptr.To[int32](200)
+		}
+		for _, tc := range []struct {
+			name string
+			// before, when set, prepares the old object; change makes the new one from a copy of the published status.
+			before func(infra *infrav1.IBMCloudManagedCluster)
+			change func(infra *infrav1.IBMCloudManagedCluster)
+			want   bool
+		}{
+			{name: "a zone added to spec.zones", want: true, change: func(infra *infrav1.IBMCloudManagedCluster) {
+				infra.Spec.Zones = append(infra.Spec.Zones, infrav1.ZoneSubnet{Name: "us-south-3", Subnet: infrav1.ResourceIdentifier{ID: "sn-3"}})
+			}},
+			{name: "a zone resolved in status.zones", want: true, change: func(infra *infrav1.IBMCloudManagedCluster) {
+				infra.Status.Zones = append(infra.Status.Zones, infrav1.ResolvedZone{Name: "us-south-3", Subnet: infrav1.ResolvedResource{ID: "sn-3"}})
+			}},
+			{name: "a zone resolved to another subnet ID", want: true, change: func(infra *infrav1.IBMCloudManagedCluster) {
+				infra.Status.Zones[1].Subnet.ID = "sn-2-recreated"
+			}},
+			{name: "the VPC resolved in status.vpc", want: true,
+				before: func(infra *infrav1.IBMCloudManagedCluster) { infra.Status.VPC = infrav1.ResolvedResource{} },
+				change: func(*infrav1.IBMCloudManagedCluster) {}},
+			{name: "the cluster-name label set", want: true, change: func(infra *infrav1.IBMCloudManagedCluster) {
+				infra.Labels[clusterv1.ClusterNameLabel] = "renamed"
+			}},
+			{name: "a condition", want: false, change: func(infra *infrav1.IBMCloudManagedCluster) {
+				infra.Status.Conditions = append(infra.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Ready"})
+			}},
+			{name: "a resync", want: false, change: func(infra *infrav1.IBMCloudManagedCluster) { infra.ResourceVersion = "2" }},
+			{name: "no zone resolved, as a nil and as an empty list", want: false,
+				before: func(infra *infrav1.IBMCloudManagedCluster) { infra.Status.Zones = nil },
+				change: func(infra *infrav1.IBMCloudManagedCluster) { infra.Status.Zones = []infrav1.ResolvedZone{} }},
+			{name: "a revalidation that counts fewer free addresses", want: false, change: func(infra *infrav1.IBMCloudManagedCluster) {
+				infra.Status.Zones[0].AvailableIPv4Addresses = ptr.To[int32](197)
+			}},
+			{name: "a revalidation that finds the public gateway detached", want: false, change: func(infra *infrav1.IBMCloudManagedCluster) {
+				infra.Status.Zones[0].PublicGateway = infrav1.PublicGatewayStateNotAttached
+			}},
+			{name: "a revalidation that finds the subnet renamed", want: false, change: func(infra *infrav1.IBMCloudManagedCluster) {
+				infra.Status.Zones[1].Subnet.Name = "renamed-in-ibm-cloud"
+			}},
+			{name: "a revalidation that warns of a nearly full subnet", want: false, change: func(infra *infrav1.IBMCloudManagedCluster) {
+				infra.ResourceVersion = "3"
+				infra.Status.VPC.Name = "renamed-vpc"
+				infra.Status.Zones[0].AvailableIPv4Addresses = ptr.To[int32](12)
+				infra.Status.Conditions = append(infra.Status.Conditions, metav1.Condition{
+					Type: infrav1.IBMCloudManagedClusterNetworkReadyCondition, Status: metav1.ConditionTrue,
+					Reason: infrav1.IBMCloudManagedClusterNetworkReadyReason, Message: "subnet sn-1 (zone us-south-1) has 12 free IPv4 addresses",
+				})
+			}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				old := published.DeepCopy()
+				updated := old.DeepCopy()
+				if tc.before != nil {
+					tc.before(old)
+				}
+				tc.change(updated)
+				NewWithT(t).Expect(p.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: updated})).To(Equal(tc.want))
+			})
+		}
+	})
+
+	t.Run("IBMCloudManagedMachinePool", func(t *testing.T) {
+		g := NewWithT(t)
+		p := poolNameClaimsChanged()
+		g.Expect(p.Create(event.CreateEvent{Object: f.pool})).To(BeTrue(), "a new claimant makes a conflict")
+		g.Expect(p.Delete(event.DeleteEvent{Object: f.pool})).To(BeTrue(), "a claimant that is gone may end a conflict")
+		g.Expect(p.Generic(event.GenericEvent{Object: f.pool})).To(BeFalse())
+		unlabelled := f.pool.DeepCopy()
+		unlabelled.Labels = nil
+		g.Expect(p.Update(event.UpdateEvent{ObjectOld: unlabelled, ObjectNew: f.pool})).To(BeTrue(),
+			"the label makes the pool a claimant in its Cluster")
+		deleting := f.pool.DeepCopy()
+		deleting.DeletionTimestamp = ptr.To(metav1.NewTime(mpTestNow))
+		g.Expect(p.Update(event.UpdateEvent{ObjectOld: f.pool, ObjectNew: deleting})).To(BeFalse(),
+			"a claimant being deleted still owns the IBM pool's workers")
+		reported := f.pool.DeepCopy()
+		reported.Status.Ready = ptr.To(true)
+		g.Expect(p.Update(event.UpdateEvent{ObjectOld: f.pool, ObjectNew: reported})).To(BeFalse())
+	})
+}
+
+// guardFixWindow is how long the guard tests behind a manager wait for a pool to resume after the edit that fixes its
+// guard: far below the terminal recheck (about 15 minutes) and the pool transition poll (about 30 seconds), so that only
+// a watch can bring the pool back in time.
+const guardFixWindow = 10 * time.Second
+
+// envtestGuardedCluster creates, in namespace, a managed Cluster "dev" with its IBMCloudManagedCluster (zones us-south-1
+// and us-south-2, both resolved) and an IBMCloudManagedControlPlane whose IBM cluster does not exist yet, both labelled
+// with the Cluster's name as the Cluster controller labels them. Without a cluster ID no pool of the Cluster makes an
+// IBM call, so a pool whose guards all pass reports WaitingForControlPlane. It returns the Cluster and the
+// IBMCloudManagedCluster.
+func envtestGuardedCluster(t *testing.T, namespace string) (*clusterv1.Cluster, *infrav1.IBMCloudManagedCluster) {
+	t.Helper()
+	g := NewWithT(t)
+	cluster := createTestCluster(t, namespace, mpTestCluster, managedControlPlaneRef(mpTestCluster))
+	labels := map[string]string{clusterv1.ClusterNameLabel: mpTestCluster}
+	infra := createTestInfra(t, namespace, mpTestCluster, cluster)
+	infra.Labels = labels
+	g.Expect(testEnv.Update(ctx, infra)).To(Succeed())
+	infra.Status.VPC = infrav1.ResolvedResource{ID: testVPCID}
+	infra.Status.Zones = []infrav1.ResolvedZone{
+		{Name: "us-south-1", Subnet: infrav1.ResolvedResource{ID: "sn-1"}},
+		{Name: "us-south-2", Subnet: infrav1.ResolvedResource{ID: "sn-2"}},
+	}
+	g.Expect(testEnv.Status().Update(ctx, infra)).To(Succeed())
+	g.Expect(testEnv.Create(ctx, &controlplanev1.IBMCloudManagedControlPlane{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: mpTestCluster, Labels: labels},
+		Spec:       controlplanev1.IBMCloudManagedControlPlaneSpec{Distribution: controlplanev1.DistributionKubernetes, DistributionVersion: "1.36"},
+	})).To(Succeed())
+	return cluster, infra
+}
+
+// createEnvtestPool creates, in namespace, a MachinePool of the Cluster "dev" with two replicas and the
+// IBMCloudManagedMachinePool it owns, both named name; the pool claims poolName in zones. It returns the pool's key.
+//
+// Parameters:
+//   - t is the test.
+//   - namespace is the Cluster's namespace.
+//   - name names the MachinePool and the pool.
+//   - poolName is the pool's spec.poolName.
+//   - zones are the pool's spec.zones.
+func createEnvtestPool(t *testing.T, namespace, name, poolName string, zones ...string) client.ObjectKey {
+	t.Helper()
+	g := NewWithT(t)
+	labels := map[string]string{clusterv1.ClusterNameLabel: mpTestCluster}
+	machinePool := &clusterv1.MachinePool{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name, Labels: labels},
+		Spec: clusterv1.MachinePoolSpec{ClusterName: mpTestCluster, Replicas: ptr.To[int32](2), Template: clusterv1.MachineTemplateSpec{
+			Spec: clusterv1.MachineSpec{ClusterName: mpTestCluster, InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: infrav1.GroupVersion.Group, Kind: ibmCloudManagedMachinePoolKind, Name: name,
+			}},
+		}},
+	}
+	g.Expect(testEnv.Create(ctx, machinePool)).To(Succeed())
+	poolZones := make([]infrav1.WorkerPoolZone, 0, len(zones))
+	for _, zone := range zones {
+		poolZones = append(poolZones, infrav1.WorkerPoolZone{Name: zone})
+	}
+	pool := &infrav1.IBMCloudManagedMachinePool{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name, Labels: labels, OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: clusterv1.GroupVersion.String(), Kind: "MachinePool", Name: name, UID: machinePool.UID,
+		}}},
+		Spec: infrav1.IBMCloudManagedMachinePoolSpec{PoolName: poolName, Flavor: mpTestFlavor, Zones: poolZones},
+	}
+	g.Expect(testEnv.Create(ctx, pool)).To(Succeed())
+	return client.ObjectKeyFromObject(pool)
+}
+
+// startGuardPoolManager starts the pool controller for namespace behind a manager whose cache, and so whose watches, see
+// only that namespace, with its real watches (SetupWithManager). The pools of these tests make no IBM call and no
+// workload-cluster call, so the resolver and the client builder fail the test when called. The manager stops when the
+// test ends, before the cleanups registered earlier run.
+func startGuardPoolManager(t *testing.T, namespace string) {
+	t.Helper()
+	g := NewWithT(t)
+	mgr := newNamespacedTestManager(t, namespace)
+	clusterCache, err := SetupClusterCache(ctx, mgr, ClusterCacheOptions{})
+	g.Expect(err).NotTo(HaveOccurred())
+	shutdownClusterCacheOnCleanup(t, clusterCache)
+	r := &IBMCloudManagedMachinePoolReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(),
+		Recorder: mgr.GetEventRecorderFor("ibmcloudmanagedmachinepool-controller"), Resolver: failIfCalledResolver{t: t},
+		ClientBuilder: failIfCalledBuilder{t: t}, ClusterCache: clusterCache, Clock: clocktesting.NewFakeClock(time.Now())}
+	g.Expect(r.SetupWithManager(ctx, mgr)).To(Succeed())
+	startTestManager(t, mgr)
+}
+
+// envtestPoolReason returns a function that reads the WorkerPoolReady reason of the pool key from the API server, ""
+// while the pool has none or is gone.
+func envtestPoolReason(t *testing.T, key client.ObjectKey) func() string {
+	t.Helper()
+	return func() string {
+		pool := &infrav1.IBMCloudManagedMachinePool{}
+		if err := testEnv.GetAPIReader().Get(ctx, key, pool); err != nil {
+			return ""
+		}
+		return conditions.GetReason(pool, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCondition)
+	}
+}
+
+// TestIBMCloudManagedMachinePoolGuardFixEnvtest runs the pool controller behind a manager with its real watches: a pool
+// stopped by a guard whose fix is an edit of another object resumes within seconds of that edit, not at the terminal
+// recheck about 15 minutes later. The Cluster is paused when the test ends, after the manager stopped, so that a
+// manager of a later test leaves the objects alone.
+func TestIBMCloudManagedMachinePoolGuardFixEnvtest(t *testing.T) {
+	t.Run("a zone added to the IBMCloudManagedCluster ends UnknownZone", func(t *testing.T) {
+		g := NewWithT(t)
+		namespace := newTestNamespace(t, "pool-zone-fix")
+		cluster, infra := envtestGuardedCluster(t, namespace)
+		pauseAtCleanup(t, cluster, client.ObjectKey{})
+		key := createEnvtestPool(t, namespace, "workers", "workers", "us-south-1", "us-south-3")
+		startGuardPoolManager(t, namespace)
+		reason := envtestPoolReason(t, key)
+		g.Eventually(reason, 30*time.Second, 200*time.Millisecond).Should(Equal(infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyUnknownZoneReason))
+
+		// The fix the message names: the zone with its subnet in the IBMCloudManagedCluster's spec.zones. Its controller
+		// does not run here, so the zone stays unresolved and the pool waits for it.
+		latest := getInfra(t, client.ObjectKeyFromObject(infra))
+		latest.Spec.Zones = append(latest.Spec.Zones, infrav1.ZoneSubnet{Name: "us-south-3", Subnet: infrav1.ResourceIdentifier{ID: "sn-3"}})
+		g.Expect(testEnv.Update(ctx, latest)).To(Succeed())
+		g.Eventually(reason, guardFixWindow, 100*time.Millisecond).Should(Equal(
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForInfrastructureReason), "the spec.zones edit re-triggers the pool")
+
+		// The IBMCloudManagedCluster controller resolves the zone: every guard passes, and the pool waits for the IBM
+		// cluster.
+		latest = getInfra(t, client.ObjectKeyFromObject(infra))
+		latest.Status.Zones = append(latest.Status.Zones, infrav1.ResolvedZone{Name: "us-south-3", Subnet: infrav1.ResolvedResource{ID: "sn-3"}})
+		g.Expect(testEnv.Status().Update(ctx, latest)).To(Succeed())
+		g.Eventually(reason, guardFixWindow, 100*time.Millisecond).Should(Equal(
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForControlPlaneReason), "the status.zones change re-triggers the pool")
+	})
+
+	t.Run("the deletion of the other claimant ends PoolNameConflict", func(t *testing.T) {
+		g := NewWithT(t)
+		namespace := newTestNamespace(t, "pool-name-fix")
+		cluster, _ := envtestGuardedCluster(t, namespace)
+		pauseAtCleanup(t, cluster, client.ObjectKey{})
+		kept := createEnvtestPool(t, namespace, "workers-a", "workers", "us-south-1", "us-south-2")
+		removed := createEnvtestPool(t, namespace, "workers-b", "workers", "us-south-1", "us-south-2")
+		startGuardPoolManager(t, namespace)
+		conflict := infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyPoolNameConflictReason
+		g.Eventually(envtestPoolReason(t, kept), 30*time.Second, 200*time.Millisecond).Should(Equal(conflict))
+		g.Eventually(envtestPoolReason(t, removed), 30*time.Second, 200*time.Millisecond).Should(Equal(conflict))
+
+		// The fix the message names: delete all but one claimant. The deleted one leaves the IBM pool to the other at
+		// once (no IBM call), and its removal re-triggers the remaining claimant.
+		pool := &infrav1.IBMCloudManagedMachinePool{}
+		g.Expect(testEnv.GetAPIReader().Get(ctx, removed, pool)).To(Succeed())
+		g.Expect(testEnv.Delete(ctx, pool)).To(Succeed())
+		g.Eventually(func() bool {
+			return apierrors.IsNotFound(testEnv.GetAPIReader().Get(ctx, removed, &infrav1.IBMCloudManagedMachinePool{}))
+		}, 30*time.Second, 100*time.Millisecond).Should(BeTrue())
+		g.Eventually(envtestPoolReason(t, kept), guardFixWindow, 100*time.Millisecond).Should(Equal(
+			infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForControlPlaneReason), "the claimant's deletion re-triggers the pool")
+	})
 }

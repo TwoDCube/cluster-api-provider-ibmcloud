@@ -370,8 +370,10 @@ func (s *MachinePoolScope) waitForControlPlane(message string) Outcome {
 }
 
 // guardOutcome reports the failing guard and returns its outcome: WaitingForInfrastructure only needs time, every other
-// guard needs a human (an edit of the MachinePool or of the pool re-triggers the reconcile). guards is PoolGuards'
-// answer; it is blocked.
+// guard needs a human. The edit that fixes a guard re-triggers the reconcile through a watch of the pool controller, so
+// the terminal recheck is only a fallback: an edit of the MachinePool or of the pool; for UnknownZone, the zone added
+// to the IBMCloudManagedCluster's spec.zones (its status.zones resolving the zone ends WaitingForInfrastructure the
+// same way); for PoolNameConflict, the deletion of the other claimants. guards is PoolGuards' answer; it is blocked.
 func (s *MachinePoolScope) guardOutcome(guards PoolGuardResult) Outcome {
 	s.report(guards.Reason, guards.Message)
 	if guards.Reason == infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyWaitingForInfrastructureReason {

@@ -37,7 +37,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/controllers/clustercache"
@@ -319,9 +321,13 @@ func (p *machinePoolPatcher) Patch(ctx context.Context) error {
 }
 
 // SetupWithManager registers the controller with mgr and its watches: MachinePool (replicas, drain limits, exclusion
-// annotations), Cluster (pause transitions), IBMCloudManagedControlPlane (cluster ID, master minor) and the
-// ClusterCache's connection events, so a pool waiting for the workload cluster resumes as soon as it connects. It
-// fails when a dependency or the MachinePool CRD is missing, so that cmd/main.go stops at start-up.
+// annotations), Cluster (pause transitions), IBMCloudManagedControlPlane (cluster ID, master minor),
+// IBMCloudManagedCluster (its zones and VPC), the other pools of the Cluster that claim the same spec.poolName, and the
+// ClusterCache's connection events, so a pool waiting for the workload cluster resumes as soon as it connects. A guard
+// whose fix is an edit of another object (UnknownZone and WaitingForInfrastructure: the IBMCloudManagedCluster's
+// zones; PoolNameConflict: the deletion of the other claimants) is re-triggered by that object's watch, so the pool
+// resumes within seconds instead of at the terminal recheck (about 15 minutes). It fails when a dependency or the
+// MachinePool CRD is missing, so that cmd/main.go stops at start-up.
 //
 // Parameters:
 //   - ctx is the setup context; its logger is used by the predicates and the map functions.
@@ -355,6 +361,18 @@ func (r *IBMCloudManagedMachinePoolReconciler) SetupWithManager(ctx context.Cont
 			&controlplanev1.IBMCloudManagedControlPlane{},
 			handler.EnqueueRequestsFromMapFunc(r.controlPlaneToIBMCloudManagedMachinePools),
 		).
+		Watches(
+			&infrav1.IBMCloudManagedCluster{},
+			handler.EnqueueRequestsFromMapFunc(r.infraClusterToIBMCloudManagedMachinePools),
+			builder.WithPredicates(infraClusterPoolInputsChanged()),
+		).
+		// A second watch of this controller's own kind, with another map function: For enqueues the pool whose event
+		// it is, this one the other claimants of its spec.poolName.
+		Watches(
+			&infrav1.IBMCloudManagedMachinePool{},
+			handler.EnqueueRequestsFromMapFunc(r.poolNameClaimants),
+			builder.WithPredicates(poolNameClaimsChanged()),
+		).
 		// Workload-cluster objects are not watched; only the connection events are, as the clustercache package asks
 		// controllers to do instead of requeueing on ErrClusterNotConnected. The drain polls at drainRetryInterval, like
 		// Cluster API's Machine drain.
@@ -379,6 +397,92 @@ func requireMachinePoolCRD(mapper meta.RESTMapper) error {
 	return nil
 }
 
+// infraClusterPoolInputsChanged passes the events of an IBMCloudManagedCluster that can change what the pools of its
+// Cluster decide or send: its creation (a pool may wait for it to exist), a change of the fields that infraPoolInputs
+// keeps (the zone guards UnknownZone and WaitingForInfrastructure of PoolGuards, and the CreateWorkerPool request, read
+// them), and a change of its cluster-name label, through which infraClusterToIBMCloudManagedMachinePools finds the
+// pools and which the Cluster controller may set only after the object exists. Every other update is dropped: a
+// condition, and the periodic revalidation of the network, which rewrites status.zones from a fresh subnet read and so
+// changes a subnet's free address count whenever a worker comes or goes. Passing those would reconcile every pool of
+// the Cluster, and repeat their IBM observation calls, for nothing. A deletion passes nothing either: a pool whose
+// IBMCloudManagedCluster is gone waits and polls (MachinePoolScope.ownersMissing).
+func infraClusterPoolInputsChanged() predicate.Funcs {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldInfra, oldOK := e.ObjectOld.(*infrav1.IBMCloudManagedCluster)
+			newInfra, newOK := e.ObjectNew.(*infrav1.IBMCloudManagedCluster)
+			if !oldOK || !newOK {
+				// Not reachable through the typed watch; letting the event through costs one reconcile per pool, dropping it
+				// could leave a pool blocked until its terminal recheck.
+				return true
+			}
+			return oldInfra.Labels[clusterv1.ClusterNameLabel] != newInfra.Labels[clusterv1.ClusterNameLabel] ||
+				!poolInputsOf(oldInfra).equal(poolInputsOf(newInfra))
+		},
+		DeleteFunc:  func(event.DeleteEvent) bool { return false },
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	}
+}
+
+// infraPoolInputs is the part of an IBMCloudManagedCluster that the pools of its Cluster read: the zone names of
+// spec.zones (UnknownZone), the zone names of status.zones (WaitingForInfrastructure), and the VPC ID and the subnet ID
+// of each resolved zone, which the CreateWorkerPool request sends. The other fields of a resolved zone (its free address
+// count, public gateway, CIDR block and subnet name) are left out on purpose: no pool reads them, and the
+// IBMCloudManagedCluster controller rewrites them on every revalidation. A field that a pool starts to read belongs
+// here, or an edit of it would not re-trigger the pools.
+type infraPoolInputs struct {
+	// declaredZones are the names of spec.zones, in spec order (the UnknownZone message lists them in that order).
+	declaredZones []string
+	// vpcID is status.vpc.id.
+	vpcID string
+	// resolvedZones are the name and subnet ID of each entry of status.zones, in status order.
+	resolvedZones []resolvedZoneKey
+}
+
+// resolvedZoneKey is the name and subnet ID of one entry of status.zones.
+type resolvedZoneKey struct {
+	name     string
+	subnetID string
+}
+
+// poolInputsOf returns the infraPoolInputs of infra, the IBMCloudManagedCluster of one side of an update event.
+func poolInputsOf(infra *infrav1.IBMCloudManagedCluster) infraPoolInputs {
+	inputs := infraPoolInputs{
+		declaredZones: make([]string, 0, len(infra.Spec.Zones)),
+		vpcID:         infra.Status.VPC.ID,
+		resolvedZones: make([]resolvedZoneKey, 0, len(infra.Status.Zones)),
+	}
+	for _, zone := range infra.Spec.Zones {
+		inputs.declaredZones = append(inputs.declaredZones, zone.Name)
+	}
+	for _, zone := range infra.Status.Zones {
+		inputs.resolvedZones = append(inputs.resolvedZones, resolvedZoneKey{name: zone.Name, subnetID: zone.Subnet.ID})
+	}
+	return inputs
+}
+
+// equal reports whether in and other hold the same inputs; a nil and an empty list are equal, as both mean no zone.
+// other is the infraPoolInputs of the other side of the update.
+func (in infraPoolInputs) equal(other infraPoolInputs) bool {
+	return in.vpcID == other.vpcID && slices.Equal(in.declaredZones, other.declaredZones) &&
+		slices.Equal(in.resolvedZones, other.resolvedZones)
+}
+
+// poolNameClaimsChanged passes the events of an IBMCloudManagedMachinePool that change the set of pools of its Cluster
+// that claim its spec.poolName, from which PoolGuards decides PoolNameConflict: its creation, its deletion (the event
+// comes once the object is gone, so the remaining claimants no longer list it; while it is only being deleted it still
+// owns the IBM pool's workers and still counts), and a change of its cluster-name label, which makes it a pool of a
+// Cluster (Cluster API's MachinePool controller may set the label after the object exists). spec.poolName is
+// immutable, so no other update changes the set.
+func poolNameClaimsChanged() predicate.Funcs {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return e.ObjectOld.GetLabels()[clusterv1.ClusterNameLabel] != e.ObjectNew.GetLabels()[clusterv1.ClusterNameLabel]
+		},
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	}
+}
+
 // clusterToIBMCloudManagedMachinePools maps a Cluster to the IBMCloudManagedMachinePools of that Cluster. It serves the
 // Cluster watch and the ClusterCache's connection events.
 //
@@ -396,6 +500,49 @@ func (r *IBMCloudManagedMachinePoolReconciler) clusterToIBMCloudManagedMachinePo
 //   - ctx is the watch context.
 //   - o is the control plane.
 func (r *IBMCloudManagedMachinePoolReconciler) controlPlaneToIBMCloudManagedMachinePools(ctx context.Context, o client.Object) []ctrl.Request {
+	return r.machinePoolsOfLabelledCluster(ctx, o)
+}
+
+// infraClusterToIBMCloudManagedMachinePools maps an IBMCloudManagedCluster to the IBMCloudManagedMachinePools with the
+// same cluster-name label, which the Cluster controller sets on its infrastructure object: its spec.zones and
+// status.zones decide the zone guards of every pool of the Cluster.
+//
+// Parameters:
+//   - ctx is the watch context.
+//   - o is the IBMCloudManagedCluster.
+func (r *IBMCloudManagedMachinePoolReconciler) infraClusterToIBMCloudManagedMachinePools(ctx context.Context, o client.Object) []ctrl.Request {
+	return r.machinePoolsOfLabelledCluster(ctx, o)
+}
+
+// poolNameClaimants maps an IBMCloudManagedMachinePool to the other IBMCloudManagedMachinePools of its Cluster (by the
+// cluster-name label) that set the same spec.poolName: the claimants whose PoolNameConflict guard its creation,
+// deletion or relabelling decides. The pool itself is left out; its own events reach it through For. A pool without
+// the label belongs to no Cluster yet and maps to nothing.
+//
+// Parameters:
+//   - ctx is the watch context.
+//   - o is the IBMCloudManagedMachinePool.
+func (r *IBMCloudManagedMachinePoolReconciler) poolNameClaimants(ctx context.Context, o client.Object) []ctrl.Request {
+	pool, ok := o.(*infrav1.IBMCloudManagedMachinePool)
+	if !ok {
+		return nil
+	}
+	clusterName := pool.Labels[clusterv1.ClusterNameLabel]
+	if clusterName == "" {
+		return nil
+	}
+	return r.poolsOfCluster(ctx, pool.Namespace, clusterName, func(other *infrav1.IBMCloudManagedMachinePool) bool {
+		return other.Name != pool.Name && other.Spec.PoolName == pool.Spec.PoolName
+	})
+}
+
+// machinePoolsOfLabelledCluster returns a request for every IBMCloudManagedMachinePool of the Cluster that o's
+// cluster-name label names, in name order; none when o has no such label.
+//
+// Parameters:
+//   - ctx is the watch context.
+//   - o is an object of the Cluster in its namespace, such as its control plane or its IBMCloudManagedCluster.
+func (r *IBMCloudManagedMachinePoolReconciler) machinePoolsOfLabelledCluster(ctx context.Context, o client.Object) []ctrl.Request {
 	clusterName := o.GetLabels()[clusterv1.ClusterNameLabel]
 	if clusterName == "" {
 		return nil
@@ -411,6 +558,19 @@ func (r *IBMCloudManagedMachinePoolReconciler) controlPlaneToIBMCloudManagedMach
 //   - namespace is the Cluster's namespace.
 //   - clusterName is the Cluster's name.
 func (r *IBMCloudManagedMachinePoolReconciler) machinePoolsOfCluster(ctx context.Context, namespace, clusterName string) []ctrl.Request {
+	return r.poolsOfCluster(ctx, namespace, clusterName, func(*infrav1.IBMCloudManagedMachinePool) bool { return true })
+}
+
+// poolsOfCluster returns a request for every IBMCloudManagedMachinePool labelled with the Cluster's name that keep
+// accepts, in name order. A failed listing is logged and maps to nothing, as a map function cannot return an error.
+//
+// Parameters:
+//   - ctx is the watch context.
+//   - namespace is the Cluster's namespace.
+//   - clusterName is the Cluster's name.
+//   - keep selects the pools to enqueue.
+func (r *IBMCloudManagedMachinePoolReconciler) poolsOfCluster(ctx context.Context, namespace, clusterName string,
+	keep func(*infrav1.IBMCloudManagedMachinePool) bool) []ctrl.Request {
 	pools := &infrav1.IBMCloudManagedMachinePoolList{}
 	if err := r.Client.List(ctx, pools, client.InNamespace(namespace), client.MatchingLabels{clusterv1.ClusterNameLabel: clusterName}); err != nil {
 		ctrl.LoggerFrom(ctx).Error(err, "Listing the IBMCloudManagedMachinePools of a Cluster failed", "Cluster", klog.KRef(namespace, clusterName))
@@ -418,7 +578,9 @@ func (r *IBMCloudManagedMachinePoolReconciler) machinePoolsOfCluster(ctx context
 	}
 	requests := make([]ctrl.Request, 0, len(pools.Items))
 	for i := range pools.Items {
-		requests = append(requests, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(&pools.Items[i])})
+		if keep(&pools.Items[i]) {
+			requests = append(requests, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(&pools.Items[i])})
+		}
 	}
 	slices.SortFunc(requests, func(a, b ctrl.Request) int { return strings.Compare(a.Name, b.Name) })
 	return requests
