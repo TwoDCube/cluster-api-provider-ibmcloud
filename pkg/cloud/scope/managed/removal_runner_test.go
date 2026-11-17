@@ -422,6 +422,26 @@ func TestRemovalRunnerRecord(t *testing.T) {
 		g.Expect(f.pool.Status.Disruption.DrainStartTime.Time).To(Equal(poolTestNow.Add(-time.Hour)))
 		g.Expect(f.events()).To(Equal([]string{"Normal DrainCompleted the 2 Nodes of pool workers are drained"}))
 	})
+	t.Run("the first WaitingForVolumeDetach starts the detach wait, and a return to Draining keeps it", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newRunnerFixture(t)
+		r := f.runner(nil)
+		r.record(draining)
+		g.Expect(f.pool.Status.Disruption.VolumeDetachStartTime.IsZero()).To(BeTrue(), "the drain is no detach wait")
+		f.clock.Step(7 * time.Minute)
+		r.record(detach)
+		g.Expect(f.pool.Status.Disruption.VolumeDetachStartTime.Time).To(Equal(poolTestNow.Add(7*time.Minute)),
+			"the detach wait begins when the drain ends, not when it started")
+		g.Expect(f.pool.Status.Disruption.DrainStartTime.Time).To(Equal(poolTestNow))
+
+		// A pod came back: Draining again, then the volume detach wait again. Cluster API keeps its
+		// waitForNodeVolumeDetachStartTime once set, and so does the removal.
+		f.clock.Step(time.Minute)
+		r.record(draining)
+		f.clock.Step(time.Minute)
+		r.record(detach)
+		g.Expect(f.pool.Status.Disruption.VolumeDetachStartTime.Time).To(Equal(poolTestNow.Add(7 * time.Minute)))
+	})
 	t.Run("a resumed drain is not announced again", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newRunnerFixture(t)
@@ -465,21 +485,48 @@ func TestRemovalRunnerRecord(t *testing.T) {
 	})
 }
 
+// detachWaitBegan is status.disruption.volumeDetachStartTime for a removal fixture recorded in phase: five minutes ago
+// for a phase after Draining, which a removal reaches only through the step into WaitingForVolumeDetach that records
+// it, and unset for Draining and no phase, whose volume detach wait has not begun.
+//
+// Parameters:
+//   - phase is the fixture's status.disruption.phase.
+func detachWaitBegan(phase infrav1.WorkerDisruptionPhase) metav1.Time {
+	if phase == "" || phase == infrav1.WorkerDisruptionPhaseDraining {
+		return metav1.Time{}
+	}
+	return metav1.NewTime(poolTestNow.Add(-5 * time.Minute))
+}
+
 func TestRemovalRunnerDisconnectedProgress(t *testing.T) {
+	// limits sets nodeDrainTimeoutSeconds 600 and nodeVolumeDetachTimeoutSeconds 300.
+	limits := func(f *runnerFixture) {
+		f.machinePool.Spec.Template.Spec.Deletion.NodeDrainTimeoutSeconds = ptr.To[int32](600)
+		f.machinePool.Spec.Template.Spec.Deletion.NodeVolumeDetachTimeoutSeconds = ptr.To[int32](300)
+	}
 	for _, tc := range []struct {
-		name   string
-		start  time.Time
-		modify func(f *runnerFixture)
-		want   DrainProgress
+		name        string
+		drainStart  time.Time
+		detachStart time.Time
+		modify      func(f *runnerFixture)
+		want        DrainProgress
 	}{
-		{name: "without a recorded start no limit runs out", modify: func(f *runnerFixture) {
-			f.machinePool.Spec.Template.Spec.Deletion.NodeDrainTimeoutSeconds = ptr.To[int32](60)
-		}},
-		{name: "without limits nothing runs out", start: poolTestNow.Add(-time.Hour)},
-		{name: "both limits count from the drain start", start: poolTestNow.Add(-2 * time.Minute), modify: func(f *runnerFixture) {
-			f.machinePool.Spec.Template.Spec.Deletion.NodeDrainTimeoutSeconds = ptr.To[int32](60)
-			f.machinePool.Spec.Template.Spec.Deletion.NodeVolumeDetachTimeoutSeconds = ptr.To[int32](180)
-		}, want: DrainProgress{TimedOut: true}},
+		{name: "without a recorded start no limit runs out", modify: limits},
+		{name: "without limits nothing runs out", drainStart: poolTestNow.Add(-time.Hour), detachStart: poolTestNow.Add(-time.Hour)},
+		{
+			// The drain's own time never counts against the detach wait: the detach limit runs only once the step into
+			// WaitingForVolumeDetach recorded its start.
+			name: "a drain that ran out of time does not use up the detach wait", drainStart: poolTestNow.Add(-10 * time.Minute),
+			modify: limits, want: DrainProgress{TimedOut: true},
+		},
+		{
+			name: "the detach limit counts from the detach start", drainStart: poolTestNow.Add(-time.Hour),
+			detachStart: poolTestNow.Add(-299 * time.Second), modify: limits, want: DrainProgress{TimedOut: true},
+		},
+		{
+			name: "the detach limit runs out at the detach start plus the limit", drainStart: poolTestNow.Add(-time.Hour),
+			detachStart: poolTestNow.Add(-300 * time.Second), modify: limits, want: DrainProgress{TimedOut: true, DetachTimedOut: true},
+		},
 		{name: "the exclusions hold", modify: func(f *runnerFixture) {
 			f.pool.Annotations = map[string]string{clusterv1.ExcludeNodeDrainingAnnotation: "",
 				clusterv1.ExcludeWaitForNodeVolumeDetachAnnotation: ""}
@@ -488,7 +535,8 @@ func TestRemovalRunnerDisconnectedProgress(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 			f := newRunnerFixture(t)
-			f.pool.Status.Disruption.DrainStartTime = metav1.NewTime(tc.start)
+			f.pool.Status.Disruption.DrainStartTime = metav1.NewTime(tc.drainStart)
+			f.pool.Status.Disruption.VolumeDetachStartTime = metav1.NewTime(tc.detachStart)
 			if tc.modify != nil {
 				tc.modify(f)
 			}

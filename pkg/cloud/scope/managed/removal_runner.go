@@ -270,7 +270,7 @@ func newRemovalRunner(in removalRunnerInput) (*removalRunner, error) {
 		return r, nil
 	}
 	drainStep, err := NewDrainStep(DrainStepInput{WorkloadClient: in.workload, Clock: r.s.params.Clock, Recorder: r.s.params.Recorder,
-		Pool: r.s.Pool, Knobs: r.knobs, RecordedStartTime: r.s.Pool.Status.Disruption.DrainStartTime.Time})
+		Pool: r.s.Pool, Knobs: r.knobs})
 	if err != nil {
 		return nil, err
 	}
@@ -340,17 +340,20 @@ func (r *removalRunner) preCallGate(check func(skipSettleDelay bool) (Disruption
 }
 
 // disconnectedProgress is the drain progress while the workload cluster is not connected. Nothing can be observed, so
-// Done and VolumesDetached stay false, but the exclusions hold and the time limits still run out: they count from
-// status.disruption.drainStartTime, which the first drain step recorded. Cluster API records the drain start in the
-// Machine's status for the same reason: a set time limit still runs out and then allows the call. The detach limit
-// counts from the drain start too, as in DrainStep.Check. Without a recorded start no limit runs out.
+// Done and VolumesDetached stay false, but the exclusions hold and the time limits still run out: the drain limit
+// counts from status.disruption.drainStartTime, which the first drain step recorded, and the detach limit from
+// status.disruption.volumeDetachStartTime, which the step into WaitingForVolumeDetach recorded, as in DrainStep.Check.
+// Cluster API records both starts in the Machine's status for the same reason: a set time limit still runs out and
+// then allows the call. A drain that runs out of time while the workload cluster is away therefore waits the whole
+// detach limit after it, as in Cluster API, instead of having both limits end together. Without a recorded start that
+// limit does not run out.
 func (r *removalRunner) disconnectedProgress() DrainProgress {
-	now, start := r.s.params.Clock.Now(), r.s.Pool.Status.Disruption.DrainStartTime.Time
+	now, disruption := r.s.params.Clock.Now(), r.s.Pool.Status.Disruption
 	return DrainProgress{
 		Excluded:       r.knobs.ExcludeDraining,
-		TimedOut:       drain.TimeoutExceeded(now, start, r.knobs.NodeDrainTimeoutSeconds),
+		TimedOut:       drain.TimeoutExceeded(now, disruption.DrainStartTime.Time, r.knobs.NodeDrainTimeoutSeconds),
 		DetachExcluded: r.knobs.ExcludeVolumeDetachWait,
-		DetachTimedOut: drain.TimeoutExceeded(now, start, r.knobs.NodeVolumeDetachTimeoutSeconds),
+		DetachTimedOut: drain.TimeoutExceeded(now, disruption.VolumeDetachStartTime.Time, r.knobs.NodeVolumeDetachTimeoutSeconds),
 	}
 }
 
@@ -566,8 +569,11 @@ func hasDrainOwner(node *corev1.Node, pool *infrav1.IBMCloudManagedMachinePool) 
 }
 
 // record writes status.disruption for phase: the runner's operation and victims, and the drain start, kept, or taken
-// from this reconcile's drain (whose start comes from the Node markers of a drain that started before) or now.
-// ibmRequestTime is kept. The drain events of the phase change are emitted here.
+// from this reconcile's drain (whose start comes from the Node markers of a drain that started before) or now. The
+// first WaitingForVolumeDetach of the removal sets the volume detach start to now, the moment the detach wait begins;
+// it is kept afterwards, also through a return to Draining, as Cluster API keeps a Machine's
+// status.deletion.waitForNodeVolumeDetachStartTime. ibmRequestTime is kept. The drain events of the phase change are
+// emitted here.
 //
 // Parameters:
 //   - phase is the phase the step records.
@@ -587,6 +593,9 @@ func (r *removalRunner) record(phase infrav1.WorkerDisruptionPhase) {
 			start = r.drainResult.StartTime
 		}
 		disruption.DrainStartTime = metav1.NewTime(start)
+	}
+	if phase == infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach && disruption.VolumeDetachStartTime.IsZero() {
+		disruption.VolumeDetachStartTime = metav1.NewTime(r.s.params.Clock.Now())
 	}
 	r.drainEvents(from, phase)
 }

@@ -665,7 +665,8 @@ func TestMachinePoolScopeDeletePreCallClusterState(t *testing.T) {
 		f.others = append(f.others, heldLease(DisruptionTokenHolder(f.pool)))
 		f.pool.Status.Disruption = infrav1.WorkerDisruptionStatus{Operation: infrav1.WorkerDisruptionOperationDeletePool,
 			Phase: infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach, WorkerIDs: []string{"w0", "w1", "w2", "w3"},
-			DrainStartTime: metav1.NewTime(poolTestNow.Add(-10 * time.Minute))}
+			DrainStartTime:        metav1.NewTime(poolTestNow.Add(-10 * time.Minute)),
+			VolumeDetachStartTime: detachWaitBegan(infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach)}
 		drainedAll(t, f)
 		f.expectIBMIn("unsupported", ourPool(""))
 		f.ibm.EXPECT().RemoveWorkerPool(gomock.Any(), poolTestClusterID, poolTestPoolID).Return(nil)
@@ -784,7 +785,8 @@ func TestMachinePoolScopeDeleteStuckWorker(t *testing.T) {
 			f.others = append(f.others, heldLease(DisruptionTokenHolder(f.pool)))
 			f.pool.Status.Disruption = infrav1.WorkerDisruptionStatus{Operation: infrav1.WorkerDisruptionOperationDeletePool,
 				Phase: infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach, WorkerIDs: []string{"w0", "w1", "w2", "w3"},
-				DrainStartTime: metav1.NewTime(poolTestNow.Add(-10 * time.Minute))}
+				DrainStartTime:        metav1.NewTime(poolTestNow.Add(-10 * time.Minute)),
+				VolumeDetachStartTime: detachWaitBegan(infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach)}
 			drainedAll(t, f)
 			f.workers = append(f.workers, otherPoolWorker("provisioning"))
 			f.transitionalSince = tc.since
@@ -829,7 +831,7 @@ func TestMachinePoolScopeDeleteInFlight(t *testing.T) {
 	inPhase := func(f *deleteFixture, op infrav1.WorkerDisruptionOperation, phase infrav1.WorkerDisruptionPhase, workerIDs ...string) {
 		f.others = append(f.others, heldLease(DisruptionTokenHolder(f.pool)))
 		f.pool.Status.Disruption = infrav1.WorkerDisruptionStatus{Operation: op, Phase: phase, WorkerIDs: workerIDs,
-			DrainStartTime: metav1.NewTime(poolTestNow.Add(-10 * time.Minute))}
+			DrainStartTime: metav1.NewTime(poolTestNow.Add(-10 * time.Minute)), VolumeDetachStartTime: detachWaitBegan(phase)}
 	}
 	t.Run("E1437_holds_with_the_Nodes_cordoned", func(t *testing.T) {
 		g := NewWithT(t)
@@ -966,7 +968,7 @@ func TestMachinePoolScopeDeleteInFlight(t *testing.T) {
 			Operation: infrav1.WorkerDisruptionOperationDeletePool, Phase: infrav1.WorkerDisruptionPhaseDraining,
 			WorkerIDs:      []string{"w0", "w1", "w2", "w3"},
 			DrainStartTime: metav1.NewTime(poolTestNow.Add(-10 * time.Minute)), IBMRequestTime: metav1.NewTime(poolTestNow.Add(-5 * time.Minute)),
-		}), "every cordon, the drain start and the earlier call are kept")
+		}), "every cordon, the drain start and the earlier call are kept; the detach wait of the whole pool begins anew")
 		g.Expect(f.cordoned()).To(HaveLen(4))
 	})
 	t.Run("a drain the Node markers show resumes after a lost status", func(t *testing.T) {
@@ -1054,13 +1056,17 @@ func TestMachinePoolScopeDeleteWithoutTheWorkloadCluster(t *testing.T) {
 	detachLimits := []struct {
 		name   string
 		modify func(f *deleteFixture)
+		// detachWait is how long the removal waits for the volumes after the drain ran out: nothing when that wait is
+		// excluded, else the whole detach limit, counted from the step into WaitingForVolumeDetach as in Cluster API,
+		// never from the drain start two hours ago.
+		detachWait time.Duration
 	}{
 		{name: "excluded", modify: func(f *deleteFixture) {
 			f.pool.Annotations = map[string]string{clusterv1.ExcludeWaitForNodeVolumeDetachAnnotation: ""}
 		}},
 		{name: "timed out", modify: func(f *deleteFixture) {
 			f.machinePool.Spec.Template.Spec.Deletion.NodeVolumeDetachTimeoutSeconds = ptr.To[int32](60)
-		}},
+		}, detachWait: 60 * time.Second},
 	}
 	for _, tc := range detachLimits {
 		t.Run("the drain time limit runs out and allows the call, detach wait "+tc.name, func(t *testing.T) {
@@ -1075,8 +1081,16 @@ func TestMachinePoolScopeDeleteWithoutTheWorkloadCluster(t *testing.T) {
 			g.Expect(f.events()).To(ConsistOf(HavePrefix("Warning DrainTimeoutExceeded the drain time limit of 60s "+
 				"(MachinePool spec.template.spec.deletion.nodeDrainTimeoutSeconds) has passed since 2026-11-16T10:00:00Z while "+
 				"the workload cluster is not connected")), "no DrainCompleted: no Node was seen drained")
+			g.Expect(f.pool.Status.Disruption.VolumeDetachStartTime.Time).To(Equal(poolTestNow))
 
 			f.clock.Step(20 * time.Second)
+			if tc.detachWait > 20*time.Second {
+				f.expectIBM(ourPool(""))
+				outcome, _ = f.scope().ReconcileDelete(context.Background())
+				g.Expect(outcome).To(Equal(NotDone(IntervalGuarded, string(ReasonWaitingForWorkloadCluster))),
+					"20 s into the detach wait: no RemoveWorkerPool")
+				f.clock.Step(tc.detachWait - 20*time.Second)
+			}
 			f.expectIBM(ourPool(""))
 			f.ibm.EXPECT().RemoveWorkerPool(gomock.Any(), poolTestClusterID, poolTestPoolID).Return(nil)
 			outcome, _ = f.scope().ReconcileDelete(context.Background())
@@ -1164,7 +1178,8 @@ func TestMachinePoolScopeDeleteExcludedDrainDetachLimit(t *testing.T) {
 		return outcome
 	}
 
-	// Nothing is cordoned, so the detach limit counts from status.disruption.drainStartTime. Neither the conditions
+	// Nothing is cordoned, so no Node carries a drain start; the detach limit counts from
+	// status.disruption.volumeDetachStartTime, which the step into WaitingForVolumeDetach records. Neither the conditions
 	// nor the events say "cordon"; they say that the drain is excluded.
 	f.expectIBM(ourPool(""))
 	reconcile()
@@ -1180,20 +1195,27 @@ func TestMachinePoolScopeDeleteExcludedDrainDetachLimit(t *testing.T) {
 	f.expectIBM(ourPool(""))
 	reconcile()
 	g.Expect(f.pool.Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach))
+	g.Expect(f.pool.Status.Disruption.VolumeDetachStartTime.Time).To(Equal(poolTestNow.Add(20 * time.Second)))
 	g.Expect(f.events()).To(Equal([]string{"Normal DrainCompleted the 4 Nodes of pool workers are not drained: " +
 		"machine.cluster.x-k8s.io/exclude-node-draining is set, so CAPIBM evicts no more pods"}))
 
+	waited := func(when string) {
+		t.Helper()
+		f.expectIBM(ourPool(""))
+		g.Expect(reconcile()).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNodes))), when)
+		draining := condition(f.pool, infrav1.IBMCloudManagedMachinePoolDrainingCondition)
+		g.Expect(draining.Reason).To(Equal(string(ReasonWaitingForVolumeDetach)), when)
+		g.Expect(draining.Message).To(ContainSubstring("pv-data"), when)
+	}
 	f.clock.Step(20 * time.Second)
-	f.expectIBM(ourPool(""))
-	g.Expect(reconcile()).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNodes))), "40 s: the volume is waited for")
-	draining := condition(f.pool, infrav1.IBMCloudManagedMachinePoolDrainingCondition)
-	g.Expect(draining.Reason).To(Equal(string(ReasonWaitingForVolumeDetach)))
-	g.Expect(draining.Message).To(ContainSubstring("pv-data"))
+	waited("20 s into the detach wait: the volume is waited for")
+	f.clock.Step(20 * time.Second)
+	waited("60 s after the drain start but 40 s into the detach wait: the volume is still waited for")
 
 	f.clock.Step(20 * time.Second)
 	f.expectIBM(ourPool(""))
 	f.ibm.EXPECT().RemoveWorkerPool(gomock.Any(), poolTestClusterID, poolTestPoolID).Return(nil)
-	g.Expect(reconcile()).To(Equal(NotDone(IntervalPoolTransition, string(ReasonRemovingWorkerPool))), "60 s: the limit ran out")
+	g.Expect(reconcile()).To(Equal(NotDone(IntervalPoolTransition, string(ReasonRemovingWorkerPool))), "60 s into the detach wait: the limit ran out")
 	g.Expect(f.cordoned()).To(BeEmpty())
 }
 
@@ -1314,4 +1336,20 @@ func TestPoolRemovalHandOverWithNothingCordoned(t *testing.T) {
 	removal.handOver(infrav1.WorkerDisruptionPhaseDraining)
 	g.Expect(f.pool.Status.Disruption).To(Equal(infrav1.WorkerDisruptionStatus{Operation: infrav1.WorkerDisruptionOperationDeletePool,
 		Phase: infrav1.WorkerDisruptionPhaseDraining, WorkerIDs: []string{"w0", "w1"}}))
+}
+
+// TestPoolRemovalHandOverRestartsTheDetachWait checks that a scale-down handed over in its volume detach wait keeps
+// its drain start and IBM call but not its detach start: the Nodes the pool deletion adds are not drained yet, and a
+// detach limit counted from the smaller removal's wait could end before their volumes began to detach.
+func TestPoolRemovalHandOverRestartsTheDetachWait(t *testing.T) {
+	g := NewWithT(t)
+	f := newDeleteFixture(t, nil)
+	drainStart, call := metav1.NewTime(poolTestNow.Add(-10*time.Minute)), metav1.NewTime(poolTestNow.Add(-4*time.Minute))
+	f.pool.Status.Disruption = infrav1.WorkerDisruptionStatus{Operation: infrav1.WorkerDisruptionOperationScaleDown,
+		Phase: infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach, WorkerIDs: []string{"w0"}, DrainStartTime: drainStart,
+		VolumeDetachStartTime: metav1.NewTime(poolTestNow.Add(-5 * time.Minute)), IBMRequestTime: call}
+	removal := &poolRemoval{s: f.scope(), victims: []string{"w0", "w1"}}
+	removal.handOver(infrav1.WorkerDisruptionPhaseDraining)
+	g.Expect(f.pool.Status.Disruption).To(Equal(infrav1.WorkerDisruptionStatus{Operation: infrav1.WorkerDisruptionOperationDeletePool,
+		Phase: infrav1.WorkerDisruptionPhaseDraining, WorkerIDs: []string{"w0", "w1"}, DrainStartTime: drainStart, IBMRequestTime: call}))
 }

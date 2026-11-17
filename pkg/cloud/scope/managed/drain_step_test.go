@@ -161,6 +161,16 @@ func attachedVolume(node string) *storagev1.VolumeAttachment {
 	}
 }
 
+// unnamedVolumeAttachment returns a VolumeAttachment attached to node without spec.source.persistentVolumeName, as
+// CSI migration creates for an inline volume.
+func unnamedVolumeAttachment(node string) *storagev1.VolumeAttachment {
+	return &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{Name: "va-unnamed-" + node},
+		Spec:       storagev1.VolumeAttachmentSpec{Attacher: "vpc.block.csi.ibm.io", NodeName: node},
+		Status:     storagev1.VolumeAttachmentStatus{Attached: true},
+	}
+}
+
 // pdbRefusal is the API server's answer to an eviction a PodDisruptionBudget refuses.
 func pdbRefusal() error {
 	err := apierrors.NewTooManyRequests("Cannot evict pod as it would violate the pod's disruption budget.", 0)
@@ -201,6 +211,12 @@ func (f *drainStepFixture) step(t *testing.T, knobs DrainKnobs) *DrainStep {
 	step, err := NewDrainStep(DrainStepInput{WorkloadClient: f.workload, Clock: f.clock, Recorder: f.recorder, Pool: f.pool, Knobs: knobs})
 	NewWithT(t).Expect(err).NotTo(HaveOccurred())
 	return step
+}
+
+// detachWaitSince records start as the pool's status.disruption.volumeDetachStartTime, as the removal does when it
+// first records WaitingForVolumeDetach; the zero time records that the wait has not begun.
+func (f *drainStepFixture) detachWaitSince(start time.Time) {
+	f.pool.Status.Disruption.VolumeDetachStartTime = metav1.NewTime(start)
 }
 
 // events drains the fake recorder.
@@ -357,6 +373,7 @@ func TestDrainStepCheck(t *testing.T) {
 	t.Run("waits for attached volumes", func(t *testing.T) {
 		g := NewWithT(t)
 		f, nodes := drained(t, victimNode("10.0.0.1", "w0"), attachedVolume("10.0.0.1"))
+		f.detachWaitSince(poolTestNow)
 		result, err := f.step(t, DrainKnobs{}).Check(context.Background(), nodes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(result.Progress).To(Equal(DrainProgress{Done: true}))
@@ -370,11 +387,12 @@ func TestDrainStepCheck(t *testing.T) {
 		f.clock.Step(2 * time.Minute)
 		result, err = f.step(t, DrainKnobs{NodeVolumeDetachTimeoutSeconds: ptr.To[int32](60)}).Check(context.Background(), nodes)
 		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(result.Progress).To(Equal(DrainProgress{Done: true, DetachTimedOut: true}), "the limit counts from the drain start")
+		g.Expect(result.Progress).To(Equal(DrainProgress{Done: true, DetachTimedOut: true}), "the limit counts from the detach start")
 	})
 	t.Run("detached volumes finish the step", func(t *testing.T) {
 		g := NewWithT(t)
 		f, nodes := drained(t, victimNode("10.0.0.1", "w0"))
+		f.detachWaitSince(poolTestNow)
 		result, err := f.step(t, DrainKnobs{}).Check(context.Background(), nodes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(result.Progress).To(Equal(DrainProgress{Done: true, VolumesDetached: true}))
@@ -382,22 +400,30 @@ func TestDrainStepCheck(t *testing.T) {
 	t.Run("an excluded drain still waits for detach", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newDrainStepFixture(t, nil, victimNode("10.0.0.1", "w0"))
+		f.detachWaitSince(poolTestNow)
 		result, err := f.step(t, DrainKnobs{ExcludeDraining: true}).Check(context.Background(), readNodes(t, f.workload))
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(result.Progress).To(Equal(DrainProgress{Excluded: true, VolumesDetached: true}))
 	})
-	t.Run("an excluded drain's detach limit counts from the recorded start", func(t *testing.T) {
+	t.Run("before the detach wait began nothing is checked", func(t *testing.T) {
 		g := NewWithT(t)
-		// Nothing is cordoned, so no Node carries a drain-start-time marker; without the recorded start a detach limit
-		// would never run out.
+		// The reconcile in which the drain finishes: DecideDisruptionStep moves on to WaitingForVolumeDetach without
+		// reading the volumes, and the wait, with its time limit, begins when that phase is recorded.
+		f, nodes := drained(t, victimNode("10.0.0.1", "w0"), attachedVolume("10.0.0.1"))
+		result, err := f.step(t, DrainKnobs{NodeVolumeDetachTimeoutSeconds: ptr.To[int32](60)}).Check(context.Background(), nodes)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(result.Progress).To(Equal(DrainProgress{Done: true}), "not detached, which never lets IBM be called")
+		g.Expect(f.calls.count("list volumeattachments")).To(BeZero())
+	})
+	t.Run("an excluded drain's detach limit counts from the detach start", func(t *testing.T) {
+		g := NewWithT(t)
+		// Nothing is cordoned, so no Node carries a drain-start-time marker: the recorded detach start is all there is.
 		f := newDrainStepFixture(t, nil, victimNode("10.0.0.1", "w0"), attachedVolume("10.0.0.1"))
 		nodes := readNodes(t, f.workload)
 		knobs := DrainKnobs{ExcludeDraining: true, NodeVolumeDetachTimeoutSeconds: ptr.To[int32](60)}
-		check := func(recorded time.Time) DrainStepResult {
-			step, err := NewDrainStep(DrainStepInput{WorkloadClient: f.workload, Clock: f.clock, Recorder: f.recorder, Pool: f.pool,
-				Knobs: knobs, RecordedStartTime: recorded})
-			g.Expect(err).NotTo(HaveOccurred())
-			result, err := step.Check(context.Background(), nodes)
+		check := func(detachStart time.Time) DrainStepResult {
+			f.detachWaitSince(detachStart)
+			result, err := f.step(t, knobs).Check(context.Background(), nodes)
 			g.Expect(err).NotTo(HaveOccurred())
 			return result
 		}
@@ -405,18 +431,85 @@ func TestDrainStepCheck(t *testing.T) {
 		g.Expect(result.Progress).To(Equal(DrainProgress{Excluded: true}), "within the limit the volume is waited for")
 		g.Expect(result.Message).To(ContainSubstring("pv-data"))
 		g.Expect(check(poolTestNow.Add(-60 * time.Second)).Progress).To(Equal(DrainProgress{Excluded: true, DetachTimedOut: true}))
-		g.Expect(check(time.Time{}).Progress).To(Equal(DrainProgress{Excluded: true}), "no recorded start, no limit")
+		g.Expect(check(time.Time{}).Progress).To(Equal(DrainProgress{Excluded: true}), "the wait has not begun, so no limit runs")
 		g.Expect(f.calls.count("cordon")).To(BeZero())
 	})
-	t.Run("a Node marker wins over the recorded start", func(t *testing.T) {
+	t.Run("a drain longer than the detach limit still gets the whole detach wait", func(t *testing.T) {
 		g := NewWithT(t)
+		// nodeDrainTimeoutSeconds 900 and nodeVolumeDetachTimeoutSeconds 300, and a PodDisruptionBudget held the drain for
+		// 400 s: Cluster API waits the full 300 s for the volumes after the drain, and so must the IBM call.
 		f, nodes := drained(t, victimNode("10.0.0.1", "w0"), attachedVolume("10.0.0.1"))
-		step, err := NewDrainStep(DrainStepInput{WorkloadClient: f.workload, Clock: f.clock, Recorder: f.recorder, Pool: f.pool,
-			Knobs: DrainKnobs{NodeVolumeDetachTimeoutSeconds: ptr.To[int32](60)}, RecordedStartTime: poolTestNow.Add(-time.Hour)})
+		knobs := DrainKnobs{NodeDrainTimeoutSeconds: ptr.To[int32](900), NodeVolumeDetachTimeoutSeconds: ptr.To[int32](300)}
+		f.clock.Step(400 * time.Second)
+		result, err := f.step(t, knobs).Check(context.Background(), nodes)
 		g.Expect(err).NotTo(HaveOccurred())
-		result, err := step.Check(context.Background(), nodes)
+		g.Expect(result.Progress).To(Equal(DrainProgress{Done: true}), "the drain's 400 s do not use up the detach wait")
+
+		f.detachWaitSince(f.clock.Now())
+		f.clock.Step(299 * time.Second)
+		result, err = f.step(t, knobs).Check(context.Background(), nodes)
 		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(result.Progress).To(Equal(DrainProgress{Done: true}), "the drain started now, as the Node says")
+		g.Expect(result.Progress).To(Equal(DrainProgress{Done: true}), "still waiting 299 s into the detach wait")
+		g.Expect(result.Message).To(ContainSubstring("pv-data"))
+
+		f.clock.Step(time.Second)
+		result, err = f.step(t, knobs).Check(context.Background(), nodes)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(result.Progress).To(Equal(DrainProgress{Done: true, DetachTimedOut: true}), "300 s after the detach wait began")
+	})
+	t.Run("a drain that ran out of time does not use up the detach wait", func(t *testing.T) {
+		g := NewWithT(t)
+		// A PodDisruptionBudget holds the drain until nodeDrainTimeoutSeconds (600 s) runs out; a detach limit below
+		// that must still give the volumes their own time, as in Cluster API.
+		f := newDrainStepFixture(t, map[string]error{"web-0": pdbRefusal()}, victimNode("10.0.0.1", "w0"),
+			workloadPod("web-0", "10.0.0.1"), attachedVolume("10.0.0.1"))
+		knobs := DrainKnobs{NodeDrainTimeoutSeconds: ptr.To[int32](600), NodeVolumeDetachTimeoutSeconds: ptr.To[int32](300)}
+		_, err := f.step(t, knobs).Evict(context.Background(), readNodes(t, f.workload))
+		g.Expect(err).NotTo(HaveOccurred())
+		nodes := readNodes(t, f.workload)
+
+		f.clock.Step(600 * time.Second)
+		result, err := f.step(t, knobs).Check(context.Background(), nodes)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(result.Progress).To(Equal(DrainProgress{TimedOut: true}), "the detach wait has not begun")
+
+		f.detachWaitSince(f.clock.Now())
+		f.clock.Step(299 * time.Second)
+		result, err = f.step(t, knobs).Check(context.Background(), nodes)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(result.Progress).To(Equal(DrainProgress{TimedOut: true}))
+		g.Expect(result.Message).To(ContainSubstring("pv-data"))
+
+		f.clock.Step(time.Second)
+		result, err = f.step(t, knobs).Check(context.Background(), nodes)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(result.Progress).To(Equal(DrainProgress{TimedOut: true, DetachTimedOut: true}))
+	})
+	t.Run("a VolumeAttachment without a PersistentVolume names the settings that end the wait", func(t *testing.T) {
+		g := NewWithT(t)
+		f, nodes := drained(t, victimNode("10.0.0.1", "w0"), unnamedVolumeAttachment("10.0.0.1"))
+		result, err := f.step(t, DrainKnobs{}).Check(context.Background(), nodes)
+		g.Expect(err).NotTo(HaveOccurred(), "before the wait began the error cannot keep the phase from being recorded")
+		g.Expect(result.Progress).To(Equal(DrainProgress{Done: true}))
+
+		f.detachWaitSince(poolTestNow)
+		_, err = f.step(t, DrainKnobs{}).Check(context.Background(), nodes)
+		g.Expect(err).To(MatchError(drain.ErrVolumeAttachmentWithoutPersistentVolume))
+		g.Expect(err).To(MatchError(ContainSubstring("VolumeAttachment va-unnamed-10.0.0.1 has no spec.source.persistentVolumeName")))
+		// The full key and the two objects DrainKnobsFor reads it from: on the Node or in the MachinePool's own metadata
+		// the annotation does nothing.
+		g.Expect(err).To(MatchError(ContainSubstring("set the annotation " + clusterv1.ExcludeWaitForNodeVolumeDetachAnnotation +
+			" (any value) in the owning MachinePool's spec.template.metadata.annotations or in the metadata.annotations of " +
+			"IBMCloudManagedMachinePool " + f.pool.Namespace + "/" + f.pool.Name + " to skip the volume detach wait")))
+		g.Expect(err).To(MatchError(ContainSubstring("spec.template.spec.deletion.nodeVolumeDetachTimeoutSeconds")))
+
+		f.clock.Step(time.Minute)
+		result, err = f.step(t, DrainKnobs{NodeVolumeDetachTimeoutSeconds: ptr.To[int32](60)}).Check(context.Background(), nodes)
+		g.Expect(err).NotTo(HaveOccurred(), "the time limit the error names ends the wait")
+		g.Expect(result.Progress).To(Equal(DrainProgress{Done: true, DetachTimedOut: true}))
+		result, err = f.step(t, DrainKnobs{ExcludeVolumeDetachWait: true}).Check(context.Background(), nodes)
+		g.Expect(err).NotTo(HaveOccurred(), "and so does the annotation it names")
+		g.Expect(result.Progress).To(Equal(DrainProgress{Done: true, DetachExcluded: true}))
 	})
 	t.Run("a timed-out Node counts as drained without a call", func(t *testing.T) {
 		g := NewWithT(t)

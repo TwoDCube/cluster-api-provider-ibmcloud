@@ -546,8 +546,9 @@ func (r *poolRemoval) ownsADrain() bool {
 // drainProgress observes the drain for the effective phase of o: Draining evicts, the phases after it check without
 // evicting, and earlier or later phases need no drain observation. Nothing is cordoned or evicted before this pool
 // holds the disruption token, so that a Cluster has one disruption at a time; DecideDisruptionStep asks for the token
-// before it reads the drain. The exclusions are known without the workload cluster, and so are the time limits once a
-// drain start is recorded (disconnectedProgress). Each kind of observation runs at most once per reconcile.
+// before it reads the drain. The exclusions are known without the workload cluster, and so are the time limits
+// (disconnectedProgress): the drain limit once a drain start is recorded, the detach limit once the step into
+// WaitingForVolumeDetach recorded its start. Each kind of observation runs at most once per reconcile.
 //
 // Parameters:
 //   - ctx is the reconcile context.
@@ -574,7 +575,11 @@ func (r *poolRemoval) drainProgress(ctx context.Context, o DisruptionObservation
 
 // handOver rewrites status.disruption as the pool deletion of every worker of the pool, keeping drainStartTime and
 // ibmRequestTime, so that the drain time limits and DisruptionSettleDelay still count from the earlier drain and IBM
-// call. phase is the decision's phase: Draining for a removal in flight, "" when nothing was cordoned yet.
+// call. It clears volumeDetachStartTime: the pool deletion adds Nodes that are not drained yet, and their volumes only
+// start to detach once they are, so a detach wait counted from the earlier, smaller removal could end before theirs
+// began. The detach wait of the whole pool begins anew when it reaches WaitingForVolumeDetach, which can only make the
+// wait of the earlier victims longer. phase is the decision's phase: Draining for a removal in flight, "" when nothing
+// was cordoned yet.
 func (r *poolRemoval) handOver(phase infrav1.WorkerDisruptionPhase) {
 	disruption := &r.s.Pool.Status.Disruption
 	if phase == "" {
@@ -584,6 +589,7 @@ func (r *poolRemoval) handOver(phase infrav1.WorkerDisruptionPhase) {
 	disruption.Operation = infrav1.WorkerDisruptionOperationDeletePool
 	disruption.Phase = phase
 	disruption.WorkerIDs = slices.Clone(r.victims)
+	disruption.VolumeDetachStartTime = metav1.Time{}
 }
 
 // apply carries out the decision of this reconcile (the DecideDisruptionStep steps, as the pool deletion uses them).

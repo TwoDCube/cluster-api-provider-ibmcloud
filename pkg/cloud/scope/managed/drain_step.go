@@ -123,15 +123,13 @@ type DrainStepInput struct {
 	// Recorder emits the drain events on Pool. Required.
 	Recorder record.EventRecorder
 	// Pool is the IBMCloudManagedMachinePool that drains; it owns the drain (drain-owner marker) and receives the
-	// events. Its Draining condition, as read, tells whether DrainBlocked is new. Required.
+	// events. Its Draining condition, as read, tells whether DrainBlocked is new. Its
+	// status.disruption.volumeDetachStartTime, as it is when Check runs, is when the volume detach wait began: it is
+	// read then, not copied here, because a pool deletion that takes over a removal clears it within the reconcile.
+	// Required.
 	Pool *infrav1.IBMCloudManagedMachinePool
 	// Knobs are the pool's drain settings (DrainKnobsFor).
 	Knobs DrainKnobs
-	// RecordedStartTime is the drain start the removal recorded (status.disruption.drainStartTime); zero when none is
-	// recorded yet. The volume detach time limit counts from it when no victim Node carries a drain-start-time marker:
-	// the drain is excluded, so nothing was cordoned, or no victim has a Node. Without it a limit the user set would
-	// never run out in those cases. Optional.
-	RecordedStartTime time.Time
 }
 
 // DrainStep cordons and drains one set of victim Nodes and waits for their volumes to detach, one reconcile at a time.
@@ -141,8 +139,6 @@ type DrainStep struct {
 	recorder record.EventRecorder
 	pool     *infrav1.IBMCloudManagedMachinePool
 	knobs    DrainKnobs
-	// recordedStart is DrainStepInput.RecordedStartTime.
-	recordedStart time.Time
 }
 
 // DrainStepResult is what one Evict or Check observed.
@@ -188,10 +184,9 @@ func NewDrainStep(in DrainStepInput) (*DrainStep, error) {
 			EvictionBudget:   EvictionBudgetPerReconcile,
 			AnnotationPrefix: infrav1.NodeAnnotationPrefix,
 		},
-		recorder:      in.Recorder,
-		pool:          in.Pool,
-		knobs:         in.Knobs,
-		recordedStart: in.RecordedStartTime,
+		recorder: in.Recorder,
+		pool:     in.Pool,
+		knobs:    in.Knobs,
 	}, nil
 }
 
@@ -223,13 +218,14 @@ func (d *DrainStep) Evict(ctx context.Context, nodes []corev1.Node) (DrainStepRe
 // Check observes the drain in the phases after Draining, without evicting: a pod that came back on a drained Node
 // sends the removal back to Draining, so the IBM call is never made while evictable pods remain. A Node whose time
 // limit has passed counts as drained without any call. Once every victim is drained, it checks volume detach, unless
-// that wait is excluded or its time limit has passed.
+// that wait is excluded, has not begun yet or has passed its time limit (checkDetach).
 //
 // Parameters:
 //   - ctx is the reconcile context.
 //   - nodes are the victim Nodes as read from the workload cluster.
 //
-// It returns an error when a pod or volume listing fails.
+// It returns an error when a pod or volume listing fails, and when a VolumeAttachment names no PersistentVolume; that
+// error names the volume detach settings that end the wait.
 func (d *DrainStep) Check(ctx context.Context, nodes []corev1.Node) (DrainStepResult, error) {
 	result := DrainStepResult{Progress: DrainProgress{Excluded: d.knobs.ExcludeDraining}}
 	if !d.knobs.ExcludeDraining {
@@ -369,10 +365,18 @@ func drainBlockedEventDue(previousReason string, start, now time.Time) bool {
 	return now.Sub(start) >= DrainBlockedEventInterval && sinceBoundary < DrainRetryInterval
 }
 
-// checkDetach adds the volume detach wait to a finished drain. The detach time limit counts from the drain start, the
-// earliest drain-start-time marker of the victims, or the start the removal recorded when no victim carries one (the
-// drain is excluded, or no victim has a Node). Neither the Node markers nor status.disruption record when the detach
-// wait began, so a limit the user set may end the wait earlier than Cluster API would, never later.
+// checkDetach adds the volume detach wait to a finished drain. The wait begins when the removal first records phase
+// WaitingForVolumeDetach, which sets status.disruption.volumeDetachStartTime (removalRunner.record), and the user's
+// nodeVolumeDetachTimeoutSeconds counts from that time, as Cluster API counts it from a Machine's
+// status.deletion.waitForNodeVolumeDetachStartTime: a drain that took longer than the detach limit, held by a
+// PodDisruptionBudget or by long grace periods, still gets the whole detach wait before IBM removes a worker whose IBM
+// VPC Block volumes may still be attached.
+//
+// Before the wait began, in the reconcile in which the drain finishes, it checks nothing and VolumesDetached stays
+// false, which never lets IBM be called. DecideDisruptionStep moves a finished drain to WaitingForVolumeDetach without
+// reading the volumes, so a check then would only cost API calls; and an error from it (a VolumeAttachment without a
+// PersistentVolume name) would fail that reconcile before the phase is recorded, so the wait would never begin and a
+// detach limit the user set could never end it.
 //
 // Parameters:
 //   - ctx is the reconcile context.
@@ -383,9 +387,9 @@ func (d *DrainStep) checkDetach(ctx context.Context, nodes []corev1.Node, result
 		result.Progress.DetachExcluded = true
 		return result, nil
 	}
-	start := result.StartTime
+	start := d.pool.Status.Disruption.VolumeDetachStartTime.Time
 	if start.IsZero() {
-		start = d.recordedStart
+		return result, nil
 	}
 	if drain.TimeoutExceeded(d.helper.Clock.Now(), start, d.knobs.NodeVolumeDetachTimeoutSeconds) {
 		result.Progress.DetachTimedOut = true
@@ -394,6 +398,16 @@ func (d *DrainStep) checkDetach(ctx context.Context, nodes []corev1.Node, result
 	var lines []string
 	for i := range nodes {
 		detached, message, err := d.helper.VolumesDetached(ctx, &nodes[i])
+		if errors.Is(err, drain.ErrVolumeAttachmentWithoutPersistentVolume) {
+			// The error repeats on every reconcile until the wait ends, so it names the exact settings that end it: the
+			// annotation counts only on these two objects (DrainKnobsFor), not on the Node or the MachinePool's own
+			// metadata.
+			return DrainStepResult{}, fmt.Errorf("%w; detach that volume, or set the annotation %s (any value) in the "+
+				"owning MachinePool's spec.template.metadata.annotations or in the metadata.annotations of "+
+				"IBMCloudManagedMachinePool %s/%s to skip the volume detach wait, or set the MachinePool's "+
+				"spec.template.spec.deletion.nodeVolumeDetachTimeoutSeconds to end that wait after so many seconds",
+				err, clusterv1.ExcludeWaitForNodeVolumeDetachAnnotation, d.pool.Namespace, d.pool.Name)
+		}
 		if err != nil {
 			return DrainStepResult{}, err
 		}
