@@ -57,6 +57,11 @@ spec:
       name: Endpoint
       priority: 1
       type: string
+    - description: Newer minors IBM offers for the master (informational)
+      jsonPath: .status.availableDistributionVersions
+      name: Upgrades
+      priority: 1
+      type: string
     name: v1alpha1
     schema:
       openAPIV3Schema:
@@ -223,6 +228,22 @@ spec:
             description: status is the observed state.
             minProperties: 1
             properties:
+              availableDistributionVersions:
+                description: |-
+                  availableDistributionVersions lists the minors newer than the master's that IBM offers for this distribution,
+                  MAJOR.MINOR in ascending order, for example ["1.37", "1.38"] or ["4.22"]. It is informational only: the master
+                  stays up to date (MasterVersionUpToDate True) while it runs spec.distributionVersion, whatever this list holds,
+                  and nothing is updated until spec.distributionVersion is raised, one step at a time. The list comes from IBM's
+                  list of offered versions, which the controller reads at most once an hour per set of credentials and region, so
+                  a new minor shows up here within about an hour. It is empty (omitted) when IBM offers nothing newer or the
+                  controller has not read IBM's list yet; when IBM cannot be asked, the previous list is kept.
+                items:
+                  maxLength: 8
+                  minLength: 3
+                  type: string
+                maxItems: 16
+                type: array
+                x-kubernetes-list-type: set
               clusterCRN:
                 description: clusterCRN is the IBM cluster CRN; its account segment
                   builds worker providerIDs.

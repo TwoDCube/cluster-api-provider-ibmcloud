@@ -523,6 +523,7 @@ func TestIBMCloudManagedControlPlaneStatusValidation(t *testing.T) {
 				DistributionVersion:             "1.36.5_1537",
 				TargetDistributionVersion:       "1.36.5_1537",
 				DistributionVersionEndOfSupport: "2027-06-30",
+				AvailableDistributionVersions:   []string{"1.37", "1.38"},
 			},
 		},
 		{
@@ -553,6 +554,30 @@ func TestIBMCloudManagedControlPlaneStatusValidation(t *testing.T) {
 				CreateIntent: controlplanev1.CreateIntent{InFlightAttemptTime: now},
 			},
 			wantErr: "status.createIntent.clusterName: Required value",
+		},
+		{
+			// The controller writes each offered minor once (the list is a set).
+			name: "available_distribution_versions_with_a_duplicate_rejected",
+			status: controlplanev1.IBMCloudManagedControlPlaneStatus{
+				AvailableDistributionVersions: []string{"1.37", "1.37"},
+			},
+			wantErr: "status.availableDistributionVersions[1]: Duplicate value",
+		},
+		{
+			name: "available_distribution_versions_beyond_the_bound_rejected",
+			status: controlplanev1.IBMCloudManagedControlPlaneStatus{
+				AvailableDistributionVersions: []string{"1.37", "1.38", "1.39", "1.40", "1.41", "1.42", "1.43", "1.44", "1.45",
+					"1.46", "1.47", "1.48", "1.49", "1.50", "1.51", "1.52", "1.53"},
+			},
+			wantErr: "status.availableDistributionVersions: Too many",
+		},
+		{
+			// MAJOR.MINOR only, as spec.distributionVersion: a fix pack is never listed.
+			name: "available_distribution_version_longer_than_a_minor_rejected",
+			status: controlplanev1.IBMCloudManagedControlPlaneStatus{
+				AvailableDistributionVersions: []string{"1.37.1_1517"},
+			},
+			wantErr: "status.availableDistributionVersions[0]: Too long",
 		},
 	}
 

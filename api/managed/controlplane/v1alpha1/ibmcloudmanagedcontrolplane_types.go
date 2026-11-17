@@ -73,6 +73,13 @@ const (
 	PublicServiceEndpointDisabled PublicServiceEndpointPolicy = "Disabled"
 )
 
+// TODO: the distribution rule below admits only OpenShift 4.x, and the distributionVersion documentation says to raise
+// it by exactly one minor. IBM's OpenShift line forks after 4.22 into 4.23 and 5.0, so the next version is no longer
+// the next minor in IBM's /versions list but a node of an upgrade graph. IBM is developing a per-cluster upgrade-path
+// endpoint for it (GraphQL, currently https://containers.cloud.ibm.com/unsafe/graphql). Once it is stable, admit
+// OpenShift 5.x here and describe the step as "a version IBM offers as the next upgrade" (see the TODO on
+// ibmversion.Minor.Next for the code that assumes the next minor).
+
 // IBMCloudManagedControlPlaneSpec is one IKS or ROKS cluster on VPC Gen2. It has no CAPI spec.version: IBM selects the
 // patch, so the only version a user controls is the IBM product minor in distributionVersion.
 //
@@ -288,6 +295,20 @@ type IBMCloudManagedControlPlaneStatus struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=32
 	DistributionVersionEndOfSupport string `json:"distributionVersionEndOfSupport,omitempty"`
+
+	// availableDistributionVersions lists the minors newer than the master's that IBM offers for this distribution,
+	// MAJOR.MINOR in ascending order, for example ["1.37", "1.38"] or ["4.22"]. It is informational only: the master
+	// stays up to date (MasterVersionUpToDate True) while it runs spec.distributionVersion, whatever this list holds,
+	// and nothing is updated until spec.distributionVersion is raised, one step at a time. The list comes from IBM's
+	// list of offered versions, which the controller reads at most once an hour per set of credentials and region, so
+	// a new minor shows up here within about an hour. It is empty (omitted) when IBM offers nothing newer or the
+	// controller has not read IBM's list yet; when IBM cannot be asked, the previous list is kept.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:items:MinLength=3
+	// +kubebuilder:validation:items:MaxLength=8
+	AvailableDistributionVersions []string `json:"availableDistributionVersions,omitempty"`
 }
 
 // IBMCloudManagedControlPlaneInitializationStatus is the CAPI v1beta2 contract block.
@@ -385,6 +406,7 @@ type MasterStatus struct {
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp",description="Time duration since creation of IBMCloudManagedControlPlane"
 // +kubebuilder:printcolumn:name="ID",type="string",priority=1,JSONPath=".status.clusterID",description="IBM cluster ID"
 // +kubebuilder:printcolumn:name="Endpoint",type="string",priority=1,JSONPath=".spec.controlPlaneEndpoint.host",description="Control plane endpoint host"
+// +kubebuilder:printcolumn:name="Upgrades",type="string",priority=1,JSONPath=".status.availableDistributionVersions",description="Newer minors IBM offers for the master (informational)"
 
 // IBMCloudManagedControlPlane is an IBM Cloud Kubernetes Service or Red Hat OpenShift on IBM Cloud cluster (VPC Gen2).
 type IBMCloudManagedControlPlane struct {
