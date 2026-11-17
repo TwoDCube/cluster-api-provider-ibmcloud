@@ -580,25 +580,38 @@ func TestListVersions(t *testing.T) {
 }
 
 func TestDeleteCluster(t *testing.T) {
-	t.Run("DELETE by ID with deleteResources=false and the resource group", func(t *testing.T) {
-		g := NewWithT(t)
-		fake := newFakeIKS(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
-		service, _ := newTestService(t, fake)
-		g.Expect(service.DeleteCluster(context.Background(), testIKSClusterID, testResourceGroupID)).To(Succeed())
-		request := fake.last(t)
-		g.Expect(request.Method).To(Equal(http.MethodDelete))
-		g.Expect(request.Path).To(Equal("/global/v1/clusters/" + testIKSClusterID))
-		g.Expect(request.RawQuery).To(Equal("deleteResources=false"))
-		g.Expect(request.Header.Get("Authorization")).To(Equal("Bearer " + testToken))
-		g.Expect(request.Header.Get("X-Auth-Resource-Group")).To(Equal(testResourceGroupID))
-		g.Expect(request.Body).To(BeEmpty())
-	})
+	// The persistent storage choice is the only thing that decides deleteResources, and it is always sent: a request
+	// without it would leave IBM's default in charge of the data.
+	storageCases := []struct {
+		name      string
+		storage   PersistentStorage
+		wantQuery string
+	}{
+		{name: "Retain asks IBM to keep the storage", storage: RetainPersistentStorage, wantQuery: "deleteResources=false"},
+		{name: "Delete asks IBM to delete the storage", storage: DeletePersistentStorage, wantQuery: "deleteResources=true"},
+	}
+	for _, tc := range storageCases {
+		t.Run("DELETE by ID with the resource group: "+tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeIKS(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+			service, _ := newTestService(t, fake)
+			g.Expect(service.DeleteCluster(context.Background(), testIKSClusterID, testResourceGroupID, tc.storage)).To(Succeed())
+			request := fake.last(t)
+			g.Expect(request.Method).To(Equal(http.MethodDelete))
+			g.Expect(request.Path).To(Equal("/global/v1/clusters/" + testIKSClusterID))
+			// Only deleteResources: the pinned SDK cannot send deleteOpenShiftRegistryCOSBucket, so the bucket stays.
+			g.Expect(request.RawQuery).To(Equal(tc.wantQuery))
+			g.Expect(request.Header.Get("Authorization")).To(Equal("Bearer " + testToken))
+			g.Expect(request.Header.Get("X-Auth-Resource-Group")).To(Equal(testResourceGroupID))
+			g.Expect(request.Body).To(BeEmpty())
+		})
+	}
 
 	t.Run("no resource group header when none is given", func(t *testing.T) {
 		g := NewWithT(t)
 		fake := newFakeIKS(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 		service, _ := newTestService(t, fake)
-		g.Expect(service.DeleteCluster(context.Background(), testROKSClusterID, "")).To(Succeed())
+		g.Expect(service.DeleteCluster(context.Background(), testROKSClusterID, "", RetainPersistentStorage)).To(Succeed())
 		g.Expect(fake.last(t).Header.Values("X-Auth-Resource-Group")).To(BeEmpty())
 	})
 
@@ -620,7 +633,7 @@ func TestDeleteCluster(t *testing.T) {
 			g := NewWithT(t)
 			fake := newFakeIKS(t, reply(tc.status, tc.body))
 			service, _ := newTestService(t, fake)
-			err := service.DeleteCluster(context.Background(), testIKSClusterID, "")
+			err := service.DeleteCluster(context.Background(), testIKSClusterID, "", RetainPersistentStorage)
 			g.Expect(Classify(OpDeleteCluster, err)).To(Equal(tc.expected))
 			var apiErr *APIError
 			g.Expect(errors.As(err, &apiErr)).To(BeTrue())
@@ -634,12 +647,28 @@ func TestDeleteCluster(t *testing.T) {
 		g := NewWithT(t)
 		fake := newFakeIKS(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 		service, limiter := newTestService(t, fake)
-		err := service.DeleteCluster(context.Background(), "", testResourceGroupID)
+		err := service.DeleteCluster(context.Background(), "", testResourceGroupID, RetainPersistentStorage)
 		g.Expect(err).To(MatchError(ErrInvalidRequest))
 		g.Expect(err.Error()).To(ContainSubstring("DeleteCluster: the cluster ID is empty"))
 		g.Expect(fake.received()).To(BeEmpty())
 		g.Expect(limiter.count()).To(BeZero())
 	})
+
+	// A choice that is neither Retain nor Delete, including the zero value of a forgotten argument and the API's
+	// lower-case typo, is refused before anything is sent: the data's fate is never guessed.
+	for _, storage := range []PersistentStorage{"", "delete", "true", "Keep"} {
+		t.Run(fmt.Sprintf("the persistent storage choice %q is refused before sending", storage), func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeIKS(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+			service, limiter := newTestService(t, fake)
+			err := service.DeleteCluster(context.Background(), testIKSClusterID, testResourceGroupID, storage)
+			g.Expect(err).To(MatchError(ErrInvalidRequest))
+			g.Expect(err.Error()).To(ContainSubstring(fmt.Sprintf(`DeleteCluster: the persistent storage choice %q is neither `+
+				`"Retain" nor "Delete"; pass the IBMCloudManagedControlPlane's spec.deletion.persistentStorage`, storage)))
+			g.Expect(fake.received()).To(BeEmpty())
+			g.Expect(limiter.count()).To(BeZero())
+		})
+	}
 }
 
 // servePath returns a handler that answers status and body on path and 404 on any other path, so that a test also

@@ -202,6 +202,36 @@ type CACertificate struct {
 	RotatedAt string
 }
 
+// PersistentStorage is what DeleteCluster asks IBM to do with the persistent storage of the cluster it deletes. It is
+// IBM's deleteResources query parameter as a named choice, so that a call site says which one it makes: the zero value
+// is neither and DeleteCluster refuses it, because a deletion of data must never be the result of a forgotten argument.
+type PersistentStorage string
+
+const (
+	// RetainPersistentStorage sends deleteResources=false: IBM keeps the storage of the cluster's persistent volumes.
+	RetainPersistentStorage PersistentStorage = "Retain"
+	// DeletePersistentStorage sends deleteResources=true, the API form of "ibmcloud ks cluster rm --delete-storage":
+	// it asks IBM to delete the cluster's persistent storage (on VPC nothing else: IBM removes subnets with a cluster
+	// only on classic infrastructure), and deleted data cannot be recovered. What IBM deletes is uncertain: its page
+	// "Removing Block Storage for VPC" (last updated 2026-05-14) says the storage that a storage class with
+	// reclaimPolicy Delete provisioned goes with the cluster, while its newer page "Removing clusters" (last updated
+	// 2026-08-03) says that VPC Block Storage is not removed automatically, even with such a storage class. Callers must
+	// not report the storage as deleted.
+	DeletePersistentStorage PersistentStorage = "Delete"
+)
+
+// deleteResources returns IBM's deleteResources query value for p, and false when p is neither choice.
+func (p PersistentStorage) deleteResources() (string, bool) {
+	switch p {
+	case RetainPersistentStorage:
+		return "false", true
+	case DeletePersistentStorage:
+		return "true", true
+	default:
+		return "", false
+	}
+}
+
 // CreateWorkerPoolRequest is the input of CreateWorkerPool. CreateWorkerPool validates it before sending anything.
 type CreateWorkerPoolRequest struct {
 	// ClusterID is the IBM cluster ID. Required.

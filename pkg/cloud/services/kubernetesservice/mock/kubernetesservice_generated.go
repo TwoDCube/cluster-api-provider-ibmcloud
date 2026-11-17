@@ -87,17 +87,17 @@ func (mr *MockKubernetesServiceMockRecorder) CreateWorkerPool(ctx, req any) *gom
 }
 
 // DeleteCluster mocks base method.
-func (m *MockKubernetesService) DeleteCluster(ctx context.Context, clusterID, resourceGroupID string) error {
+func (m *MockKubernetesService) DeleteCluster(ctx context.Context, clusterID, resourceGroupID string, persistentStorage kubernetesservice.PersistentStorage) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "DeleteCluster", ctx, clusterID, resourceGroupID)
+	ret := m.ctrl.Call(m, "DeleteCluster", ctx, clusterID, resourceGroupID, persistentStorage)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // DeleteCluster indicates an expected call of DeleteCluster.
-func (mr *MockKubernetesServiceMockRecorder) DeleteCluster(ctx, clusterID, resourceGroupID any) *gomock.Call {
+func (mr *MockKubernetesServiceMockRecorder) DeleteCluster(ctx, clusterID, resourceGroupID, persistentStorage any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteCluster", reflect.TypeOf((*MockKubernetesService)(nil).DeleteCluster), ctx, clusterID, resourceGroupID)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteCluster", reflect.TypeOf((*MockKubernetesService)(nil).DeleteCluster), ctx, clusterID, resourceGroupID, persistentStorage)
 }
 
 // GetAdminKubeconfig mocks base method.

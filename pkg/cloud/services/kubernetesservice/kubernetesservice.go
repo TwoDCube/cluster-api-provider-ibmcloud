@@ -35,11 +35,14 @@ type KubernetesService interface {
 	// caller decides. A 201 may carry non-critical errors (observed on IBM Cloud), returned in the result, never as an
 	// error. SDK VpcCreateClusterWithContext (POST /v2/vpc/createCluster).
 	CreateCluster(ctx context.Context, req CreateClusterRequest) (*CreateClusterResult, error)
-	// DeleteCluster deletes a cluster by ID with deleteResources=false: CAPIBM never deletes the VPC resources or the
-	// persistent storage of a cluster, because it only references the user's VPC. IBM answers 204 and was observed to
-	// report 404 about 5 minutes later. resourceGroupID ("" = none) is sent as X-Auth-Resource-Group. SDK
-	// RemoveClusterWithContext (DELETE /v1/clusters/{idOrName}).
-	DeleteCluster(ctx context.Context, clusterID, resourceGroupID string) error
+	// DeleteCluster deletes a cluster by ID. persistentStorage is the caller's explicit choice for the cluster's
+	// persistent storage, sent as deleteResources (RetainPersistentStorage false, DeletePersistentStorage true); any
+	// other value is refused without a request. On VPC, deleteResources=true asks IBM to delete only the persistent
+	// storage (which of it IBM deletes, see DeletePersistentStorage): IBM removes subnets with a cluster only on classic
+	// infrastructure, so the user's VPC resources stay either way. IBM answers 204 and was observed to report 404 about
+	// 5 minutes later. resourceGroupID ("" = none) is sent as X-Auth-Resource-Group. SDK RemoveClusterWithContext
+	// (DELETE /v1/clusters/{idOrName}).
+	DeleteCluster(ctx context.Context, clusterID, resourceGroupID string, persistentStorage PersistentStorage) error
 	// UpdateMaster requests a master minor update to version ("1.37", "4.22_openshift"; that IBM accepts a minor without
 	// a patch here is not yet verified against IBM Cloud); force is never set, so IBM's own checks stay in force. IBM
 	// answers 409 when the version is already requested (ClassMasterUpdateAlreadyRequested). Classify makes a 403

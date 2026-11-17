@@ -49,7 +49,7 @@ import (
 // The events of the delete flow.
 const (
 	// EventReasonLeftoverResources is the Warning event, once the IBM cluster is gone, that names the VPC resources IKS
-	// leaves behind (LeftoverResourcesMessage).
+	// leaves behind and says what happened to the cluster's storage (LeftoverResourcesMessage).
 	EventReasonLeftoverResources = "LeftoverResources"
 	// EventReasonIBMClusterNotDeleted is the Warning event that names a same-named IBM cluster the deletion leaves alone,
 	// because CAPIBM cannot prove it created it for this Cluster (DecideBinding rows 7 and 10).
@@ -209,8 +209,9 @@ func (s *ControlPlaneScope) deleteUnprovenCluster(ctx context.Context, clients *
 
 // deleteKnownCluster deletes the bound IBM cluster: it waits while IBM deletes it, never sends DELETE again for
 // delete_failed, and otherwise records status.deletionRequestTime before it sends DELETE, at most once per
-// DeleteReissueAfter. IBM's DELETE never deletes the VPC resources or the persistent storage (deleteResources=false):
-// CAPIBM only references the user's VPC, and the storage is kept by default.
+// DeleteReissueAfter. Each DELETE carries spec.deletion.persistentStorage as it is when the DELETE is sent
+// (storageOnDelete): it asks IBM to keep the storage unless the user asked for Delete. On VPC, IBM's DELETE never
+// deletes VPC resources either way, which matters because CAPIBM only references the user's VPC.
 //
 // Parameters:
 //   - ctx is the reconcile context.
@@ -250,7 +251,8 @@ func (s *ControlPlaneScope) deleteKnownCluster(ctx context.Context, clients *con
 		cp.Status.DeletionRequestTime = last
 		return Transient(fmt.Errorf("recording the deletion request time of %s before the DELETE: %w", label, err)), false
 	}
-	if err := clients.kubernetes.DeleteCluster(ctx, c.ID, s.InfraCluster.Spec.ResourceGroup.ID); err != nil {
+	storage := storageOnDelete(cp.Spec.Deletion.PersistentStorage)
+	if err := clients.kubernetes.DeleteCluster(ctx, c.ID, s.InfraCluster.Spec.ResourceGroup.ID, storage); err != nil {
 		return s.deleteCallFailed(ctx, clients, label, err), false
 	}
 	s.setDeleting(requested, fmt.Sprintf("CAPIBM requested the deletion of %s at %s; IBM reports state %s", label,
@@ -367,13 +369,40 @@ func (s *ControlPlaneScope) reportGoneCluster(ctx context.Context, clients *cont
 
 // recordLeftovers emits the LeftoverResources Warning once the IBM cluster is gone. clusterID is the deleted cluster's
 // ID, always status.clusterID: CAPIBM never names leftovers of a cluster it has no record of.
+//
+// What the event says about the cluster's storage depends on whether CAPIBM sent a DELETE. status.deletionRequestTime
+// is recorded before every DELETE and kept when the DELETE fails, whatever IBM answers (400, 401, 403, 404, 409, 429,
+// 5xx) and when the call times out, so it proves only that CAPIBM sent one, not that IBM accepted it: a refused DELETE
+// followed by a deletion in the IBM Cloud console ends the same way as an accepted one. The event therefore names what
+// CAPIBM's last DELETE asked for (spec.deletion.persistentStorage, read here again) and adds that whoever deleted the
+// cluster decided if that DELETE failed; it claims no outcome. Without the time, the cluster was deleted outside
+// CAPIBM. A change of the field after CAPIBM's last DELETE would be reported as if that DELETE had carried it; the
+// field's documentation asks for it to be set before the Cluster is deleted. Both gaps would close only with a status
+// record, written after IBM accepted the DELETE, of the choice that DELETE carried.
 func (s *ControlPlaneScope) recordLeftovers(clusterID string) {
 	vpcID := ""
 	if s.InfraCluster != nil {
 		vpcID = s.InfraCluster.Status.VPC.ID
 	}
+	var sent kubernetesservice.PersistentStorage
+	if !s.ControlPlane.Status.DeletionRequestTime.IsZero() {
+		sent = storageOnDelete(s.ControlPlane.Spec.Deletion.PersistentStorage)
+	}
 	s.params.Recorder.Event(s.ControlPlane, corev1.EventTypeWarning, EventReasonLeftoverResources,
-		LeftoverResourcesMessage(clusterID, vpcID, s.ControlPlane.Spec.Distribution))
+		LeftoverResourcesMessage(clusterID, vpcID, s.ControlPlane.Spec.Distribution, sent))
+}
+
+// storageOnDelete maps spec.deletion.persistentStorage to the persistent storage choice of IBM's DELETE. Only an
+// explicit Delete asks IBM to delete the storage: an omitted value means Retain, and a value the schema would refuse
+// keeps the storage too, because deleted data cannot be recovered and must never be deleted on a guess.
+//
+// Parameters:
+//   - policy is spec.deletion.persistentStorage.
+func storageOnDelete(policy controlplanev1.PersistentStoragePolicy) kubernetesservice.PersistentStorage {
+	if policy == controlplanev1.PersistentStorageDelete {
+		return kubernetesservice.DeletePersistentStorage
+	}
+	return kubernetesservice.RetainPersistentStorage
 }
 
 // LeftoverResourcesMessage is the LeftoverResources event of a deleted IBM cluster. The IBMCloudManagedCluster only
@@ -382,21 +411,21 @@ func (s *ControlPlaneScope) recordLeftovers(clusterID string) {
 // other resources may use them, and possibly the VPE gateway for IAM that IKS adds to every VPC with a cluster since
 // November 2026 (https://cloud.ibm.com/docs/containers?topic=containers-vpc-iam-vpe-gateway, which names neither the
 // gateway nor its deletion, so the message says "possibly" and names no ID); for about 10 minutes the per-cluster
-// load balancers, security groups and VPE gateway, which IKS removes by itself (observed on IBM Cloud); and, because
-// CAPIBM's DELETE keeps them, the VPC Block volumes (deleteResources=false) and, for OpenShift, the registry bucket in
+// load balancers, security groups and VPE gateway, which IKS removes by itself (observed on IBM Cloud). It ends with
+// the cluster's data (leftoverStorageText): what CAPIBM's last DELETE asked IBM to do with the storage of its
+// persistent volumes, never what IBM did, and that CAPIBM never asks IBM to delete the OpenShift registry bucket in
 // the user's Cloud Object Storage instance.
 //
 // Parameters:
 //   - clusterID is the deleted cluster's ID.
 //   - vpcID is status.vpc.id of the IBMCloudManagedCluster; "" when unknown, then the names show <vpc-id>.
 //   - distribution is spec.distribution; the registry bucket exists for OpenShift only.
-func LeftoverResourcesMessage(clusterID, vpcID string, distribution controlplanev1.Distribution) string {
+//   - sent is the persistent storage choice of CAPIBM's last DELETE, which IBM may have refused, or "" when CAPIBM sent
+//     no DELETE for the cluster.
+func LeftoverResourcesMessage(clusterID, vpcID string, distribution controlplanev1.Distribution,
+	sent kubernetesservice.PersistentStorage) string {
 	if vpcID == "" {
 		vpcID = "<vpc-id>"
-	}
-	kept := "the VPC Block volumes of its persistent volumes (deleteResources=false)"
-	if distribution == controlplanev1.DistributionOpenShift {
-		kept += " and the registry bucket in the Cloud Object Storage instance"
 	}
 	return fmt.Sprintf("IBM cluster %[1]s is deleted. CAPIBM deletes nothing in VPC %[2]s, so these resources remain there. "+
 		"Permanently, because IBM never deletes them, even when the last cluster leaves the VPC (delete them only when no "+
@@ -405,8 +434,52 @@ func LeftoverResourcesMessage(clusterID, vpcID string, distribution controlplane
 		"IAM that IKS adds to every VPC with a cluster since November 2026 (IBM documents neither its name nor whether it "+
 		"is ever deleted). Removed by IKS within about 10 minutes, and until then blocking the deletion of the subnets or "+
 		"the VPC: the load balancers kube-%[1]s-*, the security groups kube-%[1]s, kube-lbaas-%[1]s and kube-vpegw-%[1]s "+
-		"and the VPE gateway iks-%[1]s. Kept by design: %[3]s",
-		clusterID, vpcID, kept)
+		"and the VPE gateway iks-%[1]s. %[3]s",
+		clusterID, vpcID, leftoverStorageText(distribution, sent))
+}
+
+// leftoverStorageText is the last part of the LeftoverResources event: what CAPIBM asked IBM to do with the cluster's
+// data. It never says what IBM did, for two reasons:
+//   - CAPIBM cannot tell whether IBM accepted its last DELETE (see recordLeftovers), so every variant that names a
+//     DELETE adds that whoever deleted the cluster decided if that DELETE failed.
+//   - IBM's documentation conflicts on what deleteResources=true removes on VPC. "Removing Block Storage for VPC"
+//     (https://cloud.ibm.com/docs/containers?topic=containers-storage-block-vpc-remove, last updated 2026-05-14) says
+//     that the storage that a storage class with reclaimPolicy Delete provisioned is deleted with the cluster, while
+//     the newer "Removing clusters" (https://cloud.ibm.com/docs/containers?topic=containers-remove, last updated
+//     2026-08-03) says in its removal steps that VPC Block Storage is not removed automatically, even with a Delete
+//     storage class. Both say that statically provisioned storage and storage of a reclaimPolicy Retain class remain.
+//     A user who asked for the deletion must therefore learn that VPC Block volumes may remain, stay billed, and need
+//     checking.
+//
+// Parameters:
+//   - distribution is spec.distribution; the registry bucket exists for OpenShift only.
+//   - sent is the persistent storage choice of CAPIBM's last DELETE, which IBM may have refused, or "" when CAPIBM sent
+//     no DELETE for the cluster.
+func leftoverStorageText(distribution controlplanev1.Distribution, sent kubernetesservice.PersistentStorage) string {
+	decided := "what happened to the storage of its persistent volumes, such as VPC Block volumes"
+	bucket := ""
+	if distribution == controlplanev1.DistributionOpenShift {
+		decided += ", and to the registry bucket in the Cloud Object Storage instance"
+		bucket = ". CAPIBM never asks IBM to delete the registry bucket in the Cloud Object Storage instance"
+	}
+	// status.deletionRequestTime is kept when the DELETE fails, and a cluster deleted elsewhere afterwards disappears
+	// all the same, so a sent DELETE proves nothing about the outcome.
+	failed := ". If that DELETE failed, or the cluster was deleted elsewhere, whoever deleted it decided " + decided
+	switch sent {
+	case kubernetesservice.DeletePersistentStorage:
+		return "CAPIBM's last DELETE asked IBM to delete the cluster's persistent storage (spec.deletion.persistentStorage " +
+			"Delete, deleteResources=true), but VPC Block volumes may remain: IBM's documentation conflicts on whether they " +
+			"go even when a storage class with reclaimPolicy Delete provisioned them, and statically provisioned storage " +
+			"and storage of a storage class with reclaimPolicy Retain remain. Check the account for the VPC Block volumes " +
+			"named after the cluster's PersistentVolumes (pvc-<uid>) and delete those that remain: they are billed" +
+			bucket + failed
+	case kubernetesservice.RetainPersistentStorage:
+		return "CAPIBM's last DELETE asked IBM to keep the cluster's persistent storage (spec.deletion.persistentStorage " +
+			"Retain, also when omitted; deleteResources=false), such as the VPC Block volumes of its persistent volumes, " +
+			"which are billed until you delete them" + bucket + failed
+	default:
+		return "CAPIBM sent no DELETE for this cluster, so whoever deleted it decided " + decided
+	}
 }
 
 // workersBlockingDelete returns, sorted, the worker pools of the Cluster that must be gone before the IBM cluster is

@@ -66,11 +66,18 @@ func (f *cpFixture) expectGetByID(c *kubernetesservice.Cluster) *gomock.Call {
 	return call.Return(c, nil)
 }
 
-// expectDelete expects one DeleteCluster of cpIKSClusterID in the test resource group; before it answers err, it checks
-// that status.deletionRequestTime is already on record (the time is persisted before the DELETE).
+// expectDelete expects one DeleteCluster of cpIKSClusterID in the test resource group that keeps the persistent storage,
+// as every DELETE of a control plane without spec.deletion must (newCPObjects sets none); see expectDeleteWith.
 func (f *cpFixture) expectDelete(err error) *gomock.Call {
-	return f.kube.EXPECT().DeleteCluster(gomock.Any(), cpIKSClusterID, testResourceGroupID).DoAndReturn(
-		func(context.Context, string, string) error {
+	return f.expectDeleteWith(kubernetesservice.RetainPersistentStorage, err)
+}
+
+// expectDeleteWith expects one DeleteCluster of cpIKSClusterID in the test resource group with the persistent storage
+// choice storage; before it answers err, it checks that status.deletionRequestTime is already on record (the time is
+// persisted before the DELETE).
+func (f *cpFixture) expectDeleteWith(storage kubernetesservice.PersistentStorage, err error) *gomock.Call {
+	return f.kube.EXPECT().DeleteCluster(gomock.Any(), cpIKSClusterID, testResourceGroupID, storage).DoAndReturn(
+		func(context.Context, string, string, kubernetesservice.PersistentStorage) error {
 			if cp := f.controlPlane(); cp == nil || cp.Status.DeletionRequestTime.IsZero() {
 				f.t.Errorf("DeleteCluster was called before status.deletionRequestTime was persisted")
 			}
@@ -137,11 +144,140 @@ func TestControlPlaneDeleteKnownCluster(t *testing.T) {
 		g.Expect(events[0]).To(HavePrefix("Warning LeftoverResources IBM cluster iksclusterid00000001 is deleted. CAPIBM deletes nothing in VPC r006-test-vpc"))
 	})
 
+	// spec.deletion.persistentStorage decides what IBM's DELETE asks for, and the LeftoverResources event names what the
+	// DELETE asked for, never the other choice.
+	storageCases := []struct {
+		name        string
+		policy      controlplanev1.PersistentStoragePolicy
+		wantStorage kubernetesservice.PersistentStorage
+		wantEvent   string
+		wantNot     string
+	}{
+		{name: "an omitted persistentStorage asks IBM to keep the storage", wantStorage: kubernetesservice.RetainPersistentStorage,
+			wantEvent: "CAPIBM's last DELETE asked IBM to keep the cluster's persistent storage (spec.deletion.persistentStorage " +
+				"Retain, also when omitted; deleteResources=false)", wantNot: "asked IBM to delete"},
+		{name: "persistentStorage Retain asks IBM to keep the storage", policy: controlplanev1.PersistentStorageRetain,
+			wantStorage: kubernetesservice.RetainPersistentStorage,
+			wantEvent: "CAPIBM's last DELETE asked IBM to keep the cluster's persistent storage (spec.deletion.persistentStorage " +
+				"Retain, also when omitted; deleteResources=false)", wantNot: "asked IBM to delete"},
+		{name: "persistentStorage Delete asks IBM to delete the storage", policy: controlplanev1.PersistentStorageDelete,
+			wantStorage: kubernetesservice.DeletePersistentStorage,
+			wantEvent: "CAPIBM's last DELETE asked IBM to delete the cluster's persistent storage (spec.deletion.persistentStorage " +
+				"Delete, deleteResources=true), but VPC Block volumes may remain", wantNot: "asked IBM to keep"},
+	}
+	for _, tc := range storageCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			objs := newDeletingCPObjects()
+			objs.cp.Spec.Deletion.PersistentStorage = tc.policy
+			f := newCPFixture(t, objs)
+			gomock.InOrder(f.expectGetByID(cpCluster("normal")), f.expectDeleteWith(tc.wantStorage, nil).Times(1))
+
+			_, err := f.reconcile()
+
+			g.Expect(err).NotTo(HaveOccurred())
+			expectDeleting(g, f, controlplanev1.IBMCloudManagedControlPlaneDeletingDeletionRequestedReason)
+			f.clock.SetTime(cpTestStart.Add(6 * time.Minute))
+			f.expectGetByID(nil)
+			_, err = f.reconcile()
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(f.controlPlane()).To(BeNil(), "the finalizer is removed")
+			events := f.events()
+			g.Expect(events).To(HaveLen(1))
+			g.Expect(events[0]).To(HavePrefix("Warning LeftoverResources IBM cluster iksclusterid00000001 is deleted."))
+			g.Expect(events[0]).To(ContainSubstring(tc.wantEvent))
+			g.Expect(events[0]).NotTo(ContainSubstring(tc.wantNot))
+		})
+	}
+
+	// status.deletionRequestTime is recorded before every DELETE and kept when IBM refuses it or the call fails, so it
+	// proves only that CAPIBM sent a DELETE. When IBM refused that DELETE and the cluster then disappears, someone else
+	// deleted it: the event names what CAPIBM's DELETE asked for, says that whoever deleted the cluster decided if that
+	// DELETE failed, and claims no outcome for either choice.
+	refusedCases := []struct {
+		name        string
+		policy      controlplanev1.PersistentStoragePolicy
+		wantStorage kubernetesservice.PersistentStorage
+		answer      error
+		wantErr     bool
+		wantEvent   string
+	}{
+		{name: "Delete refused with 403", policy: controlplanev1.PersistentStorageDelete,
+			wantStorage: kubernetesservice.DeletePersistentStorage,
+			answer:      ibmError(kubernetesservice.OpDeleteCluster, http.StatusForbidden, ""),
+			wantEvent:   "CAPIBM's last DELETE asked IBM to delete the cluster's persistent storage"},
+		{name: "Retain refused with 403", policy: controlplanev1.PersistentStorageRetain,
+			wantStorage: kubernetesservice.RetainPersistentStorage,
+			answer:      ibmError(kubernetesservice.OpDeleteCluster, http.StatusForbidden, ""),
+			wantEvent:   "CAPIBM's last DELETE asked IBM to keep the cluster's persistent storage"},
+		{name: "Delete answered 409 while a deletion elsewhere runs", policy: controlplanev1.PersistentStorageDelete,
+			wantStorage: kubernetesservice.DeletePersistentStorage,
+			answer:      ibmError(kubernetesservice.OpDeleteCluster, http.StatusConflict, ""),
+			wantEvent:   "CAPIBM's last DELETE asked IBM to delete the cluster's persistent storage"},
+		{name: "omitted, the DELETE failing with 500", wantStorage: kubernetesservice.RetainPersistentStorage,
+			answer:    ibmError(kubernetesservice.OpDeleteCluster, http.StatusInternalServerError, ""),
+			wantErr:   true,
+			wantEvent: "CAPIBM's last DELETE asked IBM to keep the cluster's persistent storage"},
+	}
+	for _, tc := range refusedCases {
+		t.Run("a failed DELETE: "+tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			objs := newDeletingCPObjects()
+			objs.cp.Spec.Deletion.PersistentStorage = tc.policy
+			f := newCPFixture(t, objs)
+			gomock.InOrder(f.expectGetByID(cpCluster("normal")), f.expectDeleteWith(tc.wantStorage, tc.answer).Times(1))
+
+			_, err := f.reconcile()
+
+			if tc.wantErr {
+				g.Expect(err).To(HaveOccurred())
+			} else {
+				g.Expect(err).NotTo(HaveOccurred())
+			}
+			g.Expect(f.controlPlane().Status.DeletionRequestTime.IsZero()).To(BeFalse(), "the request time stays after a failed DELETE")
+
+			// The cluster is deleted elsewhere, for example in the IBM Cloud console, before CAPIBM sends the DELETE again.
+			f.clock.SetTime(cpTestStart.Add(6 * time.Minute))
+			f.expectGetByID(nil)
+			_, err = f.reconcile()
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(f.controlPlane()).To(BeNil(), "the finalizer is removed")
+			events := f.events()
+			g.Expect(events).To(HaveLen(1))
+			g.Expect(events[0]).To(HavePrefix("Warning LeftoverResources IBM cluster iksclusterid00000001 is deleted."))
+			g.Expect(events[0]).To(ContainSubstring(tc.wantEvent))
+			g.Expect(events[0]).To(HaveSuffix(". If that DELETE failed, or the cluster was deleted elsewhere, whoever deleted " +
+				"it decided what happened to the storage of its persistent volumes, such as VPC Block volumes"))
+			for _, claim := range []string{"Deleted by IBM", "Kept by design", "deleted by IBM", "kept by design"} {
+				g.Expect(events[0]).NotTo(ContainSubstring(claim), "a failed DELETE proves no outcome")
+			}
+		})
+	}
+
+	t.Run("a reissued DELETE carries persistentStorage as it is when it is sent", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newCPFixture(t, newDeletingCPObjects())
+		gomock.InOrder(f.expectGetByID(cpCluster("normal")), f.expectDeleteWith(kubernetesservice.RetainPersistentStorage, nil))
+		_, err := f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+
+		// The user asks for Delete while IBM still reports the cluster normal; CAPIBM reads the field again when it sends
+		// the DELETE again after DeleteReissueAfter.
+		cp := f.controlPlane()
+		cp.Spec.Deletion.PersistentStorage = controlplanev1.PersistentStorageDelete
+		g.Expect(f.client.Update(context.Background(), cp)).To(Succeed())
+		f.clock.SetTime(cpTestStart.Add(11 * time.Minute))
+		gomock.InOrder(f.expectGetByID(cpCluster("normal")), f.expectDeleteWith(kubernetesservice.DeletePersistentStorage, nil))
+		_, err = f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+		expectDeleting(g, f, controlplanev1.IBMCloudManagedControlPlaneDeletingDeletionRequestedReason)
+	})
+
 	t.Run("reissue only after the delay, and 409 is never terminal", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newCPFixture(t, newDeletingCPObjects())
 		deletes := 0
-		gomock.InOrder(f.expectGetByID(cpCluster("normal")), f.expectDelete(nil).Do(func(context.Context, string, string) { deletes++ }))
+		gomock.InOrder(f.expectGetByID(cpCluster("normal")), f.expectDelete(nil).Do(func(context.Context, string, string, kubernetesservice.PersistentStorage) { deletes++ }))
 		_, err := f.reconcile()
 		g.Expect(err).NotTo(HaveOccurred())
 		expectDeleting(g, f, controlplanev1.IBMCloudManagedControlPlaneDeletingDeletionRequestedReason)
@@ -156,7 +292,7 @@ func TestControlPlaneDeleteKnownCluster(t *testing.T) {
 		// After the delay the DELETE is sent again; IBM answers 409, which is a wait, never terminal.
 		f.clock.SetTime(cpTestStart.Add(11 * time.Minute))
 		gomock.InOrder(f.expectGetByID(cpCluster("normal")),
-			f.expectDelete(ibmError(kubernetesservice.OpDeleteCluster, http.StatusConflict, "")).Do(func(context.Context, string, string) { deletes++ }))
+			f.expectDelete(ibmError(kubernetesservice.OpDeleteCluster, http.StatusConflict, "")).Do(func(context.Context, string, string, kubernetesservice.PersistentStorage) { deletes++ }))
 		result, err := f.reconcile()
 		g.Expect(err).NotTo(HaveOccurred())
 		expectRequeue(g, result, time.Minute)
@@ -452,7 +588,10 @@ func TestControlPlaneDeleteBinding(t *testing.T) {
 
 	t.Run("row 4 by status.clusterID before any DELETE names the leftovers and a same-named cluster", func(t *testing.T) {
 		g := NewWithT(t)
-		f := newCPFixture(t, newDeletingCPObjects())
+		objs := newDeletingCPObjects()
+		// Delete is set, but CAPIBM sent no DELETE, so the event must not claim that CAPIBM asked IBM to delete the storage.
+		objs.cp.Spec.Deletion.PersistentStorage = controlplanev1.PersistentStorageDelete
+		f := newCPFixture(t, objs)
 		other := cpCluster("normal")
 		other.ID = "iksclusterid00000002"
 		gomock.InOrder(f.expectGetByID(nil), f.expectLookupByName(other))
@@ -464,6 +603,9 @@ func TestControlPlaneDeleteBinding(t *testing.T) {
 		events := f.events()
 		g.Expect(events).To(HaveLen(2))
 		g.Expect(events[0]).To(HavePrefix("Warning LeftoverResources IBM cluster iksclusterid00000001 is deleted."))
+		g.Expect(events[0]).To(ContainSubstring("CAPIBM sent no DELETE for this cluster, so whoever deleted it decided what " +
+			"happened to the storage of its persistent volumes"))
+		g.Expect(events[0]).NotTo(ContainSubstring("asked IBM"))
 		g.Expect(events[1]).To(HavePrefix("Warning IBMClusterNotDeleted IBM cluster dev (ID iksclusterid00000002"))
 	})
 
@@ -685,6 +827,8 @@ func TestControlPlaneEnvtestDelete(t *testing.T) {
 	cp := createEnvtestControlPlane(t, namespace, "dev", cluster)
 	key := client.ObjectKeyFromObject(cp)
 	cp.Finalizers = []string{controlplanev1.IBMCloudManagedControlPlaneFinalizer}
+	// Set through the real API server and its webhooks, persistentStorage Delete must reach IBM's DELETE.
+	cp.Spec.Deletion.PersistentStorage = controlplanev1.PersistentStorageDelete
 	g.Expect(testEnv.Update(ctx, cp)).To(Succeed())
 	cp.Status.ClusterID = cpIKSClusterID
 	cp.Status.Conditions = []metav1.Condition{{Type: clusterv1.PausedCondition, Status: metav1.ConditionFalse,
@@ -713,7 +857,7 @@ func TestControlPlaneEnvtestDelete(t *testing.T) {
 	r.Resolver, r.ClientBuilder = resolver, &stubClientBuilder{kubernetes: kube}
 	gomock.InOrder(
 		kube.EXPECT().GetCluster(gomock.Any(), cpIKSClusterID, "").Return(cpCluster("normal"), nil),
-		kube.EXPECT().DeleteCluster(gomock.Any(), cpIKSClusterID, testResourceGroupID).Return(nil),
+		kube.EXPECT().DeleteCluster(gomock.Any(), cpIKSClusterID, testResourceGroupID, kubernetesservice.DeletePersistentStorage).Return(nil),
 	)
 
 	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})

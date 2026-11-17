@@ -166,16 +166,24 @@ func (s *Service) CreateCluster(ctx context.Context, req CreateClusterRequest) (
 	return createClusterResult(result), nil
 }
 
-// DeleteCluster implements KubernetesService.
-func (s *Service) DeleteCluster(ctx context.Context, clusterID, resourceGroupID string) error {
+// DeleteCluster implements KubernetesService. It validates its arguments and sends nothing when one is invalid.
+func (s *Service) DeleteCluster(ctx context.Context, clusterID, resourceGroupID string, persistentStorage PersistentStorage) error {
 	if clusterID == "" {
 		return invalidRequest(OpDeleteCluster, "the cluster ID is empty; pass status.clusterID of the IBMCloudManagedControlPlane (CAPIBM never deletes by name)")
 	}
+	// deleteResources is always sent, never left to IBM's default, so that the request says what happens to the data.
+	deleteResources, ok := persistentStorage.deleteResources()
+	if !ok {
+		return invalidRequest(OpDeleteCluster, fmt.Sprintf("the persistent storage choice %q is neither %q nor %q; pass the "+
+			"IBMCloudManagedControlPlane's spec.deletion.persistentStorage, with Retain for an omitted value",
+			persistentStorage, RetainPersistentStorage, DeletePersistentStorage))
+	}
+	// TODO: IBM's DELETE also takes deleteOpenShiftRegistryCOSBucket, which deletes a ROKS cluster's registry bucket and
+	// its service key, but RemoveClusterOptions of the pinned container-services-go-sdk has no field for it, so CAPIBM
+	// never sends it and the bucket always stays. Offer it as a deletion option once a regenerated SDK carries it.
 	options := &kubernetesserviceapiv1.RemoveClusterOptions{
-		IdOrName: core.StringPtr(clusterID),
-		// "false" keeps the persistent storage and VPC resources IBM would otherwise delete with the cluster: CAPIBM only
-		// references the user's VPC.
-		DeleteResources: core.StringPtr("false"),
+		IdOrName:        core.StringPtr(clusterID),
+		DeleteResources: core.StringPtr(deleteResources),
 	}
 	if resourceGroupID != "" {
 		options.XAuthResourceGroup = core.StringPtr(resourceGroupID)
