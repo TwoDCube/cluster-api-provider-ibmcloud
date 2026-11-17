@@ -124,11 +124,15 @@ intervals:
   default/wait-move: ["30m", "15s"]
   default/wait-ibm-404: ["15m", "30s"]
   default/wait-inventory-clean: ["30m", "60s"]
+  # The Cluster reaches the Provisioned phase only once IBM has created the cluster (IKS about 25 min, ROKS up to
+  # 45 min, more for HA), so the cluster wait must be as long as the control plane wait, not the 10 min default.
+  managed-iks/wait-cluster: ["60m", "30s"]
   managed-iks/wait-control-plane: ["60m", "30s"]
   managed-iks/wait-worker-nodes: ["60m", "30s"]
   managed-iks/wait-pool-change: ["60m", "30s"]
   managed-iks/wait-master-upgrade: ["90m", "30s"]
   managed-iks/wait-worker-rollout: ["90m", "30s"]
   managed-iks/wait-drain-blocked: ["30m", "15s"]
+  managed-roks/wait-cluster: ["120m", "30s"]
   managed-roks/wait-control-plane: ["120m", "30s"]
   managed-roks/wait-worker-nodes: ["90m", "30s"]
