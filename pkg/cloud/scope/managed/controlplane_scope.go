@@ -702,8 +702,8 @@ func logIBMRefusal(ctx context.Context, callErr *controlPlaneCallError) {
 	ctrl.LoggerFrom(ctx).Info("IBM Cloud did not complete a call", "call", callErr.action, "error", callErr.err.Error())
 }
 
-// report writes problem into IBMClusterProvisioned (and Available WaitingForIBMCluster) and returns its outcome. It
-// keeps the condition instead in two cases, because the condition then records more than the problem says:
+// report writes problem into IBMClusterProvisioned (and into Available through setAvailableForFailure) and returns its
+// outcome. It keeps the condition instead in two cases, because the condition then records more than the problem says:
 //   - a True condition, when problem is transient: a blip says nothing about the cluster and must not ripple into the
 //     Cluster's conditions;
 //   - the condition of a definitive create refusal while that refusal holds the next create request (cpCreateHold),
@@ -731,8 +731,63 @@ func (s *ControlPlaneScope) report(ctx context.Context, problem cpProblem) Outco
 		return problem.outcome
 	}
 	s.setProvisioned(metav1.ConditionFalse, problem.reason, problem.message)
-	s.setAvailableWaiting()
+	s.setAvailableForFailure(problem)
 	return problem.outcome
+}
+
+// setAvailableForFailure sets Available after a failure that report writes into IBMClusterProvisioned. Every such
+// failure is a step CAPIBM could not complete (an IBM call failed, CAPIBM could not make it, or IBM reported a master
+// URL that CAPIBM cannot use), never IBM reporting the cluster down; for a bound cluster it means that CAPIBM could
+// not check the cluster in this reconcile. A state that IBM reports (a failed, deleted or missing cluster) is not such
+// a failure: notProvisioned writes it, and Available is False then.
+//   - On a control plane that CAPIBM has initialized against a bound IBM cluster (cpInitializedOnBoundCluster),
+//     Available is Unknown with IBMAPIError, and its message names IBM's answer and what to fix
+//     (cpAvailableUnknownMessage). That control plane was up and may still be: per the Kubernetes condition
+//     conventions a controller that cannot determine a state reports Unknown, and CAPI mirrors Available to the
+//     Cluster's ControlPlaneAvailable, so False would report a running control plane as down whenever, for example,
+//     its API key was deleted or a role revoked.
+//   - On a control plane that is not initialized on this management cluster, Available is False with
+//     WaitingForIBMCluster (setAvailableWaiting), whatever IBM would answer, since Available needs initialization.
+//     That includes a control plane right after clusterctl move, which starts with an empty status, until it is bound
+//     and initialized again, even when its IBM cluster runs.
+//
+// problem is the failure report writes.
+func (s *ControlPlaneScope) setAvailableForFailure(problem cpProblem) {
+	cp := s.ControlPlane
+	if !cpInitializedOnBoundCluster(cp) {
+		s.setAvailableWaiting()
+		return
+	}
+	conditions.Set(cp, metav1.Condition{
+		Type:    controlplanev1.IBMCloudManagedControlPlaneAvailableCondition,
+		Status:  metav1.ConditionUnknown,
+		Reason:  controlplanev1.IBMCloudManagedControlPlaneAvailableIBMAPIErrorReason,
+		Message: cpAvailableUnknownMessage(cp.Status.ClusterID, problem.message),
+	})
+}
+
+// cpInitializedOnBoundCluster reports whether CAPIBM has initialized cp against a bound IBM cluster: status.clusterID
+// is set and status.initialization.controlPlaneInitialized is true. Initialization needs a kubeconfig of that cluster
+// that passed the check against its master and is never set back, so such a control plane was up at some point.
+// After clusterctl move the status is empty until the binding and initialization are back, so a moved control plane
+// counts as not initialized until then, as it does for CAPI's ControlPlaneInitialized. cp is the control plane.
+func cpInitializedOnBoundCluster(cp *controlplanev1.IBMCloudManagedControlPlane) bool {
+	return cp.Status.ClusterID != "" && ptr.Deref(cp.Status.Initialization.ControlPlaneInitialized, false)
+}
+
+// cpAvailableUnknownMessage is the message of Available Unknown IBMAPIError. It says that the state is not known and
+// then gives the IBMClusterProvisioned message of the failure, which says what failed and what to fix: IBM's answer
+// (the HTTP status, and for a refusal before the request was sent the IAM token service and its status) with the API
+// key after a 401 or an IAM refusal and the missing role after a 403, credentials that do not resolve, or a master URL
+// that CAPIBM cannot use. The prefix does not claim that CAPIBM could not read the cluster, because in the last case it
+// did. That message carries IBM's code but never IBM's incident ID, so the condition does not change while the same
+// failure repeats.
+//
+// Parameters:
+//   - clusterID is status.clusterID, the bound IBM cluster.
+//   - problem is the IBMClusterProvisioned message of the failure.
+func cpAvailableUnknownMessage(clusterID, problem string) string {
+	return fmt.Sprintf("CAPIBM cannot tell whether the control plane of IBM cluster %s is available: %s", clusterID, problem)
 }
 
 // waitForInfrastructure reports that the Cluster's infrastructure is not ready yet; the Cluster watch brings the
@@ -771,11 +826,14 @@ func (s *ControlPlaneScope) setProvisioned(status metav1.ConditionStatus, reason
 }
 
 // setAvailableWaiting sets Available False with WaitingForIBMCluster. Every step that sets IBMClusterProvisioned False
-// calls it, so it covers more than the wait its reason names: no IBM cluster is bound yet or IBM is still creating it,
-// but also a bound cluster that CAPIBM cannot read (a 401, a 403, an IBM error it does not retry) or that IBM reports
-// as failed, deleted or not found, even on a control plane that was available. The message therefore does not claim
-// that no cluster exists yet, which would send an operator to wait while the credentials or the cluster need a fix;
-// it sends the reader to IBMClusterProvisioned, whose reason tells these cases apart.
+// calls it, except for a failure of an initialized control plane that report writes (setAvailableForFailure), which
+// is Unknown. So it covers more than the wait its reason names: no IBM cluster is bound yet or IBM is still creating
+// it, but also a cluster that CAPIBM cannot read (a 401, a 403, an IBM error it does not retry) or whose master URL it
+// cannot use while the control plane is not initialized on this management cluster (also right after clusterctl
+// move, until it is bound and initialized again), and a cluster that IBM reports as failed, deleted or not found, even
+// on a control plane that was available, since IBM's answer then says that it is not. The message therefore does not
+// claim that no cluster exists yet, which would send an operator to wait while the credentials or the cluster need a
+// fix; it sends the reader to IBMClusterProvisioned, whose reason tells these cases apart.
 func (s *ControlPlaneScope) setAvailableWaiting() {
 	s.setAvailable(controlplanev1.IBMCloudManagedControlPlaneAvailableWaitingForIBMClusterReason,
 		"The IBM cluster of this control plane is not provisioned or CAPIBM cannot read it; IBMClusterProvisioned says why")

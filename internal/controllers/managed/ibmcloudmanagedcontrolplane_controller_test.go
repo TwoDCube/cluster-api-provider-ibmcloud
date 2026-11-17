@@ -747,68 +747,199 @@ func TestControlPlaneReconcileCredentials(t *testing.T) {
 		expectNoIdentityDetails(g, condition.Message)
 	})
 
-	// Available follows IBMClusterProvisioned: an answer that sets IBMClusterProvisioned False also sets Available False
-	// with WaitingForIBMCluster, also on a bound control plane that was available, for example after its API key was
-	// deleted. The Available message must not claim that no IBM cluster exists yet, which would send an operator to wait
-	// for IBM, and must send the reader to IBMClusterProvisioned, whose reason names the problem. An error CAPIBM retries
-	// leaves both conditions of a provisioned cluster as they are.
-	for _, tc := range []struct {
-		name   string
-		status int
-		// wantReason is the IBMClusterProvisioned reason; "" when both conditions stay True.
+	// What a failed lookup does to Available depends on whether CAPIBM has initialized the control plane. Once it has,
+	// a lookup that fails says nothing about whether the control plane is up, so Available is Unknown with IBMAPIError,
+	// and its message names IBM's answer and what to fix: CAPI mirrors Available to the Cluster's
+	// ControlPlaneAvailable, which must not report a running control plane as down, for example after its API key was
+	// deleted. Before that, the control plane is not available whatever IBM answers: Available is False with
+	// WaitingForIBMCluster, whose message does not claim that no IBM cluster exists yet, which would send an operator
+	// to wait for IBM, and sends the reader to IBMClusterProvisioned, whose reason names the problem. That holds right
+	// after clusterctl move too, whose status starts empty, although the moved IBM cluster runs. An error CAPIBM
+	// retries leaves both conditions of a provisioned cluster as they are.
+	phases := []struct {
+		name  string
+		setup func(objs *cpObjects)
+		// lookup is the binding's GetCluster call, which the case answers.
+		lookup func(f *cpFixture) *gomock.Call
+		// provisioned is true when IBMClusterProvisioned is True before the reconcile.
+		provisioned bool
+		// wantUnknown is true when a failure that reaches the conditions makes Available Unknown, false when it makes
+		// it False with WaitingForIBMCluster.
+		wantUnknown bool
+	}{
+		{
+			name:  "no IBM cluster yet",
+			setup: func(*cpObjects) {},
+			lookup: func(f *cpFixture) *gomock.Call {
+				return f.kube.EXPECT().GetCluster(gomock.Any(), cpTestName, testResourceGroupID)
+			},
+		},
+		{
+			name: "IBM still creates the bound cluster",
+			setup: func(objs *cpObjects) {
+				objs.cp.Status.ClusterID = cpIKSClusterID
+				objs.cp.Status.Conditions = append(objs.cp.Status.Conditions,
+					metav1.Condition{Type: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, Status: metav1.ConditionFalse,
+						Reason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCreatingReason, LastTransitionTime: metav1.NewTime(cpTestStart)},
+					metav1.Condition{Type: controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, Status: metav1.ConditionFalse,
+						Reason: controlplanev1.IBMCloudManagedControlPlaneAvailableWaitingForIBMClusterReason, LastTransitionTime: metav1.NewTime(cpTestStart)})
+			},
+			lookup: func(f *cpFixture) *gomock.Call { return f.kube.EXPECT().GetCluster(gomock.Any(), cpIKSClusterID, "") },
+		},
+		{
+			// clusterctl move keeps the spec and the kubeconfig Secret with its cluster-id annotation, not the status: the
+			// binding looks the moved cluster up by that ID.
+			name: "right after clusterctl move",
+			setup: func(objs *cpObjects) {
+				objs.cp.Spec.ControlPlaneEndpoint = controlplanev1.APIEndpoint{Host: "c111.us-south.containers.cloud.ibm.com", Port: 30101}
+				objs.extra = append(objs.extra, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+					Namespace: cpTestNamespace, Name: cpTestName + "-kubeconfig",
+					Annotations: map[string]string{controlplanev1.KubeconfigClusterIDAnnotation: cpIKSClusterID},
+				}})
+			},
+			lookup: func(f *cpFixture) *gomock.Call { return f.kube.EXPECT().GetCluster(gomock.Any(), cpIKSClusterID, "") },
+		},
+		{
+			name: "initialized and available",
+			setup: func(objs *cpObjects) {
+				objs.cp.Status.ClusterID = cpIKSClusterID
+				objs.cp.Status.Initialization.ControlPlaneInitialized = ptr.To(true)
+				objs.cp.Status.Conditions = append(objs.cp.Status.Conditions,
+					metav1.Condition{Type: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, Status: metav1.ConditionTrue,
+						Reason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedReason, LastTransitionTime: metav1.NewTime(cpTestStart)},
+					metav1.Condition{Type: controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, Status: metav1.ConditionTrue,
+						Reason: controlplanev1.IBMCloudManagedControlPlaneAvailableReason, LastTransitionTime: metav1.NewTime(cpTestStart)})
+			},
+			lookup:      func(f *cpFixture) *gomock.Call { return f.kube.EXPECT().GetCluster(gomock.Any(), cpIKSClusterID, "") },
+			provisioned: true,
+			wantUnknown: true,
+		},
+	}
+	answers := []struct {
+		name string
+		// err is the lookup's answer; nil when the client cannot be built and no lookup is made.
+		err error
+		// retried marks an answer CAPIBM retries without touching a True IBMClusterProvisioned.
+		retried bool
+		// wantReason is the IBMClusterProvisioned reason when the answer reaches the conditions.
 		wantReason  string
 		wantRequeue time.Duration
 		wantErr     string
+		// wantInMessage are parts of the Unknown message: IBM's answer and what to fix.
+		wantInMessage []string
 	}{
-		{name: "a 401 on the lookup makes an available control plane unavailable", status: http.StatusUnauthorized,
-			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason, wantRequeue: 5 * time.Minute},
-		{name: "a 403 on the lookup makes an available control plane unavailable", status: http.StatusForbidden,
-			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason, wantRequeue: 15 * time.Minute},
-		{name: "a 400 on the lookup makes an available control plane unavailable", status: http.StatusBadRequest,
-			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason, wantRequeue: 15 * time.Minute},
-		{name: "a retried 500 on the lookup leaves an available control plane available", status: http.StatusInternalServerError,
-			wantErr: "HTTP 500"},
-		{name: "a retried 429 on the lookup leaves an available control plane available", status: http.StatusTooManyRequests,
-			wantRequeue: 31 * time.Second},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			g := NewWithT(t)
-			objs := newCPObjects()
-			objs.cp.Status.ClusterID = cpIKSClusterID
-			objs.cp.Status.Initialization.ControlPlaneInitialized = ptr.To(true)
-			objs.cp.Status.Conditions = append(objs.cp.Status.Conditions,
-				metav1.Condition{Type: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, Status: metav1.ConditionTrue,
-					Reason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedReason, LastTransitionTime: metav1.NewTime(cpTestStart)},
-				metav1.Condition{Type: controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, Status: metav1.ConditionTrue,
-					Reason: controlplanev1.IBMCloudManagedControlPlaneAvailableReason, LastTransitionTime: metav1.NewTime(cpTestStart)})
-			f := newCPFixture(t, objs)
-			f.kube.EXPECT().GetCluster(gomock.Any(), cpIKSClusterID, "").Return(nil, ibmError(kubernetesservice.OpGetCluster, tc.status, ""))
-
-			result, err := f.reconcile()
-
-			if tc.wantErr != "" {
-				g.Expect(err).To(MatchError(ContainSubstring(tc.wantErr)))
-			} else {
-				g.Expect(err).NotTo(HaveOccurred())
-				expectRequeue(g, result, tc.wantRequeue)
-			}
-			cp := f.controlPlane()
-			g.Expect(cp.Status.ClusterID).To(Equal(cpIKSClusterID), "the binding is kept")
-			g.Expect(cp.Status.Initialization.ControlPlaneInitialized).To(Equal(ptr.To(true)), "initialization is kept")
-			if tc.wantReason == "" {
-				expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, metav1.ConditionTrue,
-					controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedReason)
-				expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionTrue,
-					controlplanev1.IBMCloudManagedControlPlaneAvailableReason)
-				return
-			}
-			expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, metav1.ConditionFalse, tc.wantReason)
-			available := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionFalse,
-				controlplanev1.IBMCloudManagedControlPlaneAvailableWaitingForIBMClusterReason)
-			g.Expect(available.Message).To(Equal("The IBM cluster of this control plane is not provisioned or CAPIBM cannot read it; " +
-				"IBMClusterProvisioned says why"))
-		})
+		{name: "401", err: ibmError(kubernetesservice.OpGetCluster, http.StatusUnauthorized, ""),
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason, wantRequeue: 5 * time.Minute,
+			wantInMessage: []string{"with HTTP 401", "check that the API key of the CAPIBM controller identity is valid and not deleted"}},
+		{name: "IAM refused the API key", err: iamRejectedError(kubernetesservice.OpGetCluster),
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason, wantRequeue: 5 * time.Minute,
+			wantInMessage: []string{"The IAM token service of IBM Cloud rejected the credentials of the CAPIBM controller identity " +
+				"with HTTP 400", "check that the API key of the CAPIBM controller identity is valid and not deleted"}},
+		{name: "403", err: ibmError(kubernetesservice.OpGetCluster, http.StatusForbidden, ""),
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason, wantRequeue: 15 * time.Minute,
+			wantInMessage: []string{"with HTTP 403", "need the Administrator platform role and the Manager service role of Kubernetes " +
+				"Service on resource group " + testResourceGroupID}},
+		{name: "400", err: ibmError(kubernetesservice.OpGetCluster, http.StatusBadRequest, "E1234"),
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason, wantRequeue: 15 * time.Minute,
+			wantInMessage: []string{"with HTTP 400 (IBM code E1234)", "the controller log has IBM's description"}},
+		{name: "the client cannot be built",
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason, wantErr: "building the Kubernetes Service client",
+			wantInMessage: []string{"cannot build the Kubernetes Service client of the CAPIBM controller identity for region us-south"}},
+		{name: "a retried 500", err: ibmError(kubernetesservice.OpGetCluster, http.StatusInternalServerError, ""), retried: true,
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason, wantErr: "HTTP 500"},
+		{name: "a retried 429", err: ibmError(kubernetesservice.OpGetCluster, http.StatusTooManyRequests, ""), retried: true,
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason, wantRequeue: 31 * time.Second},
 	}
+	for _, phase := range phases {
+		for _, answer := range answers {
+			t.Run(phase.name+"/"+answer.name, func(t *testing.T) {
+				g := NewWithT(t)
+				objs := newCPObjects()
+				phase.setup(objs)
+				f := newCPFixture(t, objs)
+				if answer.err == nil {
+					f.builder.kubernetes = nil // the stub builder then fails, as a broken credential would
+				} else {
+					phase.lookup(f).Return(nil, answer.err)
+				}
+				before := objs.cp.Status.DeepCopy()
+
+				result, err := f.reconcile()
+
+				if answer.wantErr != "" {
+					g.Expect(err).To(MatchError(ContainSubstring(answer.wantErr)))
+				} else {
+					g.Expect(err).NotTo(HaveOccurred())
+					expectRequeue(g, result, answer.wantRequeue)
+				}
+				cp := f.controlPlane()
+				g.Expect(cp.Status.ClusterID).To(Equal(before.ClusterID), "the binding is kept")
+				g.Expect(cp.Status.Initialization).To(Equal(before.Initialization), "initialization is kept")
+				if answer.retried && phase.provisioned {
+					expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, metav1.ConditionTrue,
+						controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedReason)
+					expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionTrue,
+						controlplanev1.IBMCloudManagedControlPlaneAvailableReason)
+					return
+				}
+				provisioned := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition,
+					metav1.ConditionFalse, answer.wantReason)
+				g.Expect(conditions.IsFalse(cp, controlplanev1.IBMCloudManagedControlPlaneReadyCondition)).To(BeTrue(),
+					"Ready summarizes IBMClusterProvisioned False")
+				if !phase.wantUnknown {
+					available := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionFalse,
+						controlplanev1.IBMCloudManagedControlPlaneAvailableWaitingForIBMClusterReason)
+					g.Expect(available.Message).To(Equal("The IBM cluster of this control plane is not provisioned or CAPIBM cannot read it; " +
+						"IBMClusterProvisioned says why"))
+					return
+				}
+				available := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionUnknown,
+					controlplanev1.IBMCloudManagedControlPlaneAvailableIBMAPIErrorReason)
+				g.Expect(available.Message).To(Equal("CAPIBM cannot tell whether the control plane of IBM cluster iksclusterid00000001 " +
+					"is available: " + provisioned.Message))
+				for _, part := range answer.wantInMessage {
+					g.Expect(available.Message).To(ContainSubstring(part))
+				}
+				g.Expect(available.Message).NotTo(ContainSubstring("incident-1"), "IBM's per-answer incident ID never reaches status")
+				expectNoIdentityDetails(g, available.Message)
+			})
+		}
+	}
+
+	// IBM sends a new incident ID with every answer. The Unknown message carries IBM's code only, so the same refusal
+	// again writes no status, and the controller's own watch does not start the next reconcile at once.
+	t.Run("the Unknown message does not change with IBM's incident ID", func(t *testing.T) {
+		g := NewWithT(t)
+		objs := newCPObjects()
+		objs.cp.Status.ClusterID = cpIKSClusterID
+		objs.cp.Status.Initialization.ControlPlaneInitialized = ptr.To(true)
+		f := newCPFixture(t, objs)
+		f.kube.EXPECT().GetCluster(gomock.Any(), cpIKSClusterID, "").
+			Return(nil, ibmErrorWithIncident(kubernetesservice.OpGetCluster, http.StatusForbidden, "E3200", "incident-a"))
+		_, err := f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+		first := expectCondition(g, f.controlPlane(), controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionUnknown,
+			controlplanev1.IBMCloudManagedControlPlaneAvailableIBMAPIErrorReason)
+		g.Expect(first.Message).To(ContainSubstring("with HTTP 403 (IBM code E3200)"))
+		g.Expect(first.Message).NotTo(ContainSubstring("incident-a"))
+		patches := len(f.patches())
+
+		f.clock.SetTime(cpTestStart.Add(15 * time.Minute))
+		f.kube.EXPECT().GetCluster(gomock.Any(), cpIKSClusterID, "").
+			Return(nil, ibmErrorWithIncident(kubernetesservice.OpGetCluster, http.StatusForbidden, "E3200", "incident-b"))
+		_, err = f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(f.patches()).To(HaveLen(patches), "no status patch for the same answer with another incident ID")
+		g.Expect(conditions.Get(f.controlPlane(), controlplanev1.IBMCloudManagedControlPlaneAvailableCondition)).To(Equal(first))
+	})
+}
+
+// iamRejectedError returns the error of a call of op that the IAM token service refused before it was sent, as
+// kubernetesservice returns it: IAM answers 400 for a deleted API key. op is the operation.
+func iamRejectedError(op kubernetesservice.Operation) error {
+	return &kubernetesservice.CredentialsRejectedError{Operation: op, IAMStatus: http.StatusBadRequest,
+		Err: errors.New("Provided API key could not be found")}
 }
 
 // expectHolderIsInfraCluster checks that every identity was resolved with the Cluster's IBMCloudManagedCluster as the

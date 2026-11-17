@@ -31,6 +31,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
 	clocktesting "k8s.io/utils/clock/testing"
+	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -269,6 +270,181 @@ func TestControlPlaneClassifyCall(t *testing.T) {
 func iamRejected(op kubernetesservice.Operation) error {
 	return &kubernetesservice.CredentialsRejectedError{Operation: op, IAMStatus: http.StatusBadRequest,
 		Err: errors.New("Provided API key could not be found")}
+}
+
+// cpTestCondition returns a condition of a scope test's control plane, with a fixed transition time.
+//
+// Parameters:
+//   - conditionType, status, reason and message are the condition's.
+func cpTestCondition(conditionType string, status metav1.ConditionStatus, reason, message string) metav1.Condition {
+	return metav1.Condition{Type: conditionType, Status: status, Reason: reason, Message: message,
+		LastTransitionTime: metav1.NewTime(time.Date(2026, 11, 16, 2, 0, 0, 0, time.UTC))}
+}
+
+// TestControlPlaneReportSetsAvailable covers what a failed step of the normal flow does to Available, for each phase of
+// the control plane and each kind of failure. Once CAPIBM has initialized the control plane against a bound IBM
+// cluster, a failure to read that cluster says nothing about whether the control plane is up: Available is Unknown
+// with IBMAPIError, and its message names IBM's answer and what to fix, because CAPI mirrors Available to the Cluster's
+// ControlPlaneAvailable and must not show a running control plane as down. Before that, and on a control plane whose
+// status clusterctl move left empty, the control plane is not available whatever IBM answers, so Available is False
+// with WaitingForIBMCluster. A failure that CAPIBM retries leaves both conditions as they are while
+// IBMClusterProvisioned is True.
+func TestControlPlaneReportSetsAvailable(t *testing.T) {
+	const (
+		clusterID = "iksclusterid00000001"
+		rg        = "0123456789abcdef0123456789abcdef"
+	)
+	identity := credentials.Identity{Key: credentials.ControllerKey(), Description: credentials.ControllerDescription}
+	lookup := func(err error) func(s *ControlPlaneScope) Outcome {
+		return func(s *ControlPlaneScope) Outcome {
+			return s.callProblem(context.Background(), &controlPlaneCallError{identity: identity, op: kubernetesservice.OpGetCluster,
+				action: "getting IBM cluster " + clusterID, err: err})
+		}
+	}
+	answer := func(status int, code string) error {
+		return &kubernetesservice.APIError{Operation: kubernetesservice.OpGetCluster, StatusCode: status, Code: code, IncidentID: "inc-8"}
+	}
+	failures := []struct {
+		name string
+		// fail runs the failing step on the scope.
+		fail func(s *ControlPlaneScope) Outcome
+		// transient marks a failure that leaves a True IBMClusterProvisioned as it is (cpProblem.transient).
+		transient bool
+		// wantInMessage are parts of the Unknown message: IBM's answer and what to fix.
+		wantInMessage []string
+	}{
+		{name: "401", fail: lookup(answer(http.StatusUnauthorized, "")),
+			wantInMessage: []string{"with HTTP 401", "check that the API key of the CAPIBM controller identity is valid and not deleted"}},
+		{name: "IAM refused the API key", fail: lookup(iamRejected(kubernetesservice.OpGetCluster)),
+			wantInMessage: []string{"The IAM token service of IBM Cloud rejected the credentials of the CAPIBM controller identity " +
+				"with HTTP 400", "check that the API key of the CAPIBM controller identity is valid and not deleted"}},
+		{name: "403", fail: lookup(answer(http.StatusForbidden, "")),
+			wantInMessage: []string{"with HTTP 403", "need the Administrator platform role and the Manager service role of " +
+				"Kubernetes Service on resource group " + rg}},
+		{name: "400", fail: lookup(answer(http.StatusBadRequest, "E1234")),
+			wantInMessage: []string{"with HTTP 400 (IBM code E1234)", "the controller log has IBM's description"}},
+		{name: "429", fail: lookup(answer(http.StatusTooManyRequests, "")), transient: true,
+			wantInMessage: []string{"(HTTP 429)", "CAPIBM retries"}},
+		{name: "500", fail: lookup(answer(http.StatusInternalServerError, "E0004")), transient: true,
+			wantInMessage: []string{"(IBM code E0004)", "it retries"}},
+		{name: "no answer", fail: lookup(errors.New("dial tcp: connection refused")), transient: true,
+			wantInMessage: []string{"could not complete getting IBM cluster " + clusterID, "it retries"}},
+		{name: "the credentials do not resolve", fail: func(s *ControlPlaneScope) Outcome {
+			return s.clientsProblem(context.Background(), errors.New("the identity Secret is missing"))
+		}, wantInMessage: []string{"cannot resolve the IBM Cloud credentials of this control plane through IBMCloudManagedCluster/dev"}},
+		{name: "the kubeconfig Secret cannot be read", fail: func(s *ControlPlaneScope) Outcome {
+			return s.callProblem(context.Background(), errors.New("reading the kubeconfig Secret: timeout"))
+		}, transient: true, wantInMessage: []string{"could not decide which IBM cluster this control plane stands for"}},
+		{name: "the IBMCloudManagedCluster cannot be read", fail: func(s *ControlPlaneScope) Outcome {
+			return s.infraClusterProblem(context.Background(), errors.New("reading IBMCloudManagedCluster default/dev: timeout"))
+		}, transient: true, wantInMessage: []string{"could not read IBMCloudManagedCluster/dev"}},
+	}
+
+	available := controlplanev1.IBMCloudManagedControlPlaneAvailableCondition
+	provisioned := controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition
+	waiting := cpTestCondition(available, metav1.ConditionFalse, controlplanev1.IBMCloudManagedControlPlaneAvailableWaitingForIBMClusterReason,
+		"The IBM cluster of this control plane is not provisioned or CAPIBM cannot read it; IBMClusterProvisioned says why")
+	isProvisioned := cpTestCondition(provisioned, metav1.ConditionTrue, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedReason, "")
+	initialized := controlplanev1.IBMCloudManagedControlPlaneInitializationStatus{ControlPlaneInitialized: ptr.To(true)}
+	phases := []struct {
+		name string
+		// endpoint is spec.controlPlaneEndpoint; zero until CAPIBM records it.
+		endpoint controlplanev1.APIEndpoint
+		status   controlplanev1.IBMCloudManagedControlPlaneStatus
+		// wantUnknown is true when a failure that reaches the conditions makes Available Unknown, false when it makes
+		// Available False with WaitingForIBMCluster.
+		wantUnknown bool
+	}{
+		{name: "no IBM cluster yet"},
+		// clusterctl move keeps the spec but not the status, so the moved control plane is not initialized on the target
+		// until it is bound again, although its IBM cluster runs.
+		{name: "right after clusterctl move", endpoint: controlplanev1.APIEndpoint{Host: "c111.us-south.containers.cloud.ibm.com", Port: 30101}},
+		{name: "IBM still creates the bound cluster", status: controlplanev1.IBMCloudManagedControlPlaneStatus{ClusterID: clusterID,
+			Conditions: []metav1.Condition{waiting, cpTestCondition(provisioned, metav1.ConditionFalse,
+				controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCreatingReason, "IBM is creating IBM cluster dev")}}},
+		{name: "the master is ready but the control plane was never initialized", status: controlplanev1.IBMCloudManagedControlPlaneStatus{
+			ClusterID: clusterID, Conditions: []metav1.Condition{isProvisioned, cpTestCondition(available, metav1.ConditionFalse,
+				controlplanev1.IBMCloudManagedControlPlaneAvailableWaitingForIBMClusterReason, "The master of IBM cluster "+clusterID+" is ready")}}},
+		{name: "initialized without a bound cluster", status: controlplanev1.IBMCloudManagedControlPlaneStatus{Initialization: initialized}},
+		{name: "initialized and available", wantUnknown: true, status: controlplanev1.IBMCloudManagedControlPlaneStatus{ClusterID: clusterID,
+			Initialization: initialized, Conditions: []metav1.Condition{isProvisioned, cpTestCondition(available, metav1.ConditionTrue,
+				controlplanev1.IBMCloudManagedControlPlaneAvailableReason, "")}}},
+		{name: "initialized with an unhealthy master", wantUnknown: true, status: controlplanev1.IBMCloudManagedControlPlaneStatus{
+			ClusterID: clusterID, Initialization: initialized, Conditions: []metav1.Condition{isProvisioned, cpTestCondition(available,
+				metav1.ConditionFalse, controlplanev1.IBMCloudManagedControlPlaneAvailableMasterNotReadyReason,
+				"IBM reports the master health of cluster "+clusterID+" as error")}}},
+		{name: "initialized after an earlier refusal", wantUnknown: true, status: controlplanev1.IBMCloudManagedControlPlaneStatus{
+			ClusterID: clusterID, Initialization: initialized, Conditions: []metav1.Condition{
+				cpTestCondition(provisioned, metav1.ConditionFalse,
+					controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason, "an earlier 403"),
+				cpTestCondition(available, metav1.ConditionUnknown,
+					controlplanev1.IBMCloudManagedControlPlaneAvailableIBMAPIErrorReason, "an earlier 403")}}},
+	}
+	for _, phase := range phases {
+		for _, failure := range failures {
+			t.Run(phase.name+"/"+failure.name, func(t *testing.T) {
+				g := NewWithT(t)
+				cp := &controlplanev1.IBMCloudManagedControlPlane{ObjectMeta: metav1.ObjectMeta{Name: "dev"},
+					Spec: controlplanev1.IBMCloudManagedControlPlaneSpec{ControlPlaneEndpoint: phase.endpoint}, Status: *phase.status.DeepCopy()}
+				scope := &ControlPlaneScope{params: newCPScopeParams(&cpScopeBuilder{}), ControlPlane: cp,
+					Cluster: &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "dev"}, Spec: clusterv1.ClusterSpec{
+						InfrastructureRef: clusterv1.ContractVersionedObjectReference{Kind: "IBMCloudManagedCluster", Name: "dev"}}},
+					InfraCluster: &infrav1.IBMCloudManagedCluster{ObjectMeta: metav1.ObjectMeta{Name: "dev"},
+						Spec: infrav1.IBMCloudManagedClusterSpec{Region: "us-south", ResourceGroup: infrav1.ResourceGroupReference{ID: rg}}}}
+				before := conditions.Get(cp, available)
+
+				failure.fail(scope)
+
+				after := conditions.Get(cp, available)
+				g.Expect(after).NotTo(BeNil())
+				if failure.transient && conditions.IsTrue(&controlplanev1.IBMCloudManagedControlPlane{Status: phase.status}, provisioned) {
+					g.Expect(after).To(Equal(before), "a retried failure leaves Available of a provisioned cluster as it is")
+					g.Expect(conditions.IsTrue(cp, provisioned)).To(BeTrue(), "and IBMClusterProvisioned")
+					return
+				}
+				problem := conditions.Get(cp, provisioned)
+				g.Expect(problem.Status).To(Equal(metav1.ConditionFalse))
+				if !phase.wantUnknown {
+					g.Expect(after.Status).To(Equal(metav1.ConditionFalse))
+					g.Expect(after.Reason).To(Equal(controlplanev1.IBMCloudManagedControlPlaneAvailableWaitingForIBMClusterReason))
+					g.Expect(after.Message).To(Equal(waiting.Message))
+					return
+				}
+				g.Expect(after.Status).To(Equal(metav1.ConditionUnknown))
+				g.Expect(after.Reason).To(Equal(controlplanev1.IBMCloudManagedControlPlaneAvailableIBMAPIErrorReason))
+				g.Expect(after.Message).To(Equal("CAPIBM cannot tell whether the control plane of IBM cluster " + clusterID +
+					" is available: " + problem.Message))
+				for _, part := range failure.wantInMessage {
+					g.Expect(after.Message).To(ContainSubstring(part))
+				}
+				g.Expect(after.Message).NotTo(ContainSubstring("inc-8"), "IBM's per-answer incident ID never reaches status")
+				g.Expect(cp.Status.Initialization.ControlPlaneInitialized).To(Equal(ptr.To(true)), "initialization is kept")
+			})
+		}
+	}
+}
+
+func TestControlPlaneInitializedOnBoundCluster(t *testing.T) {
+	testCases := []struct {
+		name   string
+		status controlplanev1.IBMCloudManagedControlPlaneStatus
+		want   bool
+	}{
+		{name: "fresh"},
+		{name: "bound, not initialized", status: controlplanev1.IBMCloudManagedControlPlaneStatus{ClusterID: "iksclusterid00000001"}},
+		{name: "bound, initialization false", status: controlplanev1.IBMCloudManagedControlPlaneStatus{ClusterID: "iksclusterid00000001",
+			Initialization: controlplanev1.IBMCloudManagedControlPlaneInitializationStatus{ControlPlaneInitialized: ptr.To(false)}}},
+		{name: "initialized without a cluster ID", status: controlplanev1.IBMCloudManagedControlPlaneStatus{
+			Initialization: controlplanev1.IBMCloudManagedControlPlaneInitializationStatus{ControlPlaneInitialized: ptr.To(true)}}},
+		{name: "initialized and bound", want: true, status: controlplanev1.IBMCloudManagedControlPlaneStatus{ClusterID: "iksclusterid00000001",
+			Initialization: controlplanev1.IBMCloudManagedControlPlaneInitializationStatus{ControlPlaneInitialized: ptr.To(true)}}},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := &controlplanev1.IBMCloudManagedControlPlane{Status: tc.status}
+			NewWithT(t).Expect(cpInitializedOnBoundCluster(cp)).To(Equal(tc.want))
+		})
+	}
 }
 
 func TestControlPlaneScopeLoadsTheInfraClusterOnce(t *testing.T) {
