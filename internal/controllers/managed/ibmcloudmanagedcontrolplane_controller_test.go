@@ -746,6 +746,69 @@ func TestControlPlaneReconcileCredentials(t *testing.T) {
 			"Kubernetes book lists every role"))
 		expectNoIdentityDetails(g, condition.Message)
 	})
+
+	// Available follows IBMClusterProvisioned: an answer that sets IBMClusterProvisioned False also sets Available False
+	// with WaitingForIBMCluster, also on a bound control plane that was available, for example after its API key was
+	// deleted. The Available message must not claim that no IBM cluster exists yet, which would send an operator to wait
+	// for IBM, and must send the reader to IBMClusterProvisioned, whose reason names the problem. An error CAPIBM retries
+	// leaves both conditions of a provisioned cluster as they are.
+	for _, tc := range []struct {
+		name   string
+		status int
+		// wantReason is the IBMClusterProvisioned reason; "" when both conditions stay True.
+		wantReason  string
+		wantRequeue time.Duration
+		wantErr     string
+	}{
+		{name: "a 401 on the lookup makes an available control plane unavailable", status: http.StatusUnauthorized,
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason, wantRequeue: 5 * time.Minute},
+		{name: "a 403 on the lookup makes an available control plane unavailable", status: http.StatusForbidden,
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason, wantRequeue: 15 * time.Minute},
+		{name: "a 400 on the lookup makes an available control plane unavailable", status: http.StatusBadRequest,
+			wantReason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason, wantRequeue: 15 * time.Minute},
+		{name: "a retried 500 on the lookup leaves an available control plane available", status: http.StatusInternalServerError,
+			wantErr: "HTTP 500"},
+		{name: "a retried 429 on the lookup leaves an available control plane available", status: http.StatusTooManyRequests,
+			wantRequeue: 31 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			objs := newCPObjects()
+			objs.cp.Status.ClusterID = cpIKSClusterID
+			objs.cp.Status.Initialization.ControlPlaneInitialized = ptr.To(true)
+			objs.cp.Status.Conditions = append(objs.cp.Status.Conditions,
+				metav1.Condition{Type: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, Status: metav1.ConditionTrue,
+					Reason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedReason, LastTransitionTime: metav1.NewTime(cpTestStart)},
+				metav1.Condition{Type: controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, Status: metav1.ConditionTrue,
+					Reason: controlplanev1.IBMCloudManagedControlPlaneAvailableReason, LastTransitionTime: metav1.NewTime(cpTestStart)})
+			f := newCPFixture(t, objs)
+			f.kube.EXPECT().GetCluster(gomock.Any(), cpIKSClusterID, "").Return(nil, ibmError(kubernetesservice.OpGetCluster, tc.status, ""))
+
+			result, err := f.reconcile()
+
+			if tc.wantErr != "" {
+				g.Expect(err).To(MatchError(ContainSubstring(tc.wantErr)))
+			} else {
+				g.Expect(err).NotTo(HaveOccurred())
+				expectRequeue(g, result, tc.wantRequeue)
+			}
+			cp := f.controlPlane()
+			g.Expect(cp.Status.ClusterID).To(Equal(cpIKSClusterID), "the binding is kept")
+			g.Expect(cp.Status.Initialization.ControlPlaneInitialized).To(Equal(ptr.To(true)), "initialization is kept")
+			if tc.wantReason == "" {
+				expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, metav1.ConditionTrue,
+					controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedReason)
+				expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionTrue,
+					controlplanev1.IBMCloudManagedControlPlaneAvailableReason)
+				return
+			}
+			expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, metav1.ConditionFalse, tc.wantReason)
+			available := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionFalse,
+				controlplanev1.IBMCloudManagedControlPlaneAvailableWaitingForIBMClusterReason)
+			g.Expect(available.Message).To(Equal("The IBM cluster of this control plane is not provisioned or CAPIBM cannot read it; " +
+				"IBMClusterProvisioned says why"))
+		})
+	}
 }
 
 // expectHolderIsInfraCluster checks that every identity was resolved with the Cluster's IBMCloudManagedCluster as the
@@ -990,6 +1053,50 @@ func TestControlPlaneMapFunctions(t *testing.T) {
 		objs.cluster.Spec.ControlPlaneRef.Name = "not-created-yet"
 		f := newCPFixture(t, objs)
 		g.Expect(f.r.machinePoolToControlPlane(ctx, poolOf(cpTestName))).To(BeEmpty())
+	})
+
+	// A Cluster API MachinePool reaches the control plane of its Cluster under the same condition as a pool: before
+	// create its spec.replicas sizes the initial pool, and a deleting control plane waits until the Cluster's
+	// MachinePools are gone. Its Cluster is spec.clusterName, which every MachinePool has from its creation on, while
+	// Cluster API adds the cluster-name label only in its first reconcile.
+	machinePoolOf := func(clusterName string) *clusterv1.MachinePool {
+		return &clusterv1.MachinePool{
+			ObjectMeta: metav1.ObjectMeta{Namespace: cpTestNamespace, Name: "workers"},
+			Spec:       clusterv1.MachinePoolSpec{ClusterName: clusterName, Replicas: ptr.To[int32](2)},
+		}
+	}
+	t.Run("a MachinePool maps to the control plane of its Cluster before create", func(t *testing.T) {
+		g := NewWithT(t)
+		g.Expect(f.r.capiMachinePoolToControlPlane(ctx, machinePoolOf(cpTestName))).To(Equal(want), "without the cluster-name label")
+		g.Expect(f.r.capiMachinePoolToControlPlane(ctx, machinePoolOf("kcp"))).To(BeEmpty(), "another control plane kind is not ours")
+		g.Expect(f.r.capiMachinePoolToControlPlane(ctx, machinePoolOf("gone"))).To(BeEmpty(), "no such Cluster")
+		g.Expect(f.r.capiMachinePoolToControlPlane(ctx, machinePoolOf(""))).To(BeEmpty(), "no spec.clusterName")
+		g.Expect(f.r.capiMachinePoolToControlPlane(ctx, poolOf(cpTestName))).To(BeEmpty(), "not a MachinePool")
+	})
+
+	t.Run("a MachinePool does not wake a bound control plane", func(t *testing.T) {
+		g := NewWithT(t)
+		bound := newCPObjects()
+		bound.cp.Status.ClusterID = cpIKSClusterID
+		f := newCPFixture(t, bound)
+		g.Expect(f.r.capiMachinePoolToControlPlane(ctx, machinePoolOf(cpTestName))).To(BeEmpty())
+	})
+
+	t.Run("a MachinePool wakes a bound control plane that is being deleted", func(t *testing.T) {
+		g := NewWithT(t)
+		deleting := newCPObjects()
+		deleting.cp.Status.ClusterID = cpIKSClusterID
+		deleting.cp.DeletionTimestamp = ptr.To(metav1.NewTime(cpTestStart))
+		f := newCPFixture(t, deleting)
+		g.Expect(f.r.capiMachinePoolToControlPlane(ctx, machinePoolOf(cpTestName))).To(Equal(want))
+	})
+
+	t.Run("a MachinePool whose control plane does not exist yet wakes nothing", func(t *testing.T) {
+		g := NewWithT(t)
+		objs := newCPObjects()
+		objs.cluster.Spec.ControlPlaneRef.Name = "not-created-yet"
+		f := newCPFixture(t, objs)
+		g.Expect(f.r.capiMachinePoolToControlPlane(ctx, machinePoolOf(cpTestName))).To(BeEmpty())
 	})
 
 	// The pool created with the cluster is chosen by spec.creation, so re-marking a pool must reach a control plane that
@@ -2970,4 +3077,113 @@ func TestControlPlaneEnvtestCreationMarkerWakesTheControlPlane(t *testing.T) {
 			g.Expect(getEnvtestControlPlane(t, key).Status.ClusterID).To(Equal(cpIKSClusterID))
 		}, 20*time.Second, 100*time.Millisecond).Should(Succeed())
 	})
+}
+
+// cpTestCOSCRN is a synthetic Cloud Object Storage instance CRN, which a ROKS control plane must name for its registry.
+const cpTestCOSCRN = "crn:v1:bluemix:public:cloud-object-storage:global:a/a1b2c3d4e5f60718293a4b5c6d7e8f90:00000000-0000-0000-0000-000000000c05::"
+
+// TestControlPlaneEnvtestMachinePoolScaleWakesTheControlPlane proves the MachinePool watch end to end. The initial
+// pool's size is its MachinePool's spec.replicas, and a ROKS cluster needs at least two workers per zone at create, so
+// 2 replicas over the pool's 2 zones stop the create with InvalidConfiguration, whose recheck comes only after
+// terminalRecheck (15 minutes). Nothing in the pool's status depends on replicas before the IBM cluster exists, so no
+// pool event would bring the control plane back either: only the MachinePool watch can make a fix of spec.replicas
+// take effect within seconds. A write of the MachinePool's status alone must not wake the control plane, because Cluster
+// API writes that status often and every reconcile before the create asks IBM for the cluster by name. The manager
+// watches only the test's namespace and the Cluster is paused at cleanup, so that neither this manager nor one of a
+// later test acts on another test's objects.
+func TestControlPlaneEnvtestMachinePoolScaleWakesTheControlPlane(t *testing.T) {
+	g := NewWithT(t)
+	namespace := newTestNamespace(t, "cp-scale")
+	cluster, _ := createEnvtestCreateInputs(t, namespace)
+	// Registered before the manager starts, so it runs after the manager has stopped.
+	t.Cleanup(func() { pauseTestCluster(t, cluster) })
+	machinePoolKey := client.ObjectKey{Namespace: namespace, Name: cpTestPoolName}
+	editMachinePool := func(edit func(*clusterv1.MachinePool) error) {
+		g.Eventually(func() error {
+			machinePool := &clusterv1.MachinePool{}
+			if err := testEnv.GetAPIReader().Get(ctx, machinePoolKey, machinePool); err != nil {
+				return err
+			}
+			return edit(machinePool)
+		}, 10*time.Second, 100*time.Millisecond).Should(Succeed())
+	}
+
+	var lookups, creates, sentPerZone atomic.Int64
+	kube := ksmock.NewMockKubernetesService(gomock.NewController(t))
+	kube.EXPECT().GetCluster(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, idOrName, _ string) (*kubernetesservice.Cluster, error) {
+			if idOrName == cpIKSClusterID {
+				// The bound cluster, observed by ID after the create, as IBM lists a ROKS cluster it is deploying.
+				c := cpCluster("deploying")
+				c.Type = "openshift"
+				c.MasterKubeVersion, c.TargetVersion = "4.21.35_1537_openshift", "4.21.35_1537_openshift"
+				return c, nil
+			}
+			lookups.Add(1)
+			return nil, ibmError(kubernetesservice.OpGetCluster, http.StatusNotFound, "")
+		}).AnyTimes()
+	kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil).AnyTimes()
+	kube.EXPECT().CreateCluster(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, req kubernetesservice.CreateClusterRequest) (*kubernetesservice.CreateClusterResult, error) {
+			creates.Add(1)
+			sentPerZone.Store(req.WorkerPool.WorkerCountPerZone)
+			return &kubernetesservice.CreateClusterResult{ClusterID: cpIKSClusterID}, nil
+		}).AnyTimes()
+	startControlPlaneManager(t, namespace, kube)
+	cp := &controlplanev1.IBMCloudManagedControlPlane{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace, Name: "dev", Labels: map[string]string{clusterv1.ClusterNameLabel: cluster.Name},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: clusterv1.GroupVersion.String(), Kind: "Cluster", Name: cluster.Name, UID: cluster.UID,
+			}},
+		},
+		Spec: controlplanev1.IBMCloudManagedControlPlaneSpec{
+			Distribution:        controlplanev1.DistributionOpenShift,
+			DistributionVersion: "4.21",
+			IBMCloudClusterName: "dev",
+			OpenShift: controlplanev1.OpenShiftSpec{ImageRegistry: controlplanev1.ImageRegistrySpec{
+				COS: controlplanev1.COSInstanceReference{InstanceCRN: cpTestCOSCRN},
+			}},
+		},
+	}
+	g.Expect(testEnv.Create(ctx, cp)).To(Succeed())
+	key := client.ObjectKeyFromObject(cp)
+
+	g.Eventually(func(g Gomega) {
+		condition := expectCondition(g, getEnvtestControlPlane(t, key), controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition,
+			metav1.ConditionFalse, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason)
+		g.Expect(condition.Message).To(ContainSubstring("spec.replicas=2 gives 1 worker(s) per zone in 2 zone(s)"))
+	}, 30*time.Second, 100*time.Millisecond).Should(Succeed())
+	// Settled: the control plane's own status write brings at most one more reconcile, and then nothing moves.
+	settled := int64(-1)
+	g.Eventually(func() bool {
+		n := lookups.Load()
+		stable := n == settled
+		settled = n
+		return stable
+	}, 10*time.Second, 500*time.Millisecond).Should(BeTrue(), "binding lookups keep growing")
+
+	// Cluster API's status writes do not change spec.replicas and wake nothing.
+	editMachinePool(func(machinePool *clusterv1.MachinePool) error {
+		machinePool.Status.Phase = "Pending"
+		machinePool.Status.Replicas = ptr.To[int32](0)
+		return testEnv.Status().Update(ctx, machinePool)
+	})
+	g.Consistently(func(g Gomega) {
+		g.Expect(creates.Load()).To(BeZero(), "no create below IBM's per-zone minimum")
+		g.Expect(lookups.Load()).To(Equal(settled), "binding lookups after a MachinePool status write")
+	}, noHotLoopWindow, 100*time.Millisecond).Should(Succeed())
+
+	// The user's fix: two workers in each of the 2 zones.
+	editMachinePool(func(machinePool *clusterv1.MachinePool) error {
+		machinePool.Spec.Replicas = ptr.To[int32](4)
+		return testEnv.Update(ctx, machinePool)
+	})
+
+	// Far inside terminalRecheck: only the MachinePool watch can have brought the control plane back.
+	g.Eventually(func(g Gomega) {
+		g.Expect(creates.Load()).To(Equal(int64(1)))
+		g.Expect(getEnvtestControlPlane(t, key).Status.ClusterID).To(Equal(cpIKSClusterID))
+	}, 20*time.Second, 100*time.Millisecond).Should(Succeed())
+	g.Expect(sentPerZone.Load()).To(Equal(int64(2)), "4 replicas over 2 zones")
 }

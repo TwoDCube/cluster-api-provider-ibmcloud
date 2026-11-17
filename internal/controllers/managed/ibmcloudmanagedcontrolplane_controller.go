@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util"
@@ -274,13 +275,25 @@ func (r *IBMCloudManagedControlPlaneReconciler) SetupWithManager(ctx context.Con
 			builder.WithPredicates(predicates.ClusterPausedTransitionsOrInfrastructureProvisioned(mgr.GetScheme(), predicateLog)),
 		).
 		// The initial worker pool is created with the cluster, and a deleting control plane waits for the pools of its
-		// Cluster; both react to pool events, and only those (machinePoolToControlPlane). No predicate on purpose: the
-		// pool's spec.creation (WithCluster selects the one pool that is created with the cluster), the owner reference CAPI
-		// adds, and a deletion must all reach a control plane that waits for its initial pool, within seconds instead of at
-		// its next clusterProvisioningPoll or terminalRecheck.
+		// Cluster; both react to pool events (machinePoolToControlPlane). No predicate on purpose: the pool's
+		// spec.creation (WithCluster selects the one pool that is created with the cluster), the owner reference CAPI
+		// adds, and a deletion must all reach a control plane that waits for its initial pool, within seconds instead of
+		// at its next clusterProvisioningPoll or terminalRecheck.
 		Watches(
 			&infrav1.IBMCloudManagedMachinePool{},
 			handler.EnqueueRequestsFromMapFunc(r.machinePoolToControlPlane),
+		).
+		// The initial pool's size is its MachinePool's spec.replicas, which the create request checks against the
+		// pool's zones and IBM's per-zone minimum. Before the IBM cluster exists, nothing in the pool's own status
+		// depends on replicas, so the pool watch above never sees a replicas change: without this watch, a fixed
+		// spec.replicas would wait for the control plane's terminalRecheck (15 minutes) after InvalidConfiguration. A
+		// deleting control plane also waits for the MachinePools of its Cluster to be gone. Only spec changes, creations
+		// and deletions count (GenerationChangedPredicate; a deletion timestamp raises the generation too): Cluster API
+		// writes MachinePool status often, and every reconcile before the create asks IBM for the cluster by name.
+		Watches(
+			&clusterv1.MachinePool{},
+			handler.EnqueueRequestsFromMapFunc(r.capiMachinePoolToControlPlane),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 		).
 		Complete(r)
 	if err != nil {
@@ -315,12 +328,43 @@ func (r *IBMCloudManagedControlPlaneReconciler) clusterToControlPlane(_ context.
 //   - ctx is the watch context.
 //   - o is the IBMCloudManagedMachinePool.
 func (r *IBMCloudManagedControlPlaneReconciler) machinePoolToControlPlane(ctx context.Context, o client.Object) []ctrl.Request {
-	clusterName := o.GetLabels()[clusterv1.ClusterNameLabel]
+	return r.controlPlaneWaitingForPools(ctx, o.GetNamespace(), o.GetLabels()[clusterv1.ClusterNameLabel])
+}
+
+// capiMachinePoolToControlPlane maps a Cluster API MachinePool to the IBMCloudManagedControlPlane of its Cluster
+// (spec.clusterName, which Cluster API requires and never changes), under the same condition as
+// machinePoolToControlPlane: before the IBM cluster is created or bound, because the initial pool's MachinePool sizes
+// the create request, and while the control plane is being deleted, because it waits until the MachinePools of its
+// Cluster are gone. A bound, live control plane is not woken: a MachinePool's spec changes the IBM pool through the
+// pool controller, never the control plane.
+//
+// Parameters:
+//   - ctx is the watch context.
+//   - o is the MachinePool; another type maps to nothing.
+func (r *IBMCloudManagedControlPlaneReconciler) capiMachinePoolToControlPlane(ctx context.Context, o client.Object) []ctrl.Request {
+	machinePool, ok := o.(*clusterv1.MachinePool)
+	if !ok {
+		return nil
+	}
+	return r.controlPlaneWaitingForPools(ctx, machinePool.Namespace, machinePool.Spec.ClusterName)
+}
+
+// controlPlaneWaitingForPools returns the request of the IBMCloudManagedControlPlane of the Cluster clusterName, found
+// through the Cluster's spec.controlPlaneRef, when that control plane waits for the worker pools of its Cluster: it has
+// no status.clusterID yet, or it is being deleted. It returns none when the Cluster or the control plane cannot be
+// read, or when the control plane is bound and not being deleted, so that pool events never cost a bound, live control
+// plane a GetCluster.
+//
+// Parameters:
+//   - ctx is the watch context.
+//   - namespace is the namespace of the pool object, and so of its Cluster.
+//   - clusterName is the Cluster's name; "" maps to nothing.
+func (r *IBMCloudManagedControlPlaneReconciler) controlPlaneWaitingForPools(ctx context.Context, namespace, clusterName string) []ctrl.Request {
 	if clusterName == "" {
 		return nil
 	}
 	cluster := &clusterv1.Cluster{}
-	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: o.GetNamespace(), Name: clusterName}, cluster); err != nil {
+	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: clusterName}, cluster); err != nil {
 		// A missing Cluster has no control plane to wake; another read error is retried by the next pool event or
 		// the control plane's own requeue.
 		return nil

@@ -751,11 +751,15 @@ func (s *ControlPlaneScope) setProvisioned(status metav1.ConditionStatus, reason
 	})
 }
 
-// setAvailableWaiting sets Available False with WaitingForIBMCluster: no IBM cluster is bound or it is still being
-// created.
+// setAvailableWaiting sets Available False with WaitingForIBMCluster. Every step that sets IBMClusterProvisioned False
+// calls it, so it covers more than the wait its reason names: no IBM cluster is bound yet or IBM is still creating it,
+// but also a bound cluster that CAPIBM cannot read (a 401, a 403, an IBM error it does not retry) or that IBM reports
+// as failed, deleted or not found, even on a control plane that was available. The message therefore does not claim
+// that no cluster exists yet, which would send an operator to wait while the credentials or the cluster need a fix;
+// it sends the reader to IBMClusterProvisioned, whose reason tells these cases apart.
 func (s *ControlPlaneScope) setAvailableWaiting() {
 	s.setAvailable(controlplanev1.IBMCloudManagedControlPlaneAvailableWaitingForIBMClusterReason,
-		"No IBM cluster is provisioned for this control plane yet; see IBMClusterProvisioned")
+		"The IBM cluster of this control plane is not provisioned or CAPIBM cannot read it; IBMClusterProvisioned says why")
 }
 
 // objectName names the reconciled object in messages, for example IBMCloudManagedControlPlane/dev.
