@@ -22,10 +22,14 @@ import (
 	"io"
 	"math/big"
 	"regexp"
+
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/ibmclustername"
 )
 
 // The name contract of the managed e2e lanes: every cluster is named <prefix>-<run-id>-<lane>, for example
 // capibm-e2e-k3x9q2-iks, or capibm-e2e-periodics-x7k-iks with E2E_NAME_PREFIX=capibm-e2e-periodics.
+// The lanes do not set spec.ibmCloudClusterName, so the whole name is the IBM cluster name and must follow IBM's rule:
+// at most MaxClusterNameLength (32) characters, a letter first.
 const (
 	// DefaultNamePrefix is the prefix when E2E_NAME_PREFIX is not set.
 	DefaultNamePrefix = "capibm-e2e"
@@ -40,8 +44,9 @@ const (
 	// subdomain (IBMCloudManagedControlPlane spec.ibmCloudClusterName documentation).
 	UniqueNameLength = 24
 
-	// MaxClusterNameLength is IBM's limit for a cluster name (the MaxLength of spec.ibmCloudClusterName).
-	MaxClusterNameLength = 35
+	// MaxClusterNameLength is IBM's limit for a cluster name: IBM refuses createCluster for a longer name (HTTP 400,
+	// code E0125). The lanes leave spec.ibmCloudClusterName unset, so the cluster name is the IBM name.
+	MaxClusterNameLength = ibmclustername.MaxLength
 
 	// minNamePrefixLength keeps the janitor's prefix from matching far more than e2e clusters: a one- or
 	// two-character prefix such as "c" would select "c-anything".
@@ -108,7 +113,9 @@ func RunNamePrefix(prefix, runID string) (string, error) {
 
 // ClusterName returns the name of the lane's cluster, "<prefix>-<run-id>-<lane>", after checking the whole name
 // contract: valid prefix and run ID, "<prefix>-<run-id>" within the first UniqueNameLength characters, and the full
-// name within MaxClusterNameLength characters.
+// name a valid IBM cluster name of at most MaxClusterNameLength characters. The lane calls it first in its set-up,
+// before the janitor or any other IBM call, so a name IBM would refuse fails the lane with this error at once instead
+// of an InvalidConfiguration (or an IBM refusal) after the cluster objects were applied.
 //
 // Parameters:
 //   - prefix is E2E_NAME_PREFIX (see ValidateNamePrefix).
@@ -123,24 +130,35 @@ func ClusterName(prefix, runID string, lane Lane) (string, error) {
 		return "", err
 	}
 	name := runPrefix + string(lane)
-	if err := validateNameLength(name); err != nil {
+	if err := validateIBMClusterName(name); err != nil {
 		return "", err
 	}
 	return name, nil
 }
 
-// validateNameLength returns an error when name is longer than MaxClusterNameLength. With today's lanes it cannot
-// fail after RunNamePrefix passed (24 + len("-roks") = 29 characters); it keeps the contract explicit for a lane
-// with a longer name.
+// validateIBMClusterName returns an error when name breaks IBM's cluster name rule (ibmclustername.Problem), the rule
+// CAPIBM's admission webhook and controller apply to the same name. With today's lanes it cannot fail after
+// RunNamePrefix passed: the prefix and run ID patterns allow only valid characters, and the longest name is
+// 24 + len("-roks") = 29 characters. It keeps the contract explicit for a lane with a longer name, and its message
+// says by how much to shorten the variables.
 //
 // Parameters:
 //   - name is a full cluster name.
-func validateNameLength(name string) error {
-	if len(name) > MaxClusterNameLength {
-		return fmt.Errorf("cluster name %q has %d characters, more than IBM's limit of %d: shorten E2E_NAME_PREFIX "+
-			"or E2E_RUN_ID by %d characters", name, len(name), MaxClusterNameLength, len(name)-MaxClusterNameLength)
+func validateIBMClusterName(name string) error {
+	problem := ibmclustername.Problem(name)
+	if problem == "" {
+		return nil
 	}
-	return nil
+	if n := len([]rune(name)); n > MaxClusterNameLength {
+		excess, unit := n-MaxClusterNameLength, "characters"
+		if excess == 1 {
+			unit = "character"
+		}
+		return fmt.Errorf("cluster name %q has %d characters, more than IBM's limit of %d (%s): shorten "+
+			"E2E_NAME_PREFIX or E2E_RUN_ID by %d %s", name, n, MaxClusterNameLength, ibmclustername.Rule, excess, unit)
+	}
+	return fmt.Errorf("cluster name %q %s, so IBM would refuse it (%s): change E2E_NAME_PREFIX or E2E_RUN_ID",
+		name, problem, ibmclustername.Rule)
 }
 
 // NewRunID returns a random run ID of length lowercase letters and digits.

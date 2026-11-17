@@ -64,8 +64,8 @@ variables:
   KUBERNETES_VERSION: "${KUBERNETES_VERSION:-v1.35.9}"
   CUSTOM_KIND_NODE_IMAGE: "${CUSTOM_KIND_NODE_IMAGE:-}"
   # Name contract: <E2E_NAME_PREFIX>-<E2E_RUN_ID>-<iks|roks>; "<prefix>-<run-id>" must fit into 24 characters and the
-  # whole name into 35. An empty E2E_RUN_ID gets a random 6-character ID. The janitor deletes, by ID, clusters named
-  # "<E2E_NAME_PREFIX>-..." that are older than 4 hours.
+  # whole name, which is the IBM cluster name, into IBM's limit of 32. An empty E2E_RUN_ID gets a random 6-character
+  # ID. The janitor deletes, by ID, clusters named "<E2E_NAME_PREFIX>-..." that are older than 4 hours.
   E2E_NAME_PREFIX: "${E2E_NAME_PREFIX:-capibm-e2e}"
   E2E_RUN_ID: "${E2E_RUN_ID:-}"
   # Sharing the e2e account with other runs. The defaults suit an account that holds one managed run at a time (CI: the

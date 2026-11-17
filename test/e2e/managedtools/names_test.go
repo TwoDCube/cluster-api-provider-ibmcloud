@@ -23,6 +23,8 @@ import (
 	"testing"
 
 	. "github.com/onsi/gomega"
+
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/ibmclustername"
 )
 
 func TestClusterName(t *testing.T) {
@@ -64,6 +66,7 @@ func TestClusterName(t *testing.T) {
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(got).To(Equal(tc.want))
 			g.Expect(len(got)).To(BeNumerically("<=", MaxClusterNameLength))
+			g.Expect(ibmclustername.Problem(got)).To(BeEmpty(), "every contract name is a valid IBM cluster name")
 		})
 	}
 }
@@ -78,11 +81,50 @@ func TestClusterNameLongestUniquePartFitsIBMLimit(t *testing.T) {
 	g.Expect(len(name)).To(BeNumerically("<=", MaxClusterNameLength))
 }
 
-func TestValidateNameLength(t *testing.T) {
-	g := NewWithT(t)
-	g.Expect(validateNameLength(strings.Repeat("a", MaxClusterNameLength))).To(Succeed())
-	g.Expect(validateNameLength(strings.Repeat("a", MaxClusterNameLength+2))).To(
-		MatchError(ContainSubstring("has 37 characters, more than IBM's limit of 35: shorten E2E_NAME_PREFIX or E2E_RUN_ID by 2 characters")))
+func TestMaxClusterNameLengthIsIBMLimit(t *testing.T) {
+	// IBM refused createCluster for a 33-character name (HTTP 400, code E0125) while this contract allowed 35.
+	NewWithT(t).Expect(MaxClusterNameLength).To(Equal(32))
+}
+
+func TestValidateIBMClusterName(t *testing.T) {
+	testCases := []struct {
+		name    string
+		input   string
+		wantErr string
+	}{
+		{name: "31 characters", input: "a" + strings.Repeat("b", 30)},
+		{name: "32 characters, IBM's limit", input: "a" + strings.Repeat("b", 31)},
+		{
+			// The 33-character name IBM refused.
+			name:  "33 characters",
+			input: "example-test-cluster-e01-mgmt-iks",
+			wantErr: `cluster name "example-test-cluster-e01-mgmt-iks" has 33 characters, more than IBM's limit of 32 (` +
+				ibmclustername.Rule + "): shorten E2E_NAME_PREFIX or E2E_RUN_ID by 1 character",
+		},
+		{
+			name:    "34 characters",
+			input:   "a" + strings.Repeat("b", 33),
+			wantErr: "has 34 characters, more than IBM's limit of 32 (",
+		},
+		{
+			name:  "digit first",
+			input: "1capibm-x7k-iks",
+			wantErr: `cluster name "1capibm-x7k-iks" starts with '1' instead of a letter, so IBM would refuse it (` +
+				ibmclustername.Rule + "): change E2E_NAME_PREFIX or E2E_RUN_ID",
+		},
+		{name: "unicode", input: "capibm-x7ü-iks", wantErr: "contains 'ü'"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			err := validateIBMClusterName(tc.input)
+			if tc.wantErr == "" {
+				g.Expect(err).NotTo(HaveOccurred())
+				return
+			}
+			g.Expect(err).To(MatchError(ContainSubstring(tc.wantErr)))
+		})
+	}
 }
 
 func TestRunNamePrefix(t *testing.T) {
