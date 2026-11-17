@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/version"
 	"sigs.k8s.io/yaml"
 
 	. "github.com/onsi/gomega"
@@ -30,6 +31,44 @@ import (
 // managedE2EConfig is the part of test/e2e/config/ibmcloud-e2e-managed.yaml these tests read.
 type managedE2EConfig struct {
 	Intervals map[string][]string `json:"intervals"`
+	Providers []struct {
+		Name     string `json:"name"`
+		Type     string `json:"type"`
+		Versions []struct {
+			Name string `json:"name"`
+		} `json:"versions"`
+	} `json:"providers"`
+}
+
+// minimumClusterAPIVersion is the oldest Cluster API release the managed controllers support: v1.14.0 ignores the
+// ClusterCache's cluster filter that keeps CAPIBM from connecting to clusters it does not manage (see
+// internal/controllers/managed/clustercache.go and the book's versions page).
+const minimumClusterAPIVersion = "v1.14.1"
+
+// TestManagedE2EInstallsASupportedClusterAPI guards the Cluster API providers the managed lanes install: every
+// cluster-api and kubeadm version must be a supported release, and all of them the same release, because clusterctl
+// move refuses a target whose providers are older than the source's, so a mixed set breaks the move spec, and an
+// unsupported core provider would test a combination the book tells users not to run.
+func TestManagedE2EInstallsASupportedClusterAPI(t *testing.T) {
+	g := NewWithT(t)
+	cfg := loadManagedE2EConfig(t)
+	minimum := version.MustParseSemantic(minimumClusterAPIVersion)
+	seen := map[string]bool{}
+	for _, p := range cfg.Providers {
+		if p.Name != "cluster-api" && p.Name != "kubeadm" {
+			continue
+		}
+		g.Expect(p.Versions).NotTo(BeEmpty(), "provider %s (%s) lists no version", p.Name, p.Type)
+		for _, v := range p.Versions {
+			parsed, err := version.ParseSemantic(v.Name)
+			g.Expect(err).NotTo(HaveOccurred(), "provider %s (%s) version %q", p.Name, p.Type, v.Name)
+			g.Expect(parsed.AtLeast(minimum)).To(BeTrue(),
+				"provider %s (%s) is %s; the managed controllers need Cluster API %s or newer", p.Name, p.Type, v.Name,
+				minimumClusterAPIVersion)
+			seen[v.Name] = true
+		}
+	}
+	g.Expect(seen).To(HaveLen(1), "the cluster-api and kubeadm providers must use one release, got %v", seen)
 }
 
 // loadManagedE2EConfig reads the managed e2e configuration that the managed lanes run with.
