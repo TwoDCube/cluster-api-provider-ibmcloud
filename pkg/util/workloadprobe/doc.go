@@ -18,11 +18,12 @@ limitations under the License.
 // reconcile afterwards.
 //
 // Why the package exists: CAPIBM never writes a kubeconfig it has not seen work, it must find out which TLS trust mode
-// an IBM master needs (cluster CA for IKS, system roots for ROKS; private-only masters are not yet verified against IBM
-// Cloud), it must notice a credential the API server stopped accepting (401 → refresh), and the ownership proof after
-// a `clusterctl move` needs to know whether a stored credential is cluster-admin on a candidate cluster. CAPI's
-// ClusterCache cannot answer these questions: it connects only to Clusters whose kubeconfig Secret is already written,
-// caches the connection, and hides why a connection failed.
+// an IBM master needs (cluster CA for IKS, public or private-only; system roots for ROKS's public master; a
+// private-only ROKS master is not yet verified against IBM Cloud), it must notice a credential the API server stopped
+// accepting (401 → refresh), and the ownership proof after a `clusterctl move` needs to know whether a stored
+// credential is cluster-admin on a candidate cluster. CAPI's ClusterCache cannot answer these questions: it connects
+// only to Clusters whose kubeconfig Secret is already written, caches the connection, and hides why a connection
+// failed.
 //
 // Conventions this package follows:
 //

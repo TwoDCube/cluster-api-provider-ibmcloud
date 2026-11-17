@@ -67,7 +67,8 @@ func (t CATrust) Validate() error {
 }
 
 // Other returns the other trust mode, or "" when t is not a valid mode. The caller probes with the flavor's mode first
-// and falls back to the other one, because the trust of private-only masters is not yet verified against IBM Cloud.
+// and falls back to the other one, because the trust of a private-only OpenShift master is not yet verified against
+// IBM Cloud (a private-only IKS master was observed to verify with the cluster CA, like a public one).
 func (t CATrust) Other() CATrust {
 	switch t {
 	case ClusterCA:
