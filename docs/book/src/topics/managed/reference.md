@@ -22,7 +22,7 @@ CAPIBM makes no IBM call and writes nothing to the workload cluster.
 | `IBMClusterProvisioned` | True | `Provisioned` | the IBM cluster exists and is bound to this object; lists non-critical create error codes, if any ("IBM created the cluster with non-critical errors E49df (see the IBMCreateWarnings events)") |
 | | False | `WaitingForInfrastructure` | the `IBMCloudManagedCluster` has not resolved the VPC and subnets yet |
 | | False | `WaitingForInitialWorkerPool` | no pool of the Cluster has `spec.creation: WithCluster`, or the marked pool is not linked to its `MachinePool` yet; no IBM call |
-| | False | `InvalidConfiguration` | invalid name, pod or service ranges, or initial pool (including several pools with `spec.creation: WithCluster`); IBM 400 and 422 answers by code (`P4102`, `E7278`) |
+| | False | `InvalidConfiguration` | a name that breaks IBM's cluster name rule (1 to 32 characters, a letter first, then letters, digits, `-`, `_` and `.`; checked before any IBM call), invalid pod or service ranges, or initial pool (including several pools with `spec.creation: WithCluster`); IBM 400 and 422 answers by code (`P4102`, `E7278`) |
 | | False | `VersionNotAvailable` | IBM does not offer `spec.distributionVersion`; the message lists the offered minors |
 | | False | `ClusterNameConflict` | an IBM cluster with the name exists and CAPIBM cannot prove it created it for this Cluster; nothing is created, changed or deleted |
 | | False | `BindingMismatch` | `status.clusterID` names an IBM cluster whose name, resource group, distribution or provider differ; nothing is changed |

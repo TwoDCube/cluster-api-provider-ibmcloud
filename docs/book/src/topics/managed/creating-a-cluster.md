@@ -41,6 +41,14 @@ so other namespaces or management clusters using the same name will conflict; se
 (immutable) to choose a name
 ```
 
+The cluster name you pass to `clusterctl generate cluster` then becomes the IBM cluster name, so it must follow
+IBM's name rule: **at most 32 characters, starting with a letter** ([Naming the IBM cluster](#naming-the-ibm-cluster)).
+A longer name, or one starting with a digit, is valid for Kubernetes but not for IBM: the API server rejects the
+control plane ("spec.ibmCloudClusterName: Required value: without it the IBM cluster would be named after Cluster
+...") and nothing is created at IBM. Either set `spec.ibmCloudClusterName` in the control plane of `my-iks.yaml` and
+apply the file again, or delete the applied objects (`kubectl delete -f my-iks.yaml`) and generate the cluster again
+with a shorter name.
+
 ## 2. What happens
 
 1. The `IBMCloudManagedCluster` checks the resource group, the VPC and the subnet of every zone (it exists, is in the
@@ -127,10 +135,26 @@ spec:
 
 `spec.ibmCloudClusterName` is the IBM cluster name; omitted, it is the `Cluster`'s `metadata.name`. IBM cluster names
 are unique per **account**, across regions, while Cluster API names are unique per namespace, hence the admission
-warning. On management clusters with several namespaces, use a convention such as `<namespace>-<name>`. Rules: starts
-with a letter; letters, digits, `.` and `-`; at most 35 characters. Keep the first 24 characters unique: re-creating the
-same prefix five times in seven days hits the Let's Encrypt limit for the Ingress subdomain. The field is immutable and
-cannot be added or removed after creation.
+warning. On management clusters with several namespaces, use a convention such as `<namespace>-<name>`. Keep the first
+24 characters unique: re-creating the same prefix five times in seven days hits the Let's Encrypt limit for the Ingress
+subdomain. The field is immutable and cannot be added or removed after creation.
+
+IBM's name rule, which IBM's API enforces when it creates the cluster:
+
+* 1 to **32** characters;
+* the first character is a letter (`a-z`, `A-Z`);
+* the others are letters, digits, `-`, `_` and `.`.
+
+IBM refuses any other name (HTTP 400, IBM code `E0125`), and older IBM documentation that allows 35 characters is out
+of date. CAPIBM checks the rule before it calls IBM, at three points:
+
+* The CRD rejects a `spec.ibmCloudClusterName` that breaks the rule.
+* When `spec.ibmCloudClusterName` is omitted, the admission webhook checks the `Cluster`'s name and rejects the control
+  plane if it breaks the rule. Kubernetes allows `Cluster` names of up to 63 characters that may start with a digit,
+  so a name such as `team-a-production-iks-eu-de-cluster-01` (38 characters) or `1st-cluster` is rejected.
+* If the webhook cannot tell the `Cluster` yet (a control plane created before its `Cluster`, with neither a cluster
+  label nor an owner reference), the control plane stops with `InvalidConfiguration` before any IBM call
+  ([Troubleshooting](./troubleshooting.md#invalidconfiguration-for-other-reasons)).
 
 If an IBM cluster with the name already exists and CAPIBM cannot prove it created it for this Cluster, the control
 plane stops with `ClusterNameConflict` and creates nothing ([Troubleshooting](./troubleshooting.md#clusternameconflict)).

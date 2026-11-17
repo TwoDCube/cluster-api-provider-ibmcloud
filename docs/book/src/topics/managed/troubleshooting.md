@@ -44,6 +44,16 @@ Region, resource group and VPC cannot change after creation; zones can only be a
 
 ## The IBM cluster is not created
 
+### The control plane is rejected because of its IBM cluster name
+
+"spec.ibmCloudClusterName: Required value: without it the IBM cluster would be named after Cluster "<name>", and IBM
+would refuse that name: it has 33 characters, more than 32; ...", or "spec.ibmCloudClusterName: Invalid value: ...":
+the name breaks IBM's cluster name rule, **1 to 32 characters, a letter (`a-z`, `A-Z`) first, then letters, digits,
+`-`, `_` and `.`** ([Naming the IBM cluster](./creating-a-cluster.md#naming-the-ibm-cluster)). IBM would refuse the
+create with HTTP 400 and IBM code `E0125`, so CAPIBM refuses the control plane first; nothing was created at IBM. Set
+`spec.ibmCloudClusterName` in the control plane to a name that follows the rule and apply it again, or use a `Cluster`
+name that follows it.
+
 ### WaitingForInfrastructure
 
 The control plane waits until the `IBMCloudManagedCluster` has resolved the network (see above).
@@ -71,6 +81,14 @@ pool whose replicas are not a multiple of its zones or below the per-zone minimu
 not in the `IBMCloudManagedCluster`, `entitlement` on IKS, or an IBM 400 or 422 answer such as `P4102` (subnet not found)
 or `E7278` (ROKS without a Cloud Object Storage instance). CAPIBM checks again every 15 minutes and at once when you
 change the spec.
+
+An invalid cluster name ("the IBM cluster name "<name>", taken from the Cluster's metadata.name
+(spec.ibmCloudClusterName is omitted), has 33 characters, more than 32; ...") breaks IBM's rule of 1 to 32 characters,
+a letter first, then letters, digits, `-`, `_` and `.`. It reaches the controller when the admission webhook could not
+tell the `Cluster` whose name is the default, for example because the control plane was created before its `Cluster`.
+CAPIBM sends nothing to IBM with that name. Neither name can change (`spec.ibmCloudClusterName` cannot be added after
+creation), so delete the `Cluster` and create it again with `spec.ibmCloudClusterName` set to a valid name, or with a
+`Cluster` name that follows the rule.
 
 ### PermissionDenied on create
 

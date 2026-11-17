@@ -148,7 +148,9 @@ same variables: `managed-roks` those of `managed-iks` plus `COS_INSTANCE_CRN`, `
   pairs without `creation` (or with `creation: AfterCluster`).
 * No template sets `spec.ibmCloudClusterName`, so the IBM cluster is named after the Cluster, and creating the control
   plane returns an admission warning: IBM cluster names are unique per account, while Cluster names are unique only per
-  namespace. To choose a name, set `spec.ibmCloudClusterName` (immutable) in the generated control plane.
+  namespace. To choose a name, set `spec.ibmCloudClusterName` (immutable) in the generated control plane. Without it,
+  the Cluster name must follow IBM's cluster name rule, at most 32 characters with a letter first (then letters,
+  digits, `-`, `_` and `.`): the API server rejects the control plane of a Cluster whose name breaks the rule.
 * No template sets `spec.clusterNetwork`: IBM then picks free pod and service ranges. Custom ranges cannot be shared
   between clusters; the book page
   [Creating a cluster](../docs/book/src/topics/managed/creating-a-cluster.md#pod-and-service-networks) shows how to set
