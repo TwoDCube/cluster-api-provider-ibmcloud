@@ -72,10 +72,14 @@ CAPIBM makes no IBM call and writes nothing to the workload cluster.
 | `Paused` | | | `util/paused` |
 
 Events: `SuccessfulCreateIBMCluster` (Normal); `IBMCreateWarnings` (Warning, one per non-critical create error, with
-IBM's code, description, recovery hint and incident ID), `LeftoverResources` (Warning, once the IBM cluster is gone),
-`IBMClusterNotDeleted` (Warning, a same-named IBM cluster the deletion leaves alone), `AdminCertificateExpiring`
-(Warning, 30 days before the admin certificate expires), `ManagedKubernetesDisabled` (Warning, the feature gate is
-off).
+IBM's code, description, recovery hint and incident ID), `LeftoverResources` (Warning, once the IBM cluster is gone: the
+VPC resources IKS leaves behind, and what CAPIBM's last `DELETE` asked IBM to do with the cluster's storage, never what
+IBM did with it: with `spec.deletion.persistentStorage: Delete` it adds that VPC Block volumes may remain and must be
+checked, with either value that whoever deleted the cluster decided if that `DELETE` failed, and when CAPIBM sent no
+`DELETE` only that whoever deleted the cluster decided; CAPIBM never asks IBM to delete the ROKS registry bucket; see
+[Deleting a cluster](./deleting.md#what-stays-behind)), `IBMClusterNotDeleted` (Warning, a same-named IBM cluster the
+deletion leaves alone), `AdminCertificateExpiring` (Warning, 30 days before the admin certificate expires),
+`ManagedKubernetesDisabled` (Warning, the feature gate is off).
 
 ## IBMCloudManagedCluster
 

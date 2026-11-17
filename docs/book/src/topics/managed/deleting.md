@@ -12,11 +12,12 @@ Cluster API deletes the `MachinePool`s first, then the control plane, then the `
    cluster removes every worker. Their finalizers go at once.
 2. **Control plane** (`Deleting=True` with these reasons): CAPIBM checks once more that the IBM cluster is the one this
    control plane created or proved (the same binding checks as always), records the time and sends **one** `DELETE`
-   (`DeletionRequested`), then waits while IBM deletes it (`WaitingForIBMDeletion`). IBM answers `204` at once and stops
-   listing the cluster about 5 minutes later on both distributions. If IBM still does not show the cluster as deleting
-   10 minutes after the request, CAPIBM sends the `DELETE` again. When the cluster is gone, CAPIBM emits the Warning event
-   `LeftoverResources` (below) and removes the finalizer. The kubeconfig Secret is garbage-collected with the control
-   plane.
+   (`DeletionRequested`), which asks IBM to keep or delete the cluster's persistent storage as
+   [`spec.deletion.persistentStorage`](#persistent-storage) says, then waits while IBM deletes it
+   (`WaitingForIBMDeletion`). IBM answers `204` at once and stops listing the cluster about 5 minutes later on both
+   distributions. If IBM still does not show the cluster as deleting 10 minutes after the request, CAPIBM sends the
+   `DELETE` again. When the cluster is gone, CAPIBM emits the Warning event `LeftoverResources` (below) and removes the
+   finalizer. The kubeconfig Secret is garbage-collected with the control plane.
 3. **`IBMCloudManagedCluster`**: nothing to do in IBM Cloud; it never created anything.
 
 Do **not** delete the `IBMCloudManagedControlPlane` or the `IBMCloudManagedCluster` on their own. The validating webhooks
@@ -45,15 +46,76 @@ gone (`WaitingForWorkersDeletion`) and deletes nothing before that.
 
 Pool deletions are never rejected; see [Worker pools](./worker-pools.md#removing-a-pool).
 
+## Persistent storage
+
+`spec.deletion.persistentStorage` of the `IBMCloudManagedControlPlane` says what CAPIBM asks IBM to do with the
+cluster's persistent storage, such as the VPC Block volumes of its persistent volumes, when CAPIBM deletes the IBM
+cluster:
+
+| Value | IBM's `DELETE` | What CAPIBM asks for |
+|---|---|---|
+| `Retain` (also when omitted) | `deleteResources=false` | Keep the storage: it stays in your account, and is billed, until you delete it. |
+| `Delete` | `deleteResources=true`, as `ibmcloud ks cluster rm --delete-storage` | Delete the cluster's persistent storage. **Deleted data cannot be recovered.** VPC Block volumes may remain all the same (below), so check for them after the deletion. |
+
+IBM's documentation conflicts on what `Delete` removes:
+
+* [IBM: Removing Block Storage for VPC](https://cloud.ibm.com/docs/containers?topic=containers-storage-block-vpc-remove)
+  (last updated 2026-05-14) says that a cluster deleted with its persistent storage takes along the storage that a
+  storage class with `reclaimPolicy: Delete` provisioned.
+* [IBM: Removing clusters](https://cloud.ibm.com/docs/containers?topic=containers-remove) (last updated 2026-08-03), the
+  newer page, says in its removal steps: "VPC Block Storage is not removed automatically, even if you used a `Delete`
+  storage class."
+
+Both pages say that statically provisioned storage and storage of a storage class with `reclaimPolicy: Retain` remain,
+and are billed (IBM deletes only their PersistentVolume and PersistentVolumeClaim); the first adds that the storage of a
+cluster deleted in an unhealthy state may remain as well. Which volumes IBM deletes with `Delete` is not yet verified
+against IBM Cloud. So treat `Delete` as a request, not a guarantee: before you delete the Cluster, list its persistent
+volumes on the workload cluster, and after the deletion delete the VPC Block volumes that remain. The IBM VPC Block CSI
+driver names each volume after its PersistentVolume (`pvc-<uid>`), and the PersistentVolume's volume handle is the
+volume's ID:
+
+```console
+kubectl get pv -o custom-columns=NAME:.metadata.name,VOLUME_ID:.spec.csi.volumeHandle
+```
+
+On VPC, `Delete` asks for nothing else: IBM removes subnets with a cluster only on classic infrastructure
+([IBM: Removing clusters](https://cloud.ibm.com/docs/containers?topic=containers-remove)), and CAPIBM never deletes VPC
+resources. The ROKS registry bucket stays with either value ([below](#what-stays-behind)).
+
+The field is mutable; the templates set it from `DELETION_PERSISTENT_STORAGE` (default `Retain`). CAPIBM reads it each
+time it sends the `DELETE`, so set it **before** you delete the Cluster:
+
+```console
+kubectl patch ibmcmcp my-iks-control-plane -n default --type merge \
+  -p '{"spec":{"deletion":{"persistentStorage":"Delete"}}}'
+kubectl delete cluster my-iks -n default
+```
+
+A change made after CAPIBM sent its `DELETE` takes effect only if CAPIBM sends the `DELETE` again, which it does only
+when IBM does not show the cluster as deleting 10 minutes later. The `LeftoverResources` event reads the field when the
+cluster is gone, so after such a late change it names the new value, not the one the `DELETE` carried.
+
 ## What stays behind
 
-CAPIBM deletes the IBM cluster with `deleteResources=false`, and it only **references** your VPC, so some resources
-remain. The `LeftoverResources` event lists them by name.
+CAPIBM only **references** your VPC, so some resources remain after the IBM cluster is deleted. The
+`LeftoverResources` event lists them by name and says what CAPIBM's `DELETE` asked IBM to do with the cluster's
+storage.
 
 **Kept on purpose:**
 
-* VPC Block Storage volumes of the cluster's persistent volumes (`deleteResources=false`).
-* For ROKS, the internal registry bucket in your Cloud Object Storage instance.
+* With `spec.deletion.persistentStorage: Retain` (the default), the storage of the cluster's persistent volumes, such
+  as their VPC Block volumes. With `Delete`, the storage that IBM does not delete, which may include VPC Block volumes
+  ([above](#persistent-storage)).
+* For ROKS, the internal registry bucket in your Cloud Object Storage instance, with either value: IBM's `DELETE` can
+  delete it (`deleteOpenShiftRegistryCOSBucket`), but the IBM Cloud Kubernetes Service SDK that CAPIBM uses cannot send
+  that parameter yet. Delete the bucket yourself when you no longer need the registry's images.
+
+The event names only what CAPIBM asked for, never what IBM did with the storage. CAPIBM records the time of its
+`DELETE` before it sends it and keeps the time when the `DELETE` fails, so it cannot tell a `DELETE` that IBM accepted
+from one that IBM refused (for example with `403`) before the cluster was deleted elsewhere. So when CAPIBM sent a
+`DELETE`, the event adds that whoever deleted the cluster decided what happened to its storage if that `DELETE` failed
+or the cluster was deleted elsewhere. If the IBM cluster was deleted outside CAPIBM before CAPIBM sent any `DELETE`, for
+example in the IBM Cloud console, the event says that whoever deleted the cluster decided what happened to its storage.
 
 **Removed by IKS within about 10 minutes** of the cluster's disappearance (measured: all were gone at the first sample
 10 minutes after the 404, while nothing else in the VPC changed for 3 hours):

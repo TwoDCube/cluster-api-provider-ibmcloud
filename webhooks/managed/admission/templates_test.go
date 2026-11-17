@@ -133,6 +133,9 @@ type templateRendering struct {
 	workersPerZone  int32
 	workerFlavor    string
 	updatePolicy    infrav1.WorkerUpdatePolicy
+	// persistentStorage is the control plane's spec.deletion.persistentStorage: Retain unless the rendering asks for
+	// Delete, so that a cluster from an unmodified template never loses its data when it is deleted.
+	persistentStorage controlplanev1.PersistentStoragePolicy
 }
 
 // newTemplateRendering returns the variables of one rendering of flavor and what they must produce. Only the required
@@ -151,13 +154,14 @@ func newTemplateRendering(flavor managedTemplateFlavor, clusterName string, setO
 			"IBMCLOUD_VPC_NAME":          "test-vpc",
 			"COS_INSTANCE_CRN":           testCOSInstanceCRN,
 		},
-		clusterName:     clusterName,
-		resourceGroupID: testResourceGroupID,
-		version:         flavor.defaultVersion,
-		replicas:        flavor.defaultReplicas,
-		workersPerZone:  2,
-		workerFlavor:    flavor.defaultWorkerFlavor,
-		updatePolicy:    infrav1.WorkerUpdatePolicyManual,
+		clusterName:       clusterName,
+		resourceGroupID:   testResourceGroupID,
+		version:           flavor.defaultVersion,
+		replicas:          flavor.defaultReplicas,
+		workersPerZone:    2,
+		workerFlavor:      flavor.defaultWorkerFlavor,
+		updatePolicy:      infrav1.WorkerUpdatePolicyManual,
+		persistentStorage: controlplanev1.PersistentStorageRetain,
 	}
 	// The single-zone flavors read only the first slot; setting all three proves that they ignore the others.
 	for i := 1; i <= 3; i++ {
@@ -181,6 +185,8 @@ func newTemplateRendering(flavor managedTemplateFlavor, clusterName string, setO
 	r.variables["IBMCLOUD_WORKER_FLAVOR"] = r.workerFlavor
 	r.updatePolicy = infrav1.WorkerUpdatePolicyAutomatic
 	r.variables["WORKER_UPDATE_POLICY"] = string(r.updatePolicy)
+	r.persistentStorage = controlplanev1.PersistentStorageDelete
+	r.variables["DELETION_PERSISTENT_STORAGE"] = string(r.persistentStorage)
 	return r
 }
 
@@ -685,6 +691,7 @@ func expectManagedTemplateTopology(g *WithT, flavor managedTemplateFlavor, want 
 	wantControlPlane := controlplanev1.IBMCloudManagedControlPlaneSpec{
 		Distribution:        flavor.distribution,
 		DistributionVersion: want.version,
+		Deletion:            controlplanev1.DeletionSpec{PersistentStorage: want.persistentStorage},
 	}
 	if flavor.distribution == controlplanev1.DistributionOpenShift {
 		wantControlPlane.OpenShift = controlplanev1.OpenShiftSpec{ImageRegistry: controlplanev1.ImageRegistrySpec{

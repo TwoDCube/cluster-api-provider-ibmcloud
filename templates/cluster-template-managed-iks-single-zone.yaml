@@ -48,6 +48,11 @@ spec:
   distributionVersion: "${IKS_DISTRIBUTION_VERSION:=1.36}"   # MAJOR.MINOR only; IBM applies the newest patch
   # The IBM cluster is named after the Cluster, with an admission warning. To choose the name, see
   # https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/creating-a-cluster.html#naming-the-ibm-cluster
+  # What CAPIBM asks IBM to do with the persistent storage of the cluster when the cluster is deleted: Retain to keep
+  # it, Delete to delete it (deleted data cannot be recovered, yet VPC Block volumes may remain). See
+  # https://cluster-api-ibmcloud.sigs.k8s.io/topics/managed/deleting.html#persistent-storage
+  deletion:
+    persistentStorage: "${DELETION_PERSISTENT_STORAGE:=Retain}"
 ---
 apiVersion: cluster.x-k8s.io/v1beta2
 kind: MachinePool

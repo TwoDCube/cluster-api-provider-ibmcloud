@@ -134,6 +134,7 @@ same variables: `managed-roks` those of `managed-iks` plus `COS_INSTANCE_CRN`, `
 | `WORKER_MACHINE_COUNT` | `6` (HA flavors), `2` (single-zone flavors) | all | Total number of workers of the initial pool, a multiple of the zone count; set with `--worker-machine-count` (see below). |
 | `IBMCLOUD_WORKER_FLAVOR` | `cx2.2x4` (IKS), `bx2.4x16` (ROKS) | all | VPC worker flavor; ROKS needs at least 4 vCPU and 16 GB. Immutable: to change it, add a new pool and delete the old one. |
 | `WORKER_UPDATE_POLICY` | `Manual` | all | `Manual`: workers with a newer fix pack are replaced only after `spec.rollout.after` of the pool; `Automatic`: as soon as IBM offers the fix pack. |
+| `DELETION_PERSISTENT_STORAGE` | `Retain` | all | What CAPIBM asks IBM to do with the persistent storage of the cluster, such as the VPC Block volumes of its persistent volumes, when the Cluster is deleted: `Retain` asks IBM to keep it; `Delete` asks IBM to delete it, and deleted data cannot be recovered, but IBM's documentation conflicts on whether VPC Block volumes go with the cluster, so check for them after the deletion and delete those that remain. Sets `spec.deletion.persistentStorage` of the control plane, which can still be changed before the Cluster is deleted. The ROKS registry bucket is kept either way. |
 
 ### Notes
 

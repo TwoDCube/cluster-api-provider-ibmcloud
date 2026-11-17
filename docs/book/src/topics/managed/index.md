@@ -67,9 +67,10 @@ Use the clusterctl flavor templates described in [Topology and flavors](./topolo
 
 Not supported in this release (each one can be added later without breaking the API): worker pool labels and taints,
 adding or removing zones of a pool, cluster autoscaling (IBM's autoscaler add-on is detected and respected, but not
-configured), per-pool subnets and security groups, deletion options (CAPIBM keeps storage volumes and the ROKS registry
-bucket), private or VPE management endpoints, surge rollouts, `MachineDrainRule`, ClusterClass, and per-cluster
-credentials.
+configured), per-pool subnets and security groups, deleting the ROKS registry bucket with the cluster (CAPIBM keeps it;
+it asks IBM to keep or delete the persistent storage as
+[`spec.deletion.persistentStorage`](./deleting.md#persistent-storage) says), private or VPE management endpoints, surge
+rollouts, `MachineDrainRule`, ClusterClass, and per-cluster credentials.
 
 ## Status at a glance
 

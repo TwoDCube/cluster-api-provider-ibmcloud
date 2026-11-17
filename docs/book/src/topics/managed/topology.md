@@ -35,6 +35,7 @@ each one creates a `Cluster`, an `IBMCloudManagedCluster`, an `IBMCloudManagedCo
 | `WORKER_MACHINE_COUNT` | all | total workers of the initial pool across its zones; pass it as `--worker-machine-count` (6 for the HA flavors, 2 for the single-zone flavors). `clusterctl generate cluster` sets it to 0 when neither the flag nor the variable is given, so the template default (6 or 2) applies only to other renderers such as `envsubst` |
 | `IBMCLOUD_WORKER_FLAVOR` | all | VPC worker flavor (default `cx2.2x4` for IKS, `bx2.4x16` for ROKS; ROKS needs at least 4 vCPU and 16 GB) |
 | `WORKER_UPDATE_POLICY` | all | `Manual` (default) or `Automatic` fix-pack updates ([Upgrades](./upgrades.md#worker-fix-packs-and-the-update-policy)) |
+| `DELETION_PERSISTENT_STORAGE` | all | what CAPIBM asks IBM to do with the persistent storage of the cluster when it is deleted: `Retain` (default) to keep it, `Delete` to delete it, which cannot be undone but may leave VPC Block volumes behind, so check for them afterwards ([Deleting a cluster](./deleting.md#persistent-storage)) |
 
 The templates carry no credential variable: the API key belongs to the manager ([Prerequisites](./prerequisites.md)).
 They set neither `Cluster.spec.clusterNetwork` (IBM picks free pod and service ranges) nor `ibmCloudClusterName`
