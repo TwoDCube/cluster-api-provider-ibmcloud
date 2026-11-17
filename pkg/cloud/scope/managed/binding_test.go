@@ -29,6 +29,7 @@ import (
 
 	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/ibmclustername"
 )
 
 // The binding tests run every row of DecideBinding on scrubbed getCluster captures of live IKS and ROKS clusters
@@ -589,10 +590,21 @@ func TestEffectiveClusterName(t *testing.T) {
 	}{
 		{name: "spec.ibmCloudClusterName wins", ibmName: "prod-eu.cluster-1", clusterName: "dev", want: "prod-eu.cluster-1"},
 		{name: "Cluster name when omitted", clusterName: "dev-iks", want: "dev-iks"},
-		{name: "35 characters", clusterName: strings.Repeat("a", 35), want: strings.Repeat("a", 35)},
-		{name: "36 characters", clusterName: strings.Repeat("a", 36), wantErr: []string{"has 36 characters", "the Cluster's metadata.name", "set spec.ibmCloudClusterName"}},
-		{name: "Cluster name starting with a digit", clusterName: "1dev", wantErr: []string{`"1dev"`, "does not start with a letter"}},
-		{name: "invalid character", ibmName: "dev_iks", wantErr: []string{`contains '_'`, "taken from spec.ibmCloudClusterName"}},
+		{name: "32 characters, IBM's limit", clusterName: strings.Repeat("a", 32), want: strings.Repeat("a", 32)},
+		// The name IBM refused with HTTP 400, code E0125, when the controller still allowed 35 characters.
+		{name: "33-character Cluster name", clusterName: "example-test-cluster-e01-mgmt-iks", wantErr: []string{
+			`the IBM cluster name "example-test-cluster-e01-mgmt-iks", taken from the Cluster's metadata.name ` +
+				"(spec.ibmCloudClusterName is omitted), has 33 characters, more than 32; " + ibmclustername.Rule +
+				"; CAPIBM sends no request to IBM with this name, and spec.ibmCloudClusterName cannot be added or " +
+				"changed after creation, so delete this Cluster and create it again with spec.ibmCloudClusterName set " +
+				"to a name that follows the rule"}},
+		{name: "33-character spec.ibmCloudClusterName", ibmName: strings.Repeat("a", 33), clusterName: "dev",
+			wantErr: []string{"taken from spec.ibmCloudClusterName, has 33 characters"}},
+		{name: "Cluster name starting with a digit", clusterName: "1dev", wantErr: []string{`"1dev"`, "starts with '1' instead of a letter"}},
+		{name: "underscore and dot are IBM name characters", ibmName: "dev_iks.eu", clusterName: "dev", want: "dev_iks.eu"},
+		{name: "upper case is allowed", ibmName: "Dev-IKS", clusterName: "dev", want: "Dev-IKS"},
+		{name: "invalid character", ibmName: "dev iks", wantErr: []string{`contains ' '`, "taken from spec.ibmCloudClusterName"}},
+		{name: "unicode letter", ibmName: "clüster", wantErr: []string{`contains 'ü'`}},
 		{name: "both empty", wantErr: []string{"is empty"}},
 	}
 	for _, tc := range testCases {

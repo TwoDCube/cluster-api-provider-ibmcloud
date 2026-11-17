@@ -27,6 +27,7 @@ import (
 
 	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/ibmclustername"
 )
 
 // This file decides the binding of an IBMCloudManagedControlPlane: which IBM cluster ID it stands for (the rows that
@@ -51,65 +52,39 @@ const (
 	bindingProviderVPCGen2 = "vpc-gen2"
 )
 
-// ibmClusterNameMaxLength is the longest IBM cluster name: IBM allows 35 characters, the same limit as the CEL rule of
-// spec.ibmCloudClusterName.
-const ibmClusterNameMaxLength = 35
-
 // bindingDefaultPort is the port of an https URL that names none. It equals assumptions.go's defaultMasterPort, which
 // is added together with the kubeconfig step, so the binding keeps its own copy.
 const bindingDefaultPort = "443"
 
 // EffectiveClusterName returns the IBM cluster name of a control plane: spec.ibmCloudClusterName when set, otherwise
-// the CAPI Cluster's metadata.name. The API server already validated spec.ibmCloudClusterName, but a Cluster name is a
-// DNS-1123 name that IBM may refuse (it may start with a digit, or be longer than 35 characters), so the result is
-// checked against IBM's rule: a letter first, then letters, digits, '.' and '-', at most 35 characters.
+// the CAPI Cluster's metadata.name. The result is checked against IBM's cluster name rule (ibmclustername.Problem)
+// before any IBM call uses it, because IBM refuses createCluster for any other name (HTTP 400, code E0125), and a
+// name IBM refuses can never match an IBM cluster. The admission webhook checks the same rule, but it cannot always
+// tell the Cluster whose name is the default, and a Cluster name is a DNS-1123 name that may break IBM's rule (longer
+// than 32 characters, or a digit first); an explicit spec.ibmCloudClusterName reaches here unchecked only from an
+// object stored before the rule was enforced.
 //
 // Parameters:
 //   - ibmCloudClusterName: spec.ibmCloudClusterName of the IBMCloudManagedControlPlane; "" when omitted.
 //   - clusterName: metadata.name of the owning CAPI Cluster.
 //
-// It returns an error that names the value, IBM's rule and the field to set when the name is not acceptable; the
-// caller reports it as Terminal(InvalidConfiguration).
+// It returns an error that names the value, where it came from, what breaks IBM's rule, the rule and the fix when the
+// name is not acceptable; the caller reports it as Terminal(InvalidConfiguration).
 func EffectiveClusterName(ibmCloudClusterName, clusterName string) (string, error) {
 	name, source := ibmCloudClusterName, "spec.ibmCloudClusterName"
 	if name == "" {
 		name, source = clusterName, "the Cluster's metadata.name (spec.ibmCloudClusterName is omitted)"
 	}
-	if problem := ibmClusterNameProblem(name); problem != "" {
-		return "", fmt.Errorf("the IBM cluster name %q, taken from %s, %s; IBM cluster names start with a letter, "+
-			"contain only letters, digits, '.' and '-', and have at most %d characters; set spec.ibmCloudClusterName "+
-			"to such a name when you create the control plane", name, source, problem, ibmClusterNameMaxLength)
+	if problem := ibmclustername.Problem(name); problem != "" {
+		// Both sources are fixed for the life of the object: the Cluster's name is immutable, and
+		// spec.ibmCloudClusterName can be neither changed nor added after creation. The only fix is a new Cluster,
+		// which is cheap because CAPIBM never sent this name to IBM.
+		return "", fmt.Errorf("the IBM cluster name %q, taken from %s, %s; %s; CAPIBM sends no request to IBM "+
+			"with this name, and spec.ibmCloudClusterName cannot be added or changed after creation, so delete this "+
+			"Cluster and create it again with spec.ibmCloudClusterName set to a name that follows the rule",
+			name, source, problem, ibmclustername.Rule)
 	}
 	return name, nil
-}
-
-// ibmClusterNameProblem returns why name is not a valid IBM cluster name, or "" when it is.
-//
-// Parameters:
-//   - name: the candidate name.
-func ibmClusterNameProblem(name string) string {
-	switch {
-	case name == "":
-		return "is empty"
-	case len(name) > ibmClusterNameMaxLength:
-		return fmt.Sprintf("has %d characters", len(name))
-	case !bindingASCIILetter(rune(name[0])):
-		return "does not start with a letter"
-	}
-	for _, r := range name {
-		if !bindingASCIILetter(r) && (r < '0' || r > '9') && r != '.' && r != '-' {
-			return fmt.Sprintf("contains %q", r)
-		}
-	}
-	return ""
-}
-
-// bindingASCIILetter reports whether r is an ASCII letter.
-//
-// Parameters:
-//   - r: the character.
-func bindingASCIILetter(r rune) bool {
-	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
 }
 
 // OwnershipProof is the outcome of the proof of possession for a candidate of rows 2 and 5 (ProvesOwnership): the
