@@ -1268,7 +1268,7 @@ func newFlowIBM(t *testing.T, mock *ksmock.MockKubernetesService, clk clock.Pass
 	}
 	mock.EXPECT().GetCluster(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(ibm.getCluster).AnyTimes()
 	mock.EXPECT().CreateCluster(gomock.Any(), gomock.Any()).DoAndReturn(ibm.createCluster).AnyTimes()
-	mock.EXPECT().DeleteCluster(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(ibm.deleteCluster).AnyTimes()
+	mock.EXPECT().DeleteCluster(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(ibm.deleteCluster).AnyTimes()
 	mock.EXPECT().UpdateMaster(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(ibm.updateMaster).AnyTimes()
 	mock.EXPECT().ListVersions(gomock.Any()).DoAndReturn(ibm.listVersions).AnyTimes()
 	mock.EXPECT().GetAdminKubeconfig(gomock.Any(), gomock.Any()).DoAndReturn(ibm.getAdminKubeconfig).AnyTimes()
@@ -1409,8 +1409,9 @@ func (ibm *flowIBM) masterMinor() string {
 	return parts[0] + "." + parts[1]
 }
 
-// deleteCluster starts the deletion of the cluster.
-func (ibm *flowIBM) deleteCluster(_ context.Context, clusterID, _ string) error {
+// deleteCluster starts the deletion of the cluster. The flows do not model persistent storage, so the storage choice is
+// not recorded; the control plane delete tests check it.
+func (ibm *flowIBM) deleteCluster(_ context.Context, clusterID, _ string, _ kubernetesservice.PersistentStorage) error {
 	ibm.mu.Lock()
 	defer ibm.mu.Unlock()
 	ibm.record("DeleteCluster " + clusterID)
