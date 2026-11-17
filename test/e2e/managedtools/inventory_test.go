@@ -182,30 +182,72 @@ func TestVPCServiceListVPCResourcesRequestsAndPages(t *testing.T) {
 		{Kind: KindVolume, ID: "vol-2", Name: "pvc-2"},
 		{Kind: KindVolume, ID: "vol-3", Name: "pvc-3"},
 	}))
-	var volumePages int
 	for _, r := range fake.recorded() {
 		g.Expect(r.Method).To(Equal(http.MethodGet))
 		g.Expect(r.Header.Get("Authorization")).To(Equal("Bearer " + testToken))
 		g.Expect(r.Header.Get("User-Agent")).To(Equal(DefaultUserAgent))
-		if r.Path == "/v1/volumes" {
-			volumePages++
-		}
 	}
+	volumePages := fake.requestCount("/v1/volumes")
 	g.Expect(volumePages).To(Equal(3))
+	// Without WithLoadBalancerVPCs the four inventoried collections are all it asks for: no subnet listing.
+	g.Expect(fake.requestCount(subnetsPath)).To(BeZero())
 	g.Expect(len(fake.recorded())).To(Equal(len(vpcCollections) - 1 + volumePages))
 }
 
 func TestTakeSnapshotErrors(t *testing.T) {
-	g := NewWithT(t)
-	fake := newFakeIBM(t)
-	fake.listStatus = http.StatusInternalServerError
-	_, err := TakeSnapshot(context.Background(), fake.clusterService(""), fake.vpcService(""), janitorNow)
-	g.Expect(err).To(MatchError(ContainSubstring("inventory: listing clusters")))
+	lane, err := NewLaneScope(DefaultNamePrefix, laneRunID, testVPCID)
+	if err != nil {
+		t.Fatalf("building the lane scope: %v", err)
+	}
+	testCases := []struct {
+		name             string
+		scope            InventoryScope
+		listStatus       int
+		vpcStatus        int
+		collectionStatus map[string]int
+		// wantErr is a part of the expected error; "" expects the snapshot to succeed.
+		wantErr            string
+		wantSubnetRequests int
+	}{
+		{name: "account scope: the cluster listing fails", scope: AccountScope(), listStatus: http.StatusInternalServerError,
+			wantErr: "inventory: listing clusters"},
+		{name: "lane scope: the cluster listing fails", scope: lane, listStatus: http.StatusInternalServerError,
+			wantErr: "inventory: listing clusters"},
+		{name: "account scope lists no subnets, so its first VPC listing to fail is the load balancers'", scope: AccountScope(),
+			vpcStatus: http.StatusForbidden, wantErr: "inventory: listing VPC load balancers"},
+		{name: "lane scope lists the subnets first", scope: lane, vpcStatus: http.StatusForbidden,
+			wantErr: "inventory: listing VPC subnets", wantSubnetRequests: 1},
+		{name: "account scope does not depend on the subnet listing", scope: AccountScope(),
+			collectionStatus: map[string]int{"subnets": http.StatusForbidden}},
+		{name: "lane scope fails without the subnet listing", scope: lane,
+			collectionStatus: map[string]int{"subnets": http.StatusForbidden}, wantErr: "inventory: listing VPC subnets",
+			wantSubnetRequests: 1},
+		{name: "account scope: the load balancer listing fails", scope: AccountScope(),
+			collectionStatus: map[string]int{"load_balancers": http.StatusForbidden}, wantErr: "inventory: listing VPC load balancers"},
+		{name: "lane scope: the load balancer listing fails after the subnets", scope: lane,
+			collectionStatus: map[string]int{"load_balancers": http.StatusForbidden}, wantErr: "inventory: listing VPC load balancers",
+			wantSubnetRequests: 1},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeIBM(t)
+			fake.listStatus = tc.listStatus
+			fake.vpcStatus = tc.vpcStatus
+			for collection, status := range tc.collectionStatus {
+				fake.vpcCollectionStatus[collection] = status
+			}
 
-	fake.listStatus = 0
-	fake.vpcStatus = http.StatusForbidden
-	_, err = TakeSnapshot(context.Background(), fake.clusterService(""), fake.vpcService(""), janitorNow)
-	g.Expect(err).To(MatchError(ContainSubstring("inventory: listing VPC load balancers")))
+			_, err := TakeSnapshot(context.Background(), fake.clusterService(""), fake.inventoryVPCService("", tc.scope), janitorNow)
+
+			if tc.wantErr == "" {
+				g.Expect(err).NotTo(HaveOccurred())
+			} else {
+				g.Expect(err).To(MatchError(ContainSubstring(tc.wantErr)))
+			}
+			g.Expect(fake.requestCount(subnetsPath)).To(Equal(tc.wantSubnetRequests))
+		})
+	}
 }
 
 // resourceNames returns the resource names.

@@ -29,6 +29,10 @@ limitations under the License.
 //   - The inventory diff (inventory.go): a snapshot of clusters, VPC load balancers, VPE gateways, security groups
 //     and volumes before and after a run; the diff tolerates the shared iks-<service>-<vpcID> gateways and the
 //     kube-vpegw-<vpcID> security group that IBM keeps in a VPC for good (IBM documents this; observed on IBM Cloud).
+//   - The sharing switches (scope.go): E2E_MANAGED_JANITOR and E2E_MANAGED_LEFTOVER_SCOPE. By default the janitor and
+//     the inventory diff cover every e2e cluster and VPC resource of the resource group, which is right for an account
+//     that holds one managed run at a time. With the janitor off and the lane scope, a lane answers only for its run's
+//     clusters and the VPC resources of its own VPC, so it can run next to other runs that use VPCs of their own.
 //   - The disruption recorder (disruption.go) and the version helpers (versions.go): the pure parts of the
 //     PodDisruptionBudget probe and of the upgrade checks, so that the lanes only orchestrate.
 //   - The timeout limit (timeouts.go): it lowers every wait's timeout to the time left until the lane's hard timeout,

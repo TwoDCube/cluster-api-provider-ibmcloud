@@ -68,6 +68,21 @@ variables:
   # "<E2E_NAME_PREFIX>-..." that are older than 4 hours.
   E2E_NAME_PREFIX: "${E2E_NAME_PREFIX:-capibm-e2e}"
   E2E_RUN_ID: "${E2E_RUN_ID:-}"
+  # Sharing the e2e account with other runs. The defaults suit an account that holds one managed run at a time (CI: the
+  # Boskos lease of hack/scripts/ci/ci-e2e.sh): the janitor runs before every lane, and the final leftover check fails
+  # on any cluster, load balancer, VPE gateway, security group or volume created in the resource group since the lane
+  # started, whoever created it. Next to other runs the janitor would delete their clusters once they are 4 hours old,
+  # and the check would report their resources as the lane's, so a run that shares the account sets both switches:
+  #   E2E_MANAGED_JANITOR: "true" (default) or "false" (skip the janitor; crashed runs are then cleaned up by whoever
+  #     shares the account);
+  #   E2E_MANAGED_LEFTOVER_SCOPE: "account" (default) or "lane": the check then covers only the clusters named
+  #     "<E2E_NAME_PREFIX>-<E2E_RUN_ID>-..." and the load balancers, VPE gateways and security groups of the VPC
+  #     IBMCLOUD_VPC_NAME, so every concurrent run needs a run ID and a VPC of its own. Volumes are not checked in the
+  #     lane scope: IKS and ROKS create them only for PersistentVolumeClaims (the lanes create none), named pvc-<uid>
+  #     and tagged with nothing that names the cluster, so they must be checked account-wide after all runs.
+  # Any other value fails the lane before it creates anything.
+  E2E_MANAGED_JANITOR: "${E2E_MANAGED_JANITOR:-true}"
+  E2E_MANAGED_LEFTOVER_SCOPE: "${E2E_MANAGED_LEFTOVER_SCOPE:-account}"
   # The e2e VPC: an existing VPC with one existing subnet in each of three zones of the region (CAPIBM never creates
   # or deletes VPC resources). The ROKS lane reads the first zone and subnet.
   IBMCLOUD_REGION: "${IBMCLOUD_REGION:-}"

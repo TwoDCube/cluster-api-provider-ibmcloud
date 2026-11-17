@@ -53,8 +53,11 @@ import (
 
 // The managed Kubernetes lanes. Each lane is an Ordered container: one cluster per lane, created in the first spec,
 // exercised by the following ones and deleted in the last one; the cleanups that BeforeAll registers delete it in
-// every other outcome. A lane runs only when -e2e.flavor (E2E_FLAVOR) names its flavor, so one CI job runs one lane,
-// and the e2e account holds one run at a time (Boskos lease, ci-e2e.sh).
+// every other outcome. A lane runs only when -e2e.flavor (E2E_FLAVOR) names its flavor, so one CI job runs one lane.
+// By default a lane assumes that the e2e account holds one managed run at a time (the Boskos lease of ci-e2e.sh): its
+// janitor deletes stale e2e clusters of any run, and its leftover check covers the whole resource group.
+// E2E_MANAGED_JANITOR=false and E2E_MANAGED_LEFTOVER_SCOPE=lane let a lane share the account with other runs that
+// each use a VPC of their own (managedtools.InventoryScope).
 const (
 	// iksFlavor is the IKS lane's flavor: IBM's HA topology, 3 zones x 2 cx2.2x4 workers, the flavor's default, so
 	// that the lane tests what users get.
@@ -107,6 +110,7 @@ const (
 	varRunID           = "E2E_RUN_ID"
 	varRegion          = "IBMCLOUD_REGION"
 	varResourceGroupID = "IBMCLOUD_RESOURCE_GROUP_ID"
+	varVPCName         = "IBMCLOUD_VPC_NAME"
 	varIKSVersion      = "IKS_DISTRIBUTION_VERSION"
 	varIKSUpgradeTo    = "IKS_DISTRIBUTION_VERSION_UPGRADE_TO"
 	varContainersURL   = "IBMCLOUD_CONTAINERS_URL"
@@ -123,7 +127,7 @@ var _ = Describe("Managed Kubernetes (IKS and ROKS)", Label("managed"), func() {
 			Timeout:            iksLaneTimeout,
 			Identity:           ControllerIdentityFixture{},
 			MoveTargetIdentity: ControllerIdentityFixture{},
-			RequiredVariables: []string{varRegion, varResourceGroupID, "IBMCLOUD_VPC_NAME",
+			RequiredVariables: []string{varRegion, varResourceGroupID, varVPCName,
 				"IBMCLOUD_ZONE_1", "IBMCLOUD_ZONE_2", "IBMCLOUD_ZONE_3",
 				"IBMCLOUD_SUBNET_NAME_1", "IBMCLOUD_SUBNET_NAME_2", "IBMCLOUD_SUBNET_NAME_3",
 				varIKSVersion, varIKSUpgradeTo, varProbeImage},
@@ -149,7 +153,7 @@ var _ = Describe("Managed Kubernetes (IKS and ROKS)", Label("managed"), func() {
 			WorkerMachineCount: roksWorkerMachineCount,
 			Timeout:            roksLaneTimeout,
 			Identity:           ControllerIdentityFixture{},
-			RequiredVariables: []string{varRegion, varResourceGroupID, "IBMCLOUD_VPC_NAME", "IBMCLOUD_ZONE_1",
+			RequiredVariables: []string{varRegion, varResourceGroupID, varVPCName, "IBMCLOUD_ZONE_1",
 				"IBMCLOUD_SUBNET_NAME_1", "ROKS_DISTRIBUTION_VERSION", "COS_INSTANCE_CRN"},
 		}}
 		BeforeAll(lane.setUp)
@@ -210,13 +214,21 @@ type managedLane struct {
 	ibm           laneIBMClients
 	baseline      managedtools.Snapshot
 	baselineTaken bool
+
+	// janitor is E2E_MANAGED_JANITOR: whether setUp runs the janitor.
+	janitor bool
+	// leftoverScope is E2E_MANAGED_LEFTOVER_SCOPE; scope is built from it once the IBM clients exist.
+	leftoverScope managedtools.LeftoverScope
+	// scope is what the inventory baseline and the final leftover check cover.
+	scope managedtools.InventoryScope
 }
 
 // laneIBMClients are the lane's IBM clients, built with the identity fixture's authenticator.
 type laneIBMClients struct {
 	// clusters lists and deletes clusters for the janitor, the backstop and the inventory.
 	clusters *managedtools.ClusterService
-	// vpc lists the VPC resources for the inventory.
+	// vpc lists the VPC resources for the inventory; in the lane scope it also gives each load balancer its VPC
+	// (buildInventoryScope).
 	vpc *managedtools.VPCService
 	// service is CAPIBM's own IBM Cloud Kubernetes Service client, for the 404 assertion.
 	service kubernetesservice.KubernetesService
@@ -290,9 +302,9 @@ func variable(name, fallback string) string {
 	return fallback
 }
 
-// setUp validates the lane's configuration, runs the janitor, takes the inventory baseline, creates the namespace,
-// prepares the identity fixture and registers the cleanups. Every input problem fails here, before IBM is asked to
-// create anything.
+// setUp validates the lane's configuration, runs the janitor (unless E2E_MANAGED_JANITOR=false), sets the leftover
+// scope, takes the inventory baseline, creates the namespace, prepares the identity fixture and registers the cleanups.
+// Every input problem fails here, before IBM is asked to create anything.
 func (l *managedLane) setUp(specCtx SpecContext) {
 	Expect(e2eConfig).NotTo(BeNil(), "e2eConfig is required for the %s lane", l.input.Lane)
 	Expect(clusterctlConfigPath).To(BeAnExistingFile(), "clusterctlConfigPath must be an existing file")
@@ -323,6 +335,7 @@ func (l *managedLane) setUp(specCtx SpecContext) {
 	l.buildNames()
 	l.buildIBMClients()
 	l.runJanitor(ctx)
+	l.buildInventoryScope(ctx)
 	l.takeBaseline(ctx)
 
 	l.runStart = time.Now()
@@ -336,7 +349,8 @@ func (l *managedLane) setUp(specCtx SpecContext) {
 	l.clusterctlVariables = vars
 }
 
-// validateVariables fails unless every required variable is set and, for the IKS lane, the upgrade is one minor.
+// validateVariables fails unless every required variable is set, the janitor switch and the leftover scope are valid
+// and, for the IKS lane, the upgrade is one minor.
 func (l *managedLane) validateVariables() {
 	var missing []string
 	for _, name := range l.input.RequiredVariables {
@@ -346,6 +360,11 @@ func (l *managedLane) validateVariables() {
 	}
 	Expect(missing).To(BeEmpty(), "the %s lane needs these variables in the e2e config or the environment "+
 		"(test/e2e/config/ibmcloud-e2e-managed.yaml lists them): %v", l.input.Lane, missing)
+	var err error
+	l.janitor, err = managedtools.ParseJanitorSwitch(e2eConfig.GetVariableOrEmpty(managedtools.JanitorVariable))
+	Expect(err).NotTo(HaveOccurred())
+	l.leftoverScope, err = managedtools.ParseLeftoverScope(e2eConfig.GetVariableOrEmpty(managedtools.LeftoverScopeVariable))
+	Expect(err).NotTo(HaveOccurred())
 	if l.input.Lane == managedtools.LaneIKS {
 		Expect(managedtools.ValidateUpgradeStep(e2eConfig.GetVariableOrEmpty(varIKSVersion),
 			e2eConfig.GetVariableOrEmpty(varIKSUpgradeTo))).To(Succeed())
@@ -392,8 +411,15 @@ func (l *managedLane) buildIBMClients() {
 }
 
 // runJanitor deletes, by ID, the clusters of earlier runs that are older than managedtools.JanitorMinimumAge. A
-// failure stops the lane: a stale cluster nobody can delete costs money until an operator looks at it.
+// failure stops the lane: a stale cluster nobody can delete costs money until an operator looks at it. With
+// E2E_MANAGED_JANITOR=false it deletes nothing: in an account shared with other runs, an old cluster with the e2e
+// prefix may belong to a run that is still going, and whoever shares the account cleans up the crashed runs instead.
 func (l *managedLane) runJanitor(ctx context.Context) {
+	if !l.janitor {
+		Byf("Skipping the janitor (%s=false): the account is shared with other runs, whose clusters it must not delete",
+			managedtools.JanitorVariable)
+		return
+	}
 	report, err := managedtools.RunJanitor(ctx, l.ibm.clusters, managedtools.JanitorOptions{
 		NamePrefix: l.namePrefix,
 		MinAge:     managedtools.JanitorMinimumAge,
@@ -403,12 +429,50 @@ func (l *managedLane) runJanitor(ctx context.Context) {
 	Expect(err).NotTo(HaveOccurred(), "the janitor could not delete every stale e2e cluster")
 }
 
+// buildInventoryScope sets what the inventory baseline and the final leftover check cover: the whole resource group
+// (E2E_MANAGED_LEFTOVER_SCOPE=account), or only the run's own clusters and the VPC resources of the lane's VPC (lane),
+// for which it resolves IBMCLOUD_VPC_NAME to the VPC's ID and switches the VPC client to attributing load balancers to
+// their VPC.
+//
+// Parameters:
+//   - ctx bounds the VPC lookup.
+func (l *managedLane) buildInventoryScope(ctx context.Context) {
+	l.scope = managedtools.AccountScope()
+	if l.leftoverScope == managedtools.LeftoverScopeLane {
+		vpcID, err := l.ibm.vpc.ResolveVPCID(ctx, e2eConfig.GetVariableOrEmpty(varVPCName))
+		Expect(err).NotTo(HaveOccurred(), "%s=lane needs the ID of the lane's VPC", managedtools.LeftoverScopeVariable)
+		id, err := runID()
+		Expect(err).NotTo(HaveOccurred())
+		l.scope, err = managedtools.NewLaneScope(l.namePrefix, id, vpcID)
+		Expect(err).NotTo(HaveOccurred())
+	}
+	// Set before the baseline, so that the baseline and every later snapshot see load balancers the same way. Only
+	// the lane scope pays for listing the region's subnets: the account scope keeps every load balancer anyway.
+	if l.scope.NeedsLoadBalancerVPCs() {
+		l.ibm.vpc = l.ibm.vpc.WithLoadBalancerVPCs()
+	}
+	Byf("Leftover check of the %s lane: %s", l.input.Lane, l.scope)
+}
+
 // takeBaseline takes the inventory snapshot that the final diff compares with.
 func (l *managedLane) takeBaseline(ctx context.Context) {
 	var err error
-	l.baseline, err = managedtools.TakeSnapshot(ctx, l.ibm.clusters, l.ibm.vpc, time.Now())
+	l.baseline, err = l.snapshot(ctx)
 	Expect(err).NotTo(HaveOccurred())
 	l.baselineTaken = true
+}
+
+// snapshot takes an inventory snapshot and keeps only the resources of the lane's leftover scope. The baseline and the
+// final diff both come from here, so they always cover the same resources.
+//
+// Parameters:
+//   - ctx bounds the requests.
+func (l *managedLane) snapshot(ctx context.Context) (managedtools.Snapshot, error) {
+	snapshot, err := managedtools.TakeSnapshot(ctx, l.ibm.clusters, l.ibm.vpc, time.Now())
+	if err != nil {
+		return managedtools.Snapshot{}, err
+	}
+	return l.scope.Apply(snapshot), nil
 }
 
 // create applies the lane's flavor and waits for the control plane and the initial MachinePool.
@@ -945,8 +1009,13 @@ func (l *managedLane) ibmBackstop(ctx SpecContext) {
 		return
 	}
 	if skipCleanup {
-		Byf("Skipping the IBM backstop (-e2e.skip-resource-cleanup); the janitor deletes %s after %s",
-			l.clusterName, managedtools.JanitorMinimumAge)
+		if l.janitor {
+			Byf("Skipping the IBM backstop (-e2e.skip-resource-cleanup); the janitor deletes %s after %s",
+				l.clusterName, managedtools.JanitorMinimumAge)
+		} else {
+			Byf("Skipping the IBM backstop (-e2e.skip-resource-cleanup); the janitor is off (%s=false), so %s stays "+
+				"until whoever shares the account deletes it", managedtools.JanitorVariable, l.clusterName)
+		}
 		return
 	}
 	report, err := managedtools.DeleteRunClusters(ctx, l.ibm.clusters, []string{l.clusterName}, l.runStart, false)
@@ -957,8 +1026,8 @@ func (l *managedLane) ibmBackstop(ctx SpecContext) {
 	}
 }
 
-// finalCleanup compares the inventory with the baseline until the run left nothing behind, then tears down the
-// identity fixture and the move target.
+// finalCleanup compares the inventory with the baseline, within the lane's leftover scope, until the run left nothing
+// behind, then tears down the identity fixture and the move target.
 func (l *managedLane) finalCleanup(ctx SpecContext) {
 	defer l.disposeMoveTarget(ctx)
 	defer l.teardownIdentity(ctx)
@@ -967,7 +1036,7 @@ func (l *managedLane) finalCleanup(ctx SpecContext) {
 	}
 	Byf("Comparing the IBM inventory with the baseline of %s", l.baseline.TakenAt.Format(time.RFC3339))
 	eventually(ctx, func(g Gomega) {
-		after, err := managedtools.TakeSnapshot(ctx, l.ibm.clusters, l.ibm.vpc, time.Now())
+		after, err := l.snapshot(ctx)
 		g.Expect(err).NotTo(HaveOccurred())
 		diff := managedtools.Diff(l.baseline, after)
 		g.Expect(diff.Clean()).To(BeTrue(), "resources the run left behind (IKS removes per-cluster ones within "+

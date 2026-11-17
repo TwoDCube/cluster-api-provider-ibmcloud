@@ -18,8 +18,10 @@ package managedtools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/IBM/go-sdk-core/v5/core"
 	"github.com/IBM/vpc-go-sdk/vpcv1"
@@ -49,7 +51,10 @@ type Resource struct {
 	ID string
 	// Name is the resource name.
 	Name string
-	// VPCID is the ID of the VPC the resource belongs to; "" for kinds without one (clusters, load balancers, volumes).
+	// VPCID is the ID of the VPC the resource belongs to: the VPC reference of a VPE gateway or security group, and,
+	// from a VPCService built with WithLoadBalancerVPCs, the VPC of a load balancer's subnets (the VPC API gives a load
+	// balancer no VPC reference). It is "" for clusters and volumes, which belong to no VPC, for every load balancer of
+	// a VPCService without WithLoadBalancerVPCs, and for a load balancer whose subnets are not in the subnet listing.
 	VPCID string
 }
 
@@ -66,6 +71,9 @@ type VPCService struct {
 	sdk *vpcv1.VpcV1
 	// resourceGroupID, when not empty, keeps only the resources of that resource group.
 	resourceGroupID string
+	// loadBalancerVPCs, set by WithLoadBalancerVPCs, makes ListVPCResources list the region's subnets and give each
+	// load balancer the VPC of its subnets.
+	loadBalancerVPCs bool
 }
 
 var _ VPCResourceLister = &VPCService{}
@@ -92,11 +100,37 @@ func NewVPCService(opts ClientOptions) (*VPCService, error) {
 	return &VPCService{sdk: sdk, resourceGroupID: opts.ResourceGroupID}, nil
 }
 
+// WithLoadBalancerVPCs returns a copy of s whose ListVPCResources also gives every load balancer the VPC of its
+// subnets (Resource.VPCID), at the cost of listing every subnet of the region on each call. Only a leftover check that
+// selects load balancers by VPC needs it (InventoryScope.NeedsLoadBalancerVPCs); without it ListVPCResources makes
+// exactly the four requests of the inventoried kinds (and their pages), so the account scope that CI uses pays for no
+// listing it would not read. s itself is unchanged.
+func (s *VPCService) WithLoadBalancerVPCs() *VPCService {
+	attributing := *s
+	attributing.loadBalancerVPCs = true
+	return &attributing
+}
+
 // ListVPCResources implements VPCResourceLister. It follows every page of the four collections. The VPC API filters
 // only some collections by resource group, so the filter is applied here, the same way for all four.
+//
+// A load balancer has no VPC reference, only subnets, so with WithLoadBalancerVPCs the subnets of the region are
+// listed first and a load balancer's VPCID is the VPC of its subnets. That listing is not filtered by resource group:
+// a load balancer of the resource group may use subnets of another one, and the map only attributes resources, it
+// never adds any. Without WithLoadBalancerVPCs no subnet is listed and every load balancer's VPCID stays "".
 func (s *VPCService) ListVPCResources(ctx context.Context) ([]Resource, error) {
+	var subnetVPCs map[string]string
+	if s.loadBalancerVPCs {
+		var err error
+		if subnetVPCs, err = s.subnetVPCs(ctx); err != nil {
+			return nil, err
+		}
+	}
+	listLoadBalancers := func(ctx context.Context) ([]Resource, error) {
+		return s.listLoadBalancers(ctx, subnetVPCs)
+	}
 	listers := []func(context.Context) ([]Resource, error){
-		s.listLoadBalancers, s.listEndpointGateways, s.listSecurityGroups, s.listVolumes,
+		listLoadBalancers, s.listEndpointGateways, s.listSecurityGroups, s.listVolumes,
 	}
 	var all []Resource
 	for _, list := range listers {
@@ -109,8 +143,12 @@ func (s *VPCService) ListVPCResources(ctx context.Context) ([]Resource, error) {
 	return all, nil
 }
 
-// listLoadBalancers returns every load balancer of the resource group.
-func (s *VPCService) listLoadBalancers(ctx context.Context) ([]Resource, error) {
+// listLoadBalancers returns every load balancer of the resource group, each with the VPC of its subnets.
+//
+// Parameters:
+//   - ctx bounds the requests.
+//   - subnetVPCs maps subnet IDs to VPC IDs (subnetVPCs); nil, without WithLoadBalancerVPCs, leaves every VPCID "".
+func (s *VPCService) listLoadBalancers(ctx context.Context, subnetVPCs map[string]string) ([]Resource, error) {
 	pager, err := s.sdk.NewLoadBalancersPager(&vpcv1.ListLoadBalancersOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("listing VPC load balancers: %w", err)
@@ -122,10 +160,93 @@ func (s *VPCService) listLoadBalancers(ctx context.Context) ([]Resource, error) 
 	var resources []Resource
 	for i := range items {
 		if s.inScope(items[i].ResourceGroup) {
-			resources = append(resources, Resource{Kind: KindLoadBalancer, ID: deref(items[i].ID), Name: deref(items[i].Name)})
+			resources = append(resources, Resource{Kind: KindLoadBalancer, ID: deref(items[i].ID), Name: deref(items[i].Name),
+				VPCID: loadBalancerVPC(items[i].Subnets, subnetVPCs)})
 		}
 	}
 	return resources, nil
+}
+
+// subnetVPCs maps the ID of every subnet of the region that the credentials can see to the ID of its VPC.
+//
+// Parameters:
+//   - ctx bounds the requests.
+func (s *VPCService) subnetVPCs(ctx context.Context) (map[string]string, error) {
+	pager, err := s.sdk.NewSubnetsPager(&vpcv1.ListSubnetsOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("listing VPC subnets: %w", err)
+	}
+	items, err := pager.GetAllWithContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing VPC subnets: %w", err)
+	}
+	vpcs := make(map[string]string, len(items))
+	for i := range items {
+		if id := deref(items[i].ID); id != "" {
+			vpcs[id] = vpcID(items[i].VPC)
+		}
+	}
+	return vpcs, nil
+}
+
+// loadBalancerVPC returns the VPC of a load balancer's subnets. IBM places all subnets of a load balancer in one VPC;
+// should the known subnets still name two VPCs, or none be known, it returns "", so that the load balancer is
+// attributed to no VPC rather than to a guessed one.
+//
+// Parameters:
+//   - subnets are the load balancer's subnet references.
+//   - subnetVPCs maps subnet IDs to VPC IDs (subnetVPCs).
+func loadBalancerVPC(subnets []vpcv1.SubnetReference, subnetVPCs map[string]string) string {
+	found := ""
+	for i := range subnets {
+		vpc := subnetVPCs[deref(subnets[i].ID)]
+		switch {
+		case vpc == "":
+		case found == "":
+			found = vpc
+		case found != vpc:
+			return ""
+		}
+	}
+	return found
+}
+
+// ResolveVPCID returns the ID of the VPC named name in the region, found the way CAPIBM finds spec.vpc by name: among
+// all VPCs of the region, whatever their resource group (IBM keeps VPC names unique per region). A name that matches
+// several VPCs is still refused rather than guessed.
+//
+// Parameters:
+//   - ctx bounds the requests.
+//   - name is IBMCLOUD_VPC_NAME, the name of the existing e2e VPC.
+func (s *VPCService) ResolveVPCID(ctx context.Context, name string) (string, error) {
+	if name == "" {
+		return "", errors.New("resolving the e2e VPC: IBMCLOUD_VPC_NAME is empty; set it to the name of the existing e2e VPC")
+	}
+	pager, err := s.sdk.NewVpcsPager(&vpcv1.ListVpcsOptions{})
+	if err != nil {
+		return "", fmt.Errorf("resolving the e2e VPC %q: listing VPCs: %w", name, err)
+	}
+	items, err := pager.GetAllWithContext(ctx)
+	if err != nil {
+		return "", fmt.Errorf("resolving the e2e VPC %q: listing VPCs: %w", name, err)
+	}
+	var ids []string
+	for i := range items {
+		if deref(items[i].Name) == name {
+			ids = append(ids, deref(items[i].ID))
+		}
+	}
+	switch {
+	case len(ids) == 0:
+		return "", fmt.Errorf("resolving the e2e VPC: no VPC of the region is named %q; set IBMCLOUD_VPC_NAME to the "+
+			"name of the existing e2e VPC (the VPC endpoint selects the region)", name)
+	case len(ids) > 1:
+		return "", fmt.Errorf("resolving the e2e VPC: %d VPCs are named %q (IDs %s); rename all but one", len(ids), name,
+			strings.Join(ids, ", "))
+	case ids[0] == "":
+		return "", fmt.Errorf("resolving the e2e VPC: IBM listed the VPC %q without an ID", name)
+	}
+	return ids[0], nil
 }
 
 // listEndpointGateways returns every VPE gateway of the resource group.

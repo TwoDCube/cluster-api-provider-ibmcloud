@@ -32,8 +32,12 @@ import (
 // testToken is the bearer token of the tests' authenticator; every request must carry it.
 const testToken = "e2e-test-token" //nolint:gosec // G101: a fixed test value, not a credential.
 
-// vpcCollections are the VPC collections the inventory lists, by URL path segment.
+// vpcCollections are the VPC collections the inventory lists, by URL path segment. A VPCService built with
+// WithLoadBalancerVPCs lists the subnets (subnetsPath) first.
 var vpcCollections = []string{"load_balancers", "endpoint_gateways", "security_groups", "volumes"}
+
+// subnetsPath is the path of the subnet listing, which only a VPCService built with WithLoadBalancerVPCs requests.
+const subnetsPath = "/v1/subnets"
 
 // recordedRequest is one request the fake IBM server received.
 type recordedRequest struct {
@@ -62,6 +66,9 @@ type fakeIBM struct {
 	vpc map[string][]map[string]any
 	// vpcStatus, when not 0, is the status of every VPC answer.
 	vpcStatus int
+	// vpcCollectionStatus maps a VPC collection to the status of its answers, so that one listing fails while the
+	// others answer; missing collections answer normally.
+	vpcCollectionStatus map[string]int
 	// pageSize is the number of VPC items per page; 0 means all on one page.
 	pageSize int
 }
@@ -72,7 +79,8 @@ type fakeIBM struct {
 //   - t is the test.
 func newFakeIBM(t *testing.T) *fakeIBM {
 	t.Helper()
-	f := &fakeIBM{t: t, deleteStatus: map[string]int{}, vpc: map[string][]map[string]any{}}
+	f := &fakeIBM{t: t, deleteStatus: map[string]int{}, vpc: map[string][]map[string]any{},
+		vpcCollectionStatus: map[string]int{}}
 	f.server = httptest.NewTLSServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.server.Close)
 	return f
@@ -115,6 +123,34 @@ func (f *fakeIBM) vpcService(resourceGroupID string) *VPCService {
 		f.t.Fatalf("building the VPC service: %v", err)
 	}
 	return service
+}
+
+// inventoryVPCService returns the VPCService a lane with the scope scope snapshots with: like the e2e suite's
+// buildInventoryScope, it attributes load balancers to their VPC only when the scope needs it.
+//
+// Parameters:
+//   - resourceGroupID is the optional resource group scope.
+//   - scope is the lane's leftover scope.
+func (f *fakeIBM) inventoryVPCService(resourceGroupID string, scope InventoryScope) *VPCService {
+	service := f.vpcService(resourceGroupID)
+	if scope.NeedsLoadBalancerVPCs() {
+		return service.WithLoadBalancerVPCs()
+	}
+	return service
+}
+
+// requestCount returns how many requests for path the fake server received (every page counts).
+//
+// Parameters:
+//   - path is the request path, for example subnetsPath.
+func (f *fakeIBM) requestCount(path string) int {
+	count := 0
+	for _, r := range f.recorded() {
+		if r.Path == path {
+			count++
+		}
+	}
+	return count
 }
 
 // recorded returns a copy of the recorded requests.
@@ -174,6 +210,10 @@ func (f *fakeIBM) serve(w http.ResponseWriter, r *http.Request) {
 func (f *fakeIBM) serveVPC(w http.ResponseWriter, r *http.Request, collection string) {
 	if f.vpcStatus != 0 {
 		writeError(w, f.vpcStatus)
+		return
+	}
+	if status := f.vpcCollectionStatus[collection]; status != 0 {
+		writeError(w, status)
 		return
 	}
 	items := f.vpc[collection]
@@ -251,5 +291,22 @@ func vpcItem(id, name, resourceGroupID, vpcID string) map[string]any {
 	if vpcID != "" {
 		item["vpc"] = map[string]any{"id": vpcID}
 	}
+	return item
+}
+
+// loadBalancerItem returns one item of the load balancer collection: like the VPC API, it has no VPC reference, only
+// subnets.
+//
+// Parameters:
+//   - id and name are the load balancer's fields.
+//   - resourceGroupID is its resource group.
+//   - subnetIDs are the IDs of its subnets.
+func loadBalancerItem(id, name, resourceGroupID string, subnetIDs ...string) map[string]any {
+	item := vpcItem(id, name, resourceGroupID, "")
+	subnets := make([]map[string]any, 0, len(subnetIDs))
+	for _, subnetID := range subnetIDs {
+		subnets = append(subnets, map[string]any{"id": subnetID})
+	}
+	item["subnets"] = subnets
 	return item
 }
