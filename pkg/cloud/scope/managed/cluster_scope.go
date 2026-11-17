@@ -500,11 +500,13 @@ func (s *ClusterScope) publish(vpcFound *vpcv1.VPC, zones []infrav1.ResolvedZone
 
 // callProblem turns a failed VPC or Resource Manager call into a networkProblem. Messages carry the status code but
 // no IBM free text and no trace ID, so a repeated failure writes nothing new; the returned outcome carries the full
-// error for the controller log.
+// error for the controller log. A call the IAM token service refused to authorize (errIAMRejectedCredentials, which
+// the clients of ProdClientBuilder return) is reported before any status: it never reached the service, so neither the
+// service's status nor its required role says anything about it.
 //
 // Parameters:
-//   - identity is the identity the call was made with; 401 invalidates its authenticator, and credential messages
-//     name it by its description.
+//   - identity is the identity the call was made with; 401 and an IAM refusal invalidate its authenticator, and
+//     credential messages name it by its description.
 //   - action says what the call did, for example "getting VPC r006-...".
 //   - role is the IAM role the call's service needs (resourceGroupRole or vpcRole); a 403 message asks for it.
 //   - response is the SDK's DetailedResponse (may be nil).
@@ -521,6 +523,17 @@ func (s *ClusterScope) callProblem(identity credentials.Identity, action, role s
 	}
 	reason := infrav1.IBMCloudManagedClusterNetworkReadyIBMAPIErrorReason
 	switch {
+	case errors.Is(err, errIAMRejectedCredentials):
+		// Like a 401: only this identity's authenticator is rebuilt, which re-reads a rotated key, and the next attempt
+		// follows at the steady interval. It is not transient, so a True NetworkReady shows the broken credentials.
+		s.params.ClientBuilder.InvalidateAuthenticator(identity.Key)
+		return &networkProblem{
+			reason: reason,
+			message: fmt.Sprintf("The IAM token service of IBM Cloud rejected the credentials of %s while %s, so the request was "+
+				"not sent; CAPIBM rebuilds its authenticator and retries in about 5 minutes; check that the API key of %s "+
+				"is valid and not deleted", identity.Description, action, identity.Description),
+			outcome: NotDone(IntervalSteadyState, reason),
+		}
 	case status == http.StatusNotFound && notFound != nil:
 		notFound.outcome = Terminal(notFound.reason, notFound.message)
 		return notFound

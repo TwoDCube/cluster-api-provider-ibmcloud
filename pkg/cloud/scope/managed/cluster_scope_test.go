@@ -19,8 +19,11 @@ package managed
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/IBM/go-sdk-core/v5/core"
 	"github.com/IBM/platform-services-go-sdk/resourcemanagerv2"
@@ -29,6 +32,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
+	clocktesting "k8s.io/utils/clock/testing"
 	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -38,6 +42,7 @@ import (
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/v1alpha1"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/credentials"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/endpoints"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/resourcemanager"
 	rmmock "sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/resourcemanager/mock"
@@ -554,6 +559,84 @@ func TestReconcileNetworkClassifiesIBMErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// iamRejectedMessage is the NetworkReady message of a call that the IAM token service refused to authorize.
+const iamRejectedMessage = "The IAM token service of IBM Cloud rejected the credentials of the test identity iam while %s, so " +
+	"the request was not sent; CAPIBM rebuilds its authenticator and retries in about 5 minutes; check that the API key " +
+	"of the test identity iam is valid and not deleted"
+
+// TestReconcileNetworkReportsIAMRejection runs ReconcileNetwork with the production client builder against an IAM token
+// service that refuses the API key. go-sdk-core hands the token service's answer to a Resource Manager call as if that
+// service had answered, so without the builder's separation a deleted key read as "HTTP 400 ...; CAPIBM retries" for
+// ever and an IAM 403 as a missing Viewer role, and nothing rebuilt the authenticator. A NetworkReady that was True
+// turns False, so that the broken credentials show.
+func TestReconcileNetworkReportsIAMRejection(t *testing.T) {
+	for _, iamStatus := range []int{http.StatusBadRequest, http.StatusForbidden} {
+		for _, readyBefore := range []bool{false, true} {
+			t.Run(fmt.Sprintf("IAM %d, NetworkReady True before: %t", iamStatus, readyBefore), func(t *testing.T) {
+				g := NewWithT(t)
+				iamServer := httptest.NewServer(&iamTokenAnswer{status: iamStatus})
+				t.Cleanup(iamServer.Close)
+				service := &countingHandler{}
+				serviceServer := httptest.NewServer(service)
+				t.Cleanup(serviceServer.Close)
+				clk := clocktesting.NewFakeClock(time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC))
+				opts := validBuilderOptions(clk, &countingSource{prefix: "controller"}, &countingLimiter{})
+				opts.ServiceEndpoints = []endpoints.ServiceEndpoint{{ID: string(endpoints.VPC), Region: testRegion, URL: serviceServer.URL + "/v1"}}
+				builder, err := NewProdClientBuilder(opts)
+				g.Expect(err).NotTo(HaveOccurred())
+				builder.resourceManagerURL = serviceServer.URL
+				id := sourcedIdentity("iam", "1", iamSource{url: iamServer.URL})
+				infra := testInfra()
+				if readyBefore {
+					conditions.Set(infra, metav1.Condition{
+						Type: infrav1.IBMCloudManagedClusterNetworkReadyCondition, Status: metav1.ConditionTrue, Reason: infrav1.IBMCloudManagedClusterNetworkReadyReason,
+					})
+				}
+				scope, err := NewClusterScope(&ScopeParams{Resolver: &recordingResolver{identity: id}, ClientBuilder: builder},
+					&clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "dev"}}, infra)
+				g.Expect(err).NotTo(HaveOccurred())
+
+				outcome := scope.ReconcileNetwork(context.Background())
+
+				g.Expect(outcome.Kind).To(Equal(OutcomeNotDone))
+				g.Expect(outcome.Interval).To(Equal(IntervalSteadyState))
+				condition := networkReady(infra)
+				g.Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+				g.Expect(condition.Reason).To(Equal(infrav1.IBMCloudManagedClusterNetworkReadyIBMAPIErrorReason))
+				g.Expect(condition.Message).To(Equal(fmt.Sprintf(iamRejectedMessage, "getting resource group "+testResourceGroupID)))
+				builder.mu.Lock()
+				invalidated := builder.auths[id.Key].invalidated
+				builder.mu.Unlock()
+				g.Expect(invalidated).To(BeTrue(), "the next request rebuilds the authenticator, which re-reads a rotated key")
+				g.Expect(service.requests.Load()).To(BeZero(), "Resource Manager never saw the request")
+			})
+		}
+	}
+}
+
+// TestReconcileNetworkReportsIAMRejectionOfVPCCalls covers the VPC calls, which follow the resource group check: their
+// IAM refusal names the VPC call and never asks for the VPC role, which would not help.
+func TestReconcileNetworkReportsIAMRejectionOfVPCCalls(t *testing.T) {
+	g := NewWithT(t)
+	infra := testInfra()
+	f := newScopeFixture(t, infra)
+	f.resolver.identity = sourcedIdentity("iam", "1", &countingSource{prefix: "iam"})
+	f.expectResourceGroup(nil, nil)
+	refusal := iamRejection(&core.AuthenticationError{Err: errors.New("the IAM token service answered BXNIM0415E"),
+		HTTPProblem: &core.HTTPProblem{IBMProblem: &core.IBMProblem{Summary: "Provided API key could not be found."},
+			Response: &core.DetailedResponse{StatusCode: http.StatusForbidden}}})
+	f.expectVPCByID(nil, nil, refusal)
+
+	outcome := f.scope.ReconcileNetwork(context.Background())
+
+	g.Expect(outcome.Kind).To(Equal(OutcomeNotDone))
+	g.Expect(outcome.Interval).To(Equal(IntervalSteadyState))
+	condition := networkReady(infra)
+	g.Expect(condition.Message).To(Equal(fmt.Sprintf(iamRejectedMessage, "getting VPC "+testVPCID)))
+	g.Expect(condition.Message).NotTo(ContainSubstring(vpcRole))
+	g.Expect(f.builder.invalidated).To(Equal([]credentials.IdentityKey{f.resolver.identity.Key}))
 }
 
 func TestReconcileNetworkProvisionedIsSticky(t *testing.T) {

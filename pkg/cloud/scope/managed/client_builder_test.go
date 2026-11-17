@@ -38,6 +38,7 @@ import (
 
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/credentials"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/endpoints"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
 
 	. "github.com/onsi/gomega"
 )
@@ -745,4 +746,176 @@ func TestNewResourceManager(t *testing.T) {
 			g.Expect(client).NotTo(BeNil())
 		})
 	}
+}
+
+// iamTokenAnswer is an httptest handler that plays the IAM token service: it answers every token request with status
+// and an IAM error body, and counts the requests.
+type iamTokenAnswer struct {
+	status   int
+	requests atomic.Int32
+}
+
+// ServeHTTP implements http.Handler.
+func (a *iamTokenAnswer) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	a.requests.Add(1)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(a.status)
+	_, _ = w.Write([]byte(`{"errorCode":"BXNIM0415E","errorMessage":"Provided API key could not be found."}`))
+}
+
+// iamSource is a credentials.CredentialSource whose authenticator is a real go-sdk-core IAM authenticator that asks the
+// token service at url, so that a test sees exactly what go-sdk-core makes of the token service's answer.
+type iamSource struct {
+	url string
+}
+
+// NewAuthenticator implements credentials.CredentialSource.
+func (s iamSource) NewAuthenticator() (core.Authenticator, error) {
+	return core.NewIamAuthenticatorBuilder().SetApiKey("test-api-key").SetURL(s.url).Build()
+}
+
+// countingHandler counts the requests that reached a service; the IAM tests expect none.
+type countingHandler struct {
+	requests atomic.Int32
+}
+
+// ServeHTTP implements http.Handler.
+func (h *countingHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	h.requests.Add(1)
+	w.WriteHeader(http.StatusInternalServerError)
+}
+
+// TestProdClientBuilderSeparatesIAMRejections sends one request of each client through go-sdk-core against an IAM
+// token service that refuses the API key. The VPC and Resource Manager clients must return errIAMRejectedCredentials
+// and no response, because go-sdk-core would otherwise hand them IAM's status as if their own service had answered (a
+// deleted key would read as a VPC 400). The IKS client keeps its own handling of the same answer
+// (kubernetesservice.ErrCredentialsRejected). An unavailable token service (503) is no refusal and stays as it is.
+func TestProdClientBuilderSeparatesIAMRejections(t *testing.T) {
+	for _, iamStatus := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusServiceUnavailable} {
+		t.Run(fmt.Sprintf("IAM answers %d", iamStatus), func(t *testing.T) {
+			g := NewWithT(t)
+			iam := &iamTokenAnswer{status: iamStatus}
+			iamServer := httptest.NewServer(iam)
+			t.Cleanup(iamServer.Close)
+			service := &countingHandler{}
+			serviceServer := httptest.NewServer(service)
+			t.Cleanup(serviceServer.Close)
+
+			clk := clocktesting.NewFakeClock(time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC))
+			opts := validBuilderOptions(clk, &countingSource{prefix: "controller"}, &countingLimiter{})
+			opts.ServiceEndpoints = []endpoints.ServiceEndpoint{
+				{ID: string(endpoints.Containers), Region: testRegion, URL: serviceServer.URL + "/global"},
+				{ID: string(endpoints.VPC), Region: testRegion, URL: serviceServer.URL + "/v1"},
+			}
+			builder, err := NewProdClientBuilder(opts)
+			g.Expect(err).NotTo(HaveOccurred())
+			builder.resourceManagerURL = serviceServer.URL
+			ctx := context.Background()
+			id := sourcedIdentity("iam", "1", iamSource{url: iamServer.URL})
+			refused := iamStatus != http.StatusServiceUnavailable
+
+			vpcClient, err := builder.VPC(ctx, id, testRegion)
+			g.Expect(err).NotTo(HaveOccurred())
+			_, vpcResponse, vpcErr := vpcClient.GetVPC(&vpcv1.GetVPCOptions{ID: core.StringPtr("r006-00000000-0000-0000-0000-000000000000")})
+			rmClient, err := builder.ResourceManager(ctx, id)
+			g.Expect(err).NotTo(HaveOccurred())
+			_, rmResponse, rmErr := rmClient.GetResourceGroup(&resourcemanagerv2.GetResourceGroupOptions{ID: core.StringPtr(testResourceGroupID)})
+
+			for name, call := range map[string]struct {
+				response *core.DetailedResponse
+				err      error
+			}{"VPC": {vpcResponse, vpcErr}, "Resource Manager": {rmResponse, rmErr}} {
+				g.Expect(call.err).To(HaveOccurred(), name)
+				g.Expect(errors.Is(call.err, errIAMRejectedCredentials)).To(Equal(refused), name)
+				if refused {
+					g.Expect(call.response).To(BeNil(), "%s: IAM's answer is not handed out as the service's", name)
+					g.Expect(call.err.Error()).To(ContainSubstring(fmt.Sprintf("IAM answered HTTP %d", iamStatus)), name)
+					g.Expect(call.err.Error()).To(ContainSubstring("Provided API key could not be found."), name)
+				} else {
+					g.Expect(call.response).NotTo(BeNil(), name)
+					g.Expect(call.response.StatusCode).To(Equal(iamStatus), name)
+				}
+			}
+
+			ks, err := builder.KubernetesService(ctx, id, testRegion)
+			g.Expect(err).NotTo(HaveOccurred())
+			_, ksErr := ks.ListVersions(ctx)
+			g.Expect(errors.Is(ksErr, kubernetesservice.ErrCredentialsRejected)).To(Equal(refused), "the IKS client keeps its own handling")
+
+			g.Expect(service.requests.Load()).To(BeZero(), "no request reaches a service without a token")
+			g.Expect(iam.requests.Load()).To(BeNumerically(">=", 3))
+		})
+	}
+}
+
+func TestIAMRejection(t *testing.T) {
+	// authError builds the error go-sdk-core's IAM authenticator returns when the token service answers status.
+	authError := func(status int) *core.AuthenticationError {
+		return &core.AuthenticationError{
+			Err: errors.New("the IAM token service answered BXNIM0415E"),
+			HTTPProblem: &core.HTTPProblem{
+				IBMProblem: &core.IBMProblem{Summary: "Provided API key could not be found."},
+				Response:   &core.DetailedResponse{StatusCode: status},
+			},
+		}
+	}
+	plain := errors.New("the API key file cannot be read")
+	unavailable := authError(http.StatusServiceUnavailable)
+	rateLimited := authError(http.StatusTooManyRequests)
+	withoutProblem := &core.AuthenticationError{Err: errors.New("no HTTP problem")}
+
+	testCases := []struct {
+		name string
+		err  error
+		// want is the error expected back unchanged; nil with rejected set means a converted error.
+		want     error
+		rejected bool
+	}{
+		{name: "nil stays nil", err: nil, want: nil},
+		{name: "an error that is not an IAM answer stays", err: plain, want: plain},
+		{name: "IAM 503 means unavailable, not refused", err: unavailable, want: unavailable},
+		{name: "IAM 429 means rate limited, not refused", err: rateLimited, want: rateLimited},
+		{name: "an authentication error without an HTTP problem stays", err: withoutProblem, want: withoutProblem},
+		{name: "IAM 400 refuses the credentials", err: authError(http.StatusBadRequest), rejected: true},
+		{name: "IAM 401 refuses the credentials", err: authError(http.StatusUnauthorized), rejected: true},
+		{name: "IAM 403 refuses the credentials", err: authError(http.StatusForbidden), rejected: true},
+		{name: "a wrapped IAM 400 refuses the credentials", err: fmt.Errorf("authenticating: %w", authError(http.StatusBadRequest)), rejected: true},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			got := iamRejection(tc.err)
+			switch {
+			case !tc.rejected && tc.want == nil:
+				g.Expect(got).ToNot(HaveOccurred())
+				return
+			case !tc.rejected:
+				g.Expect(got).To(BeIdenticalTo(tc.want), "the error is passed on as it is")
+				return
+			}
+			g.Expect(errors.Is(got, errIAMRejectedCredentials)).To(BeTrue())
+			var authErr *core.AuthenticationError
+			g.Expect(errors.As(got, &authErr)).To(BeFalse(), "go-sdk-core would hand out IAM's response for an AuthenticationError")
+			var problem *core.SDKProblem
+			g.Expect(errors.As(got, &problem)).To(BeTrue(), "go-sdk-core keeps the chain of an authenticator's SDKProblem only")
+			g.Expect(got.Error()).To(ContainSubstring("Provided API key could not be found."))
+		})
+	}
+}
+
+func TestWithIAMRejection(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(withIAMRejection(nil)).To(BeNil())
+	g.Expect(withIAMRejection((*core.BearerTokenAuthenticator)(nil))).To(BeNil(), "a typed nil is no authenticator either")
+
+	// The wrapper delegates everything else to the identity's authenticator.
+	builder, _, _ := newTestBuilder(t)
+	g.Expect(builder.authFor(controllerIdentity())).To(Succeed())
+	wrapped := withIAMRejection(&identityAuthenticator{key: credentials.ControllerKey(), b: builder})
+	g.Expect(wrapped.AuthenticationType()).To(Equal(core.AUTHTYPE_BEARER_TOKEN))
+	g.Expect(wrapped.Validate()).To(Succeed())
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.invalid", http.NoBody)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(wrapped.Authenticate(request)).To(Succeed())
+	g.Expect(request.Header.Get("Authorization")).To(Equal("Bearer controller-1"))
 }

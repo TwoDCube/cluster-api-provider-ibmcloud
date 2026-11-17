@@ -44,7 +44,8 @@ import (
 // so a rebuilt authenticator (after an hour, a new Version or an IBM 401) reaches clients that already exist. Every IKS
 // client waits on the one process-wide limiter, because IBM limits the request rate per source IP, not per identity,
 // and every request of every client is bounded by HTTPTimeout, so that an IBM response that never arrives cannot stall
-// a controller.
+// a controller. The VPC and Resource Manager clients also turn an IAM refusal of the credentials into
+// errIAMRejectedCredentials (iamRejectionAuthenticator), so that it never reads as the answer of those services.
 
 // ClientBuilder builds IBM Cloud clients for the managed controllers, always for one resolved identity. Adding a
 // second identity later adds a value of credentials.Identity, never a parameter. Tests inject a stub that returns
@@ -216,7 +217,8 @@ func (b *ProdClientBuilder) KubernetesService(_ context.Context, id credentials.
 	return client, nil
 }
 
-// VPC implements ClientBuilder.
+// VPC implements ClientBuilder. A request that the IAM token service refuses to authorize fails with
+// errIAMRejectedCredentials and no response (iamRejectionAuthenticator).
 //
 // Parameters:
 //   - ctx is unused today; a later CredentialSource may need it.
@@ -229,7 +231,7 @@ func (b *ProdClientBuilder) VPC(_ context.Context, id credentials.Identity, regi
 	serviceURL := endpoints.FetchVPCEndpoint(region, b.opts.ServiceEndpoints)
 	key := clientKey{identity: id.Key, service: string(endpoints.VPC), url: serviceURL}
 	built, err := b.cachedClient(id, key, func(auth core.Authenticator) (any, error) {
-		return vpc.NewServiceWithAuthenticatorAndTimeout(serviceURL, auth, b.opts.HTTPTimeout)
+		return vpc.NewServiceWithAuthenticatorAndTimeout(serviceURL, withIAMRejection(auth), b.opts.HTTPTimeout)
 	})
 	if err != nil {
 		return nil, err
@@ -241,7 +243,8 @@ func (b *ProdClientBuilder) VPC(_ context.Context, id credentials.Identity, regi
 	return client, nil
 }
 
-// ResourceManager implements ClientBuilder.
+// ResourceManager implements ClientBuilder. A request that the IAM token service refuses to authorize fails with
+// errIAMRejectedCredentials and no response (iamRejectionAuthenticator).
 //
 // Parameters:
 //   - ctx is unused today; a later CredentialSource may need it.
@@ -253,7 +256,7 @@ func (b *ProdClientBuilder) ResourceManager(_ context.Context, id credentials.Id
 	serviceURL := b.resourceManagerURL
 	key := clientKey{identity: id.Key, service: string(endpoints.RM), url: serviceURL}
 	built, err := b.cachedClient(id, key, func(auth core.Authenticator) (any, error) {
-		return newResourceManager(auth, serviceURL, b.opts.HTTPTimeout)
+		return newResourceManager(withIAMRejection(auth), serviceURL, b.opts.HTTPTimeout)
 	})
 	if err != nil {
 		return nil, err
@@ -510,6 +513,73 @@ func (a *identityAuthenticator) Validate() error {
 		return err
 	}
 	return auth.Validate()
+}
+
+// errIAMRejectedCredentials marks a VPC or Resource Manager request that was never sent because the IAM token service
+// refused the credentials of its identity (iamRejection). ClusterScope.callProblem reports it as a credential failure.
+var errIAMRejectedCredentials = errors.New("the IAM token service rejected the credentials, so the request was not sent")
+
+// iamRejectionComponent names CAPIBM as the component of the problem iamRejection builds; it must not be go-sdk-core's
+// own module name, which go-sdk-core treats as one of its internal problems.
+var iamRejectionComponent = core.NewProblemComponent("cluster-api-provider-ibmcloud", "")
+
+// iamRejectionAuthenticator wraps the authenticator of the VPC and Resource Manager clients, so that an IAM refusal of
+// the credentials cannot pass for the answer of those services. When an authenticator fails with a
+// *core.AuthenticationError, go-sdk-core v5.25.3 returns the IAM token service's response as the DetailedResponse of
+// the VPC or Resource Manager call (base_service.go:389-395): a deleted or unknown API key (IAM 400) would read as a
+// VPC 400 and be retried for ever, and an IAM 403 as a missing Viewer role, and no 401 handling would rebuild the
+// authenticator. kubernetesservice tells the two apart by whether the request reached its transport, which needs a
+// request context; the VPC and Resource Manager methods take none, so this wrapper changes the authenticator's error
+// instead (iamRejection). The IKS clients keep the plain identityAuthenticator, because kubernetesservice reads IAM's
+// status from that response (kubernetesservice.ErrCredentialsRejected).
+type iamRejectionAuthenticator struct {
+	// Authenticator is the identity's identityAuthenticator; AuthenticationType and Validate delegate to it.
+	core.Authenticator
+}
+
+var _ core.Authenticator = &iamRejectionAuthenticator{}
+
+// withIAMRejection returns auth wrapped in an iamRejectionAuthenticator. A nil auth stays nil, so that the client
+// constructors still refuse a missing authenticator instead of receiving a wrapper around nothing. auth is the
+// identityAuthenticator cachedClient built for the client.
+func withIAMRejection(auth core.Authenticator) core.Authenticator {
+	if core.IsNil(auth) {
+		return nil
+	}
+	return &iamRejectionAuthenticator{Authenticator: auth}
+}
+
+// Authenticate implements core.Authenticator. req is the outgoing request; the wrapped authenticator adds its
+// Authorization header, and an IAM refusal of the credentials is returned as iamRejection describes.
+func (a *iamRejectionAuthenticator) Authenticate(req *http.Request) error {
+	return iamRejection(a.Authenticator.Authenticate(req))
+}
+
+// iamRejection returns err unchanged unless it is the IAM token service refusing the credentials themselves: a
+// *core.AuthenticationError whose response has status 400, 401 or 403. A 429 or 5xx of the token service stays as it
+// is, because the service is unavailable and the credentials may be fine. A refusal becomes an error that
+// errors.Is matches with errIAMRejectedCredentials and that holds no *core.AuthenticationError, so go-sdk-core returns
+// no response with it. It is a *core.SDKProblem because go-sdk-core v5.25.3 passes an authenticator's error on with its
+// chain only for that type (base_service.go:396-400); any other error reaches the caller as text only, and errors.Is
+// could no longer find errIAMRejectedCredentials. IAM's own description stays in the error text for the controller log.
+//
+// Parameters:
+//   - err is the authenticator's error; nil stays nil.
+func iamRejection(err error) error {
+	var authErr *core.AuthenticationError
+	if !errors.As(err, &authErr) || authErr.HTTPProblem == nil || authErr.Response == nil ||
+		!iamRefusedCredentials(authErr.Response.StatusCode) {
+		return err
+	}
+	cause := fmt.Errorf("%w: IAM answered HTTP %d: %s", errIAMRejectedCredentials, authErr.Response.StatusCode, authErr.Error())
+	return core.SDKErrorf(cause, "", "iam-credentials-rejected", iamRejectionComponent)
+}
+
+// iamRefusedCredentials reports whether a status of the IAM token service means that it refused the credentials
+// themselves (400 for an unknown or deleted API key, 401, 403), as opposed to being unavailable or rate limiting.
+// statusCode is IAM's status.
+func iamRefusedCredentials(statusCode int) bool {
+	return statusCode == http.StatusBadRequest || statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden
 }
 
 // newResourceManager builds every Resource Manager client of the managed path with
