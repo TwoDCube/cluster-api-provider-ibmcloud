@@ -1112,8 +1112,10 @@ func TestControlPlaneConditionsIgnoreTheIncident(t *testing.T) {
 			patches := len(f.patches())
 
 			// IBM answers the same error with a new incident ID: status does not change, so the controller's own watch
-			// does not re-trigger the reconcile (condition messages carry IBM's error code, never its incident ID).
-			f.clock.SetTime(cpTestStart.Add(time.Minute))
+			// does not re-trigger the reconcile (condition messages carry IBM's error code, never its incident ID). The second
+			// reconcile runs once the VersionsCache's hold of a failed listing is over, so that a failed ListVersions is asked
+			// again too.
+			f.clock.SetTime(cpTestStart.Add(managedscope.VersionsFailureHold))
 			tc.expect(f, "incident-b")
 			_, err = f.reconcile()
 
