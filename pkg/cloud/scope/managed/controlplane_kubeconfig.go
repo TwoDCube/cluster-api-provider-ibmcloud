@@ -619,11 +619,12 @@ func (p probeOutcome) failedTLS() bool {
 // from the stored credential with IBM's cluster CA (GetCACertificate, IBM's getCACert) and with the system roots, and
 // writes the mode that passes. managedkubeconfig.Decide has no such rule (its probe input is the 401 signal only, and
 // its CA rule skips a kubeconfig without CA data, the SystemRoots mode of ROKS and of the IKS fallback), so the scope
-// adds it; the trust of private-only masters is not yet verified against IBM Cloud, so a stored mode may need the other
-// one. The re-check waits backoff after the latest attempt that left the stored credential in place (the
-// refresh-checked-at annotation), so a kubeconfig that keeps failing TLS costs one getCACert per backoff, not one per
-// reconcile. A missing time, or one after now (a forged value: no real attempt lies in the future), makes the re-check
-// due at once, like managedkubeconfig.Decide treats such a refresh-checked-at.
+// adds it; the trust of a private-only OpenShift master is not yet verified against IBM Cloud (a private-only IKS
+// master was observed to verify with the cluster CA, like a public one), so a stored mode may need the other one. The
+// re-check waits backoff after the latest attempt that left the stored credential in place (the refresh-checked-at
+// annotation), so a kubeconfig that keeps failing TLS costs one getCACert per backoff, not one per reconcile. A missing
+// time, or one after now (a forged value: no real attempt lies in the future), makes the re-check due at once, like
+// managedkubeconfig.Decide treats such a refresh-checked-at.
 //
 // Parameters:
 //   - refreshCheckedAt is the refresh-checked-at annotation; zero when absent or unparseable.
@@ -1360,9 +1361,10 @@ func samePEM(a, b []byte) bool {
 }
 
 // verifyKubeconfig builds the new kubeconfig with the flavor's trust mode (CATrustFor) and, after a TLS failure, with
-// the other one (the trust of private-only masters is not yet verified against IBM Cloud), and returns the first one
-// that passes the probe (verify before write). A kubeconfig equal to the stored one is not probed again: the stored
-// probe of this reconcile is its answer. The returned report is non-nil when none passed or a part could not be used.
+// the other one (the trust of a private-only OpenShift master is not yet verified against IBM Cloud), and returns the
+// first one that passes the probe (verify before write). A kubeconfig equal to the stored one is not probed again: the
+// stored probe of this reconcile is its answer. The returned report is non-nil when none passed or a part could not be
+// used.
 //
 // Parameters:
 //   - ctx is the reconcile context.

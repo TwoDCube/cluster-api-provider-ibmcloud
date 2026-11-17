@@ -1624,9 +1624,9 @@ func TestControlPlaneKubeconfigRefreshBackoff(t *testing.T) {
 }
 
 // TestControlPlaneKubeconfigTLSRecheck checks the trust re-check of a stored kubeconfig whose probe fails TLS (the
-// trust of a private-only master is not yet verified against IBM Cloud): both trust modes are tried with the stored
-// credential, the CA comes from getCACert and no credential is fetched, and a re-check that fails waits ten minutes
-// before the next one.
+// trust of a private-only OpenShift master is not yet verified against IBM Cloud): both trust modes are tried with the
+// stored credential, the CA comes from getCACert and no credential is fetched, and a re-check that fails waits ten
+// minutes before the next one.
 func TestControlPlaneKubeconfigTLSRecheck(t *testing.T) {
 	failTLS := func(probedKubeconfig) (workloadprobe.Result, error) {
 		return workloadprobe.Result{}, probeFailure(workloadprobe.FailureTLS, "SelfSubjectReview")

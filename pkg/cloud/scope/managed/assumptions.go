@@ -244,11 +244,13 @@ const DeleteReissueAfter = 10 * time.Minute
 // cluster CA. kubernetesservice sends this value; the constant records the decision with the other live facts.
 const AdminKubeconfigFormat = "json"
 
-// CATrustFor returns how the API server certificate of a distribution's public master is verified.
-// Observed on IBM Cloud: IKS serves a certificate of the cluster CA, so the system roots fail and ClusterCA is used;
-// ROKS's "-e" master serves a publicly trusted certificate that getCACert's CA does not validate, so SystemRoots is
-// used. Private-only clusters are not yet verified against IBM Cloud; the caller therefore tries the other mode when
-// this one fails and records the winner. An unknown distribution gets ClusterCA, the narrower trust.
+// CATrustFor returns how the API server certificate of a distribution's master is verified.
+// Observed on IBM Cloud: IKS serves a certificate of the cluster CA, so the system roots fail and ClusterCA is used,
+// on the public master and on the private service endpoint of a private-only cluster alike; ROKS's "-e" public master
+// serves a publicly trusted certificate that getCACert's CA does not validate, so SystemRoots is used. Not yet verified
+// against IBM Cloud: the certificate of a private-only ROKS master; default: SystemRoots, as for the public master;
+// fallback: the caller tries the other mode when this one fails and records the winner. An unknown distribution gets
+// ClusterCA, the narrower trust.
 //
 // Parameters:
 //   - d: the control plane's spec.distribution.
@@ -290,13 +292,14 @@ const defaultMasterPort = "443"
 // ManagementServerURL returns the API server URL CAPIBM uses for a cluster: IBM's masterURL, which is also the server
 // of IBM's admin kubeconfig, normalised to https://<host>:<port> with the port always present. The port is 443 when IBM
 // gives none, because Go's url.Port returns "" then and Cluster API copies only an endpoint with a non-zero port.
-// Observed on IBM Cloud: masterURL equals the kubeconfig server on both flavors, with ports such as 30101 and 30102.
-// Not yet verified against IBM Cloud: masterURL also for a private-only cluster; fallback: the private service
-// endpoint URL.
+// Observed on IBM Cloud: masterURL equals the kubeconfig server on both flavors, with ports such as 30101 and 30102,
+// and on a private-only IKS cluster masterURL is the private service endpoint URL with its port. Not yet verified
+// against IBM Cloud: masterURL of a private-only ROKS cluster; default: masterURL, as for IKS; fallback: the private
+// service endpoint URL.
 //
 // Parameters:
-//   - d: the control plane's spec.distribution; both distributions use masterURL today, and the private-only check
-//     may change that for one of them.
+//   - d: the control plane's spec.distribution; both distributions use masterURL today, and the private-only ROKS
+//     check may change that for OpenShift.
 //   - c: the cluster as GetCluster returned it.
 //
 // It returns an error naming the URL and what is wrong when the distribution is unknown, c is nil, masterURL is empty
