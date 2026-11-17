@@ -165,6 +165,7 @@ var managedMachinePoolConditionCatalogue = []conditionCatalogue{
 			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateDrainingNodeReason,
 			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateReplacingWorkerReason,
 			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForReplacementReason,
+			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWorkersNotReadyReason,
 			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForControlPlaneUpgradeReason,
 			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForCapacityReason,
 			infrav1.IBMCloudManagedMachinePoolWorkersUpToDateWaitingForClusterMinimumReason,
@@ -200,6 +201,7 @@ var managedMachinePoolConditionCatalogue = []conditionCatalogue{
 			infrav1.IBMCloudManagedMachinePoolDeletingWaitingForDisruptionTokenReason,
 			infrav1.IBMCloudManagedMachinePoolDeletingDrainingNodesReason,
 			infrav1.IBMCloudManagedMachinePoolDeletingRemovingWorkerPoolReason,
+			infrav1.IBMCloudManagedMachinePoolDeletingWaitingForWorkerRemovalReason,
 		},
 	},
 }

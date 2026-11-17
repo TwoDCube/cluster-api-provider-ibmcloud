@@ -202,6 +202,13 @@ const (
 	// Ready for minReadySeconds.
 	IBMCloudManagedMachinePoolWorkersUpToDateWaitingForReplacementReason = "WaitingForReplacement"
 
+	// IBMCloudManagedMachinePoolWorkersUpToDateWorkersNotReadyReason surfaces while a replacement waits to start because
+	// another worker of the pool is not deployed, healthy and Ready for minReadySeconds: a replacement completes only once
+	// every worker of the pool is, so it starts only then, and a worker that stays broken holds the rollout of its own
+	// pool instead of the disruption token of the whole Cluster. The message names the workers. It is the token
+	// WorkerPoolReady uses for workers of the pool that are not ready.
+	IBMCloudManagedMachinePoolWorkersUpToDateWorkersNotReadyReason = "WorkersNotReady"
+
 	// IBMCloudManagedMachinePoolWorkersUpToDateWaitingForControlPlaneUpgradeReason surfaces while the master is pending or
 	// updating (a requested minor or an IBM patch).
 	IBMCloudManagedMachinePoolWorkersUpToDateWaitingForControlPlaneUpgradeReason = "WaitingForControlPlaneUpgrade"
@@ -316,4 +323,10 @@ const (
 	// IBMCloudManagedMachinePoolDeletingRemovingWorkerPoolReason surfaces after removeWorkerPool was sent, until IBM no
 	// longer lists the pool.
 	IBMCloudManagedMachinePoolDeletingRemovingWorkerPoolReason = "RemovingWorkerPool"
+
+	// IBMCloudManagedMachinePoolDeletingWaitingForWorkerRemovalReason surfaces while a deletion that leaves the IBM pool
+	// alone (another object still claims it, or it has another flavor) waits for IBM to remove the workers that this
+	// pool's unfinished scale-down or replacement already asked IBM to remove: their Nodes stay cordoned until IBM has
+	// removed them or 60 minutes have passed since the call, then CAPIBM reverts the cordons and the finalizer goes.
+	IBMCloudManagedMachinePoolDeletingWaitingForWorkerRemovalReason = "WaitingForWorkerRemoval"
 )
