@@ -97,10 +97,14 @@ To see whose key a cluster uses, run `ibmcloud ks api-key info --cluster <cluste
 
 ## Network
 
-* **Management cluster to IBM Cloud.** The manager calls `https://containers.cloud.ibm.com/global` (Kubernetes
-  Service), the regional VPC API and the Resource Manager API. Requests to the Kubernetes Service API are limited by
-  the manager flags `--containers-api-qps` (default 10) and `--containers-api-burst` (default 20); IBM allows 200
-  requests per 10 seconds per source IP address, shared with every other tool behind the same address.
+* **Management cluster to IBM Cloud.** The manager calls the IAM token service, `https://iam.cloud.ibm.com` (or the
+  URL set in `IBMCLOUD_AUTH_URL` at install time), for the access token that every other call carries; when it cannot
+  reach IAM, every IBM call fails. With that token it calls `https://containers.cloud.ibm.com/global` (Kubernetes
+  Service), the regional VPC API (`https://<region>.iaas.cloud.ibm.com/v1`) and the Resource Manager API
+  (`https://resource-controller.cloud.ibm.com`), unless `SERVICE_ENDPOINT` moves them
+  ([below](#private-service-endpoints)). An egress allowlist must name all four. Requests to the Kubernetes Service API
+  are limited by the manager flags `--containers-api-qps` (default 10) and `--containers-api-burst` (default 20); IBM
+  allows 200 requests per 10 seconds per source IP address, shared with every other tool behind the same address.
 * **Management cluster to each master.** CAPIBM probes the cluster's master URL to verify the kubeconfig, and Cluster
   API's ClusterCache and CAPIBM's drain use it too. The management cluster must reach the public master URL (default)
   or, for a private-only cluster, the private one (VPN, Direct Link, Transit Gateway, or running inside IBM Cloud).
@@ -114,15 +118,29 @@ To see whose key a cluster uses, run `ibmcloud ks api-key info --cluster <cluste
 
 ### Private service endpoints
 
-To send the Kubernetes Service, VPC or Resource Manager calls of one region to another URL (for example IBM's private
-endpoint, or a staging endpoint), set `SERVICE_ENDPOINT` at install time; it becomes the manager's `--service-endpoint`
-flag. The service IDs are `containers`, `vpc` and `rm`:
+To send the Kubernetes Service, VPC or Resource Manager calls to another URL (for example IBM's private endpoint, or a
+staging endpoint), set `SERVICE_ENDPOINT` at install time; it becomes the manager's `--service-endpoint` flag. The
+service IDs are `containers`, `vpc` and `rm`:
 
 ```console
 export SERVICE_ENDPOINT='us-south:containers=https://private.us-south.containers.cloud.ibm.com/global'
 ```
 
-Each URL is used as given. A region without a `containers` entry uses `https://containers.cloud.ibm.com/global`.
+Each URL is used as given. A `containers` or `vpc` entry applies only to the clusters of the region it is listed
+under: a region without a `containers` entry uses `https://containers.cloud.ibm.com/global`, and one without a `vpc`
+entry `https://<region>.iaas.cloud.ibm.com/v1`. Resource Manager is a global service, so an `rm` entry is not per
+region: CAPIBM uses the first `rm` entry, whatever region it is listed under, for the clusters of every region, and
+`https://resource-controller.cloud.ibm.com` when there is none.
+
+`SERVICE_ENDPOINT` does not move the IAM token requests. Set their URL with `IBMCLOUD_AUTH_URL` at install time
+instead, for example IBM's private IAM endpoint:
+
+```console
+export IBMCLOUD_AUTH_URL=https://private.iam.cloud.ibm.com
+```
+
+A management cluster that reaches IBM Cloud only through private endpoints needs both variables. `clusterctl upgrade`
+substitutes them again, like `IBMCLOUD_API_KEY`, so set them for every upgrade too.
 
 ## VPC and other IBM resources
 

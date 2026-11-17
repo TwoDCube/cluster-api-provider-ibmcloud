@@ -90,8 +90,12 @@ None of these makes an IBM call. Once the IBM cluster exists the marker is ignor
 The message names the field and the fix: an invalid cluster name, pod or service ranges outside IBM's rules, an initial
 pool whose replicas are not a multiple of its zones or below the per-zone minimum (1 on IKS, 2 on ROKS), a zone that is
 not in the `IBMCloudManagedCluster`, `entitlement` on IKS, or an IBM 400 or 422 answer such as `P4102` (subnet not found)
-or `E7278` (ROKS without a Cloud Object Storage instance). CAPIBM checks again every 15 minutes and at once when you
-change the spec.
+or `E7278` (ROKS without a Cloud Object Storage instance). CAPIBM checks again every 15 minutes, and at once when you
+change the `IBMCloudManagedControlPlane`, an `IBMCloudManagedMachinePool` of the Cluster or the spec of one of its
+`MachinePool`s (for example `spec.replicas` of the initial pool). A change to the `Cluster` (its pod and service
+ranges) or to the `IBMCloudManagedCluster` is picked up at the next check. After an IBM 400 or 422 answer, only a
+change to the spec of the `IBMCloudManagedControlPlane` ends the [create hold](#the-create-hold-after-a-refusal) before
+that check.
 
 An invalid cluster name ("the IBM cluster name "<name>", taken from the Cluster's metadata.name
 (spec.ibmCloudClusterName is omitted), has 33 characters, more than 32; ...") breaks IBM's rule of 1 to 32 characters,
@@ -111,9 +115,12 @@ creation), so delete the `Cluster` and create it again with `spec.ibmCloudCluste
   the region and resource group belongs to an identity with insufficient permissions. Check whose key it is with
   `ibmcloud ks api-key info --cluster <any-cluster-in-that-region-and-resource-group>`; `ibmcloud ks api-key reset
   --region <region>` re-binds it to the caller.
+* **401**: "IBM Cloud rejected the credentials of the CAPIBM controller identity while \<action\>; CAPIBM rebuilds its
+  authenticator and retries in about 5 minutes; ...". No role is missing: IBM does not accept the API key the manager
+  was installed with (`IBMCLOUD_API_KEY`), for example because it was deleted. Check the key, or replace it.
 
-After a refusal CAPIBM holds further creates ([below](#the-create-hold-after-a-refusal)) and checks again every
-15 minutes, so a granted role takes effect within about 15 minutes.
+After a 403 or `A0656` CAPIBM holds further creates ([below](#the-create-hold-after-a-refusal)) and checks again every
+15 minutes, so a granted role takes effect within about 15 minutes. After a 401 it checks again after about 5 minutes.
 
 ### Check permissions without creating anything
 
@@ -150,7 +157,7 @@ create request; ..."), CAPIBM retries it, and the condition reports it only if i
 
 * the hold is **12 minutes** after a refusal and **4 minutes** after a 401, so the next check (about 15 minutes after a
   refusal, 5 minutes after a 401) sends exactly one new request;
-* a **spec change ends the hold at once**, so fix the cause in the spec, or grant the missing role and wait for the
+* a **change to the control plane's spec ends the hold at once**; a granted role or a fixed subnet or pool waits for the
   next check;
 * the hold exists only while no IBM cluster is bound; the next create attempt and any binding remove it, and it never
   appears on an initialized or moved control plane;
@@ -198,6 +205,7 @@ CAPIBM created nothing and never touches that cluster.
 | `KubeconfigReady=False` `VerificationFailed` | a new credential failed the check against the master (the previous Secret is kept), the stored credential is rejected with 401 (CAPIBM fetches IBM's admin credential again with a backoff of 1 to 10 minutes), or the master's certificate no longer verifies with the stored trust (both trust modes are tried again at most once every 10 minutes) |
 | `KubeconfigReady=False` `UserProvidedSecretInvalid` | your Secret lacks the `cluster.x-k8s.io/cluster-name` label or a non-empty `value` key |
 | `KubeconfigReady=Unknown` `CARotationInProgress` | IBM rotates the cluster CA; CAPIBM fetches the new credential when it is done |
+| `Available=False` `WaitingForIBMCluster` | "The IBM cluster of this control plane is not provisioned or CAPIBM cannot read it; IBMClusterProvisioned says why": `IBMClusterProvisioned` is False, and its reason says why. That may be a wait (there is no IBM cluster yet, or IBM is still creating it), but it also appears on a control plane that was available when CAPIBM cannot read the IBM cluster (for example `PermissionDenied` after IBM rejected the API key, or `IBMAPIError`) or IBM reports it failed, deleted or not found (for example `CreateFailed`, `DeletedOutOfBand` or `IBMClusterNotFound`): then waiting does not help; fix what that reason names ([The IBM cluster is not created](#the-ibm-cluster-is-not-created)). "The master of IBM cluster \<id\> is ready; the control plane becomes available once CAPIBM has verified its kubeconfig and initialized it": the master is ready, but no kubeconfig has passed the check against it yet; the `KubeconfigReady` reason above says why, for example `EndpointUnreachable` when the management cluster cannot reach a private-only master |
 | `Available=False` `MasterNotReady` | IBM does not report the master ready, or reports its health as `error` or `unavailable` |
 | `Available=False` `WorkloadAPIUnreachable` | the stored kubeconfig's probe fails (network, TLS, or a 401 while the credential is refreshed) |
 

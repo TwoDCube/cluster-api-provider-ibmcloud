@@ -15,7 +15,7 @@ CAPIBM makes no IBM call and writes nothing to the workload cluster.
 |---|---|---|---|
 | `Ready` | summary | | of `IBMClusterProvisioned`, `KubeconfigReady` and `Available` |
 | `Available` (contract; Cluster API mirrors it to the Cluster's `ControlPlaneAvailable`) | True | `Available` | initialized, the last probe of the stored kubeconfig passed, the IBM cluster exists and its master health is not `error` or `unavailable`; IBM's ingress status is never consulted |
-| | False | `WaitingForIBMCluster` | no IBM cluster yet, or it is still provisioning |
+| | False | `WaitingForIBMCluster` | `IBMClusterProvisioned` is False, and its reason says why ("The IBM cluster of this control plane is not provisioned or CAPIBM cannot read it; IBMClusterProvisioned says why"): no IBM cluster yet, or it is still provisioning; but also, on a control plane that was available, CAPIBM cannot read the IBM cluster (for example `PermissionDenied` or `IBMAPIError`), or IBM reports it failed, deleted or not found (for example `CreateFailed`, `DeletedOutOfBand` or `IBMClusterNotFound`). An error CAPIBM retries (a 5xx, a timeout or a 429) changes neither condition once `IBMClusterProvisioned` is True. Or the master is ready but CAPIBM has not yet verified a kubeconfig against it and initialized the control plane ("The master of IBM cluster \<id\> is ready; the control plane becomes available once CAPIBM has verified its kubeconfig and initialized it"): `KubeconfigReady` says why, for example `EndpointUnreachable` |
 | | False | `MasterNotReady` | IBM does not report the master ready (state `deployed`, status "Ready", a master URL), or its health is `error` or `unavailable` |
 | | False | `WorkloadAPIUnreachable` | the probe with the stored kubeconfig fails (network, TLS, or a 401 while the credential is refreshed) |
 | | False | `Deleting` | the control plane is being deleted |
@@ -32,6 +32,7 @@ CAPIBM makes no IBM call and writes nothing to the workload cluster.
 | | False | `IBMClusterNotFound` | a known cluster ID or the endpoint exists, but IBM returns 404; never re-created |
 | | False | `DeletedOutOfBand` | IBM reports `deleting`, `deleted`, `aborted` or `delete_failed` while the Cluster is not being deleted |
 | | False | `PermissionDenied` | IBM 403 or `A0656`; the message names the missing role and, for creates, `ibmcloud ks api-key info` and `api-key reset`; checked again every 15 minutes |
+| | False | `PermissionDenied` | IBM 401: IBM does not accept the credentials ("IBM Cloud rejected the credentials of the CAPIBM controller identity while \<action\>; CAPIBM rebuilds its authenticator and retries in about 5 minutes; check that the API key of the CAPIBM controller identity is valid and not deleted"); no role is missing: check or replace the API key; checked again after about 5 minutes |
 | | False | `IBMAPIError` | any other classified IBM error: the operation, the HTTP status and IBM's code |
 | `KubeconfigReady` | True | `Ready` | the verified `<cluster>-kubeconfig` Secret exists; within 30 days of the certificate's expiry the message warns |
 | | True | `UserProvidedSecret` | a user-provided Secret is valid and respected, never modified |
@@ -66,7 +67,8 @@ CAPIBM makes no IBM call and writes nothing to the workload cluster.
 | | True | `PossibleOwnClusterFound` | a same-named cluster may come from a create attempt with an unknown outcome; the finalizer is kept and `DELETE` is never sent for it |
 | | True | `OwnershipNotProven` | the cluster to delete cannot be proven to be this control plane's: the Secret's `cluster-id` names it and a check or the proof fails, or `status.clusterID` names it and it does not match (then a new Secret does not help; [What to do](./deleting.md#when-capibm-does-not-delete)); never deleted |
 | | True | `IBMClusterNotVisible` | IBM returns 404 for a known cluster while the stored kubeconfig still works: "The credentials of the CAPIBM controller identity cannot see IBM cluster <id> in account <account-id>, but its kubeconfig Secret still authenticates against it; check the account and IAM scope of those credentials. CAPIBM keeps the finalizer ... and never deletes a cluster it cannot see; remove the finalizer by hand to orphan the IBM cluster"; once reported, it stays (checked every 15 minutes) also while the kubeconfig cannot be checked ("... its kubeconfig Secret authenticated against it before but cannot be checked now (...); ...") until the kubeconfig is rejected or the finalizer is removed by hand |
-| | True | `PermissionDenied` | IBM refused the `DELETE` with 401 or 403; checked again every 15 minutes |
+| | True | `PermissionDenied` | IBM refused a call of the deletion with 403 (the lookup of the cluster, the CA fetch of the ownership proof, or the `DELETE`): the message names the call and the missing Kubernetes Service role; checked again every 15 minutes |
+| | True | `PermissionDenied` | IBM answered a call of the deletion with 401: IBM does not accept the credentials ("IBM Cloud rejected the credentials of the CAPIBM controller identity while \<action\>; ..."); no role is missing: check or replace the API key; checked again after about 5 minutes |
 | `Paused` | | | `util/paused` |
 
 Events: `SuccessfulCreateIBMCluster` (Normal); `IBMCreateWarnings` (Warning, one per non-critical create error, with
