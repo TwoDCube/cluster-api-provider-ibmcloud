@@ -50,8 +50,10 @@ clusterctl upgrade apply --contract v1beta2
 ```
 
 If it happens anyway, the manager logs an error at start-up and emits a Warning event `ManagedKubernetesDisabled` on
-every `IBMCloudManagedControlPlane`: "feature gate ManagedKubernetes is off: this cluster is not reconciled and cannot
-be deleted; set EXP_MANAGED_KUBERNETES=true". Run the upgrade again with the variable set.
+every `IBMCloudManagedControlPlane` it would reconcile: "feature gate ManagedKubernetes is off: this cluster is not
+reconciled and cannot be deleted; set EXP_MANAGED_KUBERNETES=true". Run the upgrade again with the variable set. A
+manager started with `--namespace` or `--watch-filter` checks only the control planes of that namespace or with that
+`cluster.x-k8s.io/watch-filter` label, so it never warns about control planes that another CAPIBM instance reconciles.
 
 </aside>
 
