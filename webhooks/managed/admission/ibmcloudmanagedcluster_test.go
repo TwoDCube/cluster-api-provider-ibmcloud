@@ -43,6 +43,20 @@ func infraClusterDeleteDeniedMessage(clusterName string) string {
 		" still needs this IBMCloudManagedCluster to manage and delete its IBM cluster"
 }
 
+// infraClusterDeletingClusterMessage is the rejection of the IBMCloudManagedCluster delete guard while the Cluster
+// clusterName is being deleted and its control plane may still own an IBM cluster. clusterID is the control plane's
+// status.clusterID, "" when it has recorded none.
+func infraClusterDeletingClusterMessage(clusterName, clusterID string) string {
+	target := "its IBM cluster"
+	if clusterID != "" {
+		target = "IBM cluster " + clusterID
+	}
+	return "leave this deletion to Cluster API: Cluster " + clusterName + " is being deleted, and " +
+		"IBMCloudManagedControlPlane/" + controlPlaneNameFor(clusterName) + " still needs this IBMCloudManagedCluster " +
+		"to delete " + target + "; Cluster API deletes this object once that control plane is gone, and a retried " +
+		"deletion succeeds from then on"
+}
+
 // controlPlaneWith returns the unit-test control plane of Cluster "dev" after mutate.
 func controlPlaneWith(mutate func(cp *controlplanev1.IBMCloudManagedControlPlane)) *controlplanev1.IBMCloudManagedControlPlane {
 	cp := newControlPlane(unitNamespace, "dev")
@@ -78,7 +92,8 @@ func TestIBMCloudManagedClusterValidateCreateAndUpdate(t *testing.T) {
 }
 
 // TestIBMCloudManagedClusterValidateDelete covers every case of the delete guard on the typed validator with a strict
-// reader, which also proves which reads each case makes and that nothing else is read.
+// reader, which also proves which reads each case makes and that nothing else is read. Every case runs with the
+// feature gate on and off, because the guard does not depend on it.
 func TestIBMCloudManagedClusterValidateDelete(t *testing.T) {
 	readFailure := errors.New("connection refused")
 	dev := clusterGet("dev")
@@ -122,11 +137,47 @@ func TestIBMCloudManagedClusterValidateDelete(t *testing.T) {
 			wantErr: infraClusterDeleteDeniedMessage("dev"),
 		},
 		{
-			name:    "cluster deleting allowed",
+			// kubectl delete -f or a GitOps prune deletes the Cluster and this object at once. The control plane still
+			// needs this object to delete its IBM cluster, and Cluster API deletes it itself once the control plane is
+			// gone, so the deletion waits for that.
+			name:    "cluster deleting and control plane has clusterID rejected",
 			objs:    []client.Object{deleting(newCluster(unitNamespace, "dev")), controlPlaneWith(withClusterID)},
+			allowed: []string{dev, devCP},
+			wantErr: infraClusterDeletingClusterMessage("dev", testIBMClusterID),
+		},
+		{
+			name:    "cluster deleting and control plane has only createIntent rejected",
+			objs:    []client.Object{deleting(newCluster(unitNamespace, "dev")), controlPlaneWith(withCreateIntent)},
+			allowed: []string{dev, devCP},
+			wantErr: infraClusterDeletingClusterMessage("dev", ""),
+		},
+		{
+			// Cluster API's own order: the control plane is gone before Cluster API deletes this object.
+			name:    "cluster deleting and control plane gone allowed",
+			objs:    []client.Object{deleting(newCluster(unitNamespace, "dev"))},
+			allowed: []string{dev, devCP},
+		},
+		{
+			name: "cluster deleting and control plane without IBM cluster allowed",
+			objs: []client.Object{
+				deleting(newCluster(unitNamespace, "dev")),
+				controlPlaneWith(func(*controlplanev1.IBMCloudManagedControlPlane) {}),
+			},
+			allowed: []string{dev, devCP},
+		},
+		{
+			name: "cluster deleting and infrastructureRef names another IBMCloudManagedCluster allowed",
+			objs: []client.Object{
+				deleting(clusterWithInfrastructureRef(clusterv1.ContractVersionedObjectReference{
+					APIGroup: infrav1.GroupVersion.Group, Kind: "IBMCloudManagedCluster", Name: "dev-v2",
+				})),
+				controlPlaneWith(withClusterID),
+			},
 			allowed: []string{dev},
 		},
 		{
+			// The control plane's controller cannot reconcile without its owner Cluster, so it could not use this
+			// object anyway.
 			name:    "cluster gone allowed",
 			objs:    []client.Object{controlPlaneWith(withClusterID)},
 			allowed: []string{dev},
@@ -221,33 +272,38 @@ func TestIBMCloudManagedClusterValidateDelete(t *testing.T) {
 		},
 	}
 	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			g := NewWithT(t)
-			infra := newInfraCluster(unitNamespace, "dev")
-			if tc.mutate != nil {
-				tc.mutate(infra)
-			}
-			reader := newStrictReader(t, tc.allowed, tc.errs, tc.objs...)
+		// The guard must answer the same whatever the feature gate value.
+		for _, gate := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s (gate on: %t)", tc.name, gate), func(t *testing.T) {
+				g := NewWithT(t)
+				infra := newInfraCluster(unitNamespace, "dev")
+				if tc.mutate != nil {
+					tc.mutate(infra)
+				}
+				reader := newStrictReader(t, tc.allowed, tc.errs, tc.objs...)
 
-			warnings, err := (&IBMCloudManagedCluster{ManagedKubernetesEnabled: true, Reader: reader}).ValidateDelete(context.Background(), infra)
+				validator := &IBMCloudManagedCluster{ManagedKubernetesEnabled: gate, Reader: reader}
+				warnings, err := validator.ValidateDelete(context.Background(), infra)
 
-			g.Expect(warnings).To(BeEmpty())
-			g.Expect(reader.calls).To(Equal(tc.allowed))
-			switch {
-			case tc.wantErr == "":
-				g.Expect(err).NotTo(HaveOccurred())
-			case tc.errs != nil:
-				g.Expect(apierrors.IsInternalError(err)).To(BeTrue(), "want InternalError, got %v", err)
-				g.Expect(err.Error()).To(ContainSubstring(tc.wantErr))
-			default:
-				expectForbidden(g, err, tc.wantErr)
-			}
-		})
+				g.Expect(warnings).To(BeEmpty())
+				g.Expect(reader.calls).To(Equal(tc.allowed))
+				switch {
+				case tc.wantErr == "":
+					g.Expect(err).NotTo(HaveOccurred())
+				case tc.errs != nil:
+					g.Expect(apierrors.IsInternalError(err)).To(BeTrue(), "want InternalError, got %v", err)
+					g.Expect(err.Error()).To(ContainSubstring(tc.wantErr))
+				default:
+					expectForbidden(g, err, tc.wantErr)
+				}
+			})
+		}
 	}
 }
 
 // TestIBMCloudManagedClusterWebhookDelete covers every case of the delete guard through the API server (the gate-off
-// case is in TestGateOff). Each case creates its own Cluster, control plane and IBMCloudManagedCluster in one
+// rows are unit tests, TestGateOff and TestIBMCloudManagedClusterValidateDelete, because one API server registers only
+// one validator per webhook path). Each case creates its own Cluster, control plane and IBMCloudManagedCluster in one
 // namespace.
 func TestIBMCloudManagedClusterWebhookDelete(t *testing.T) {
 	namespace := newTestNamespace(t, "ibmcmc-webhook-delete")
@@ -258,7 +314,8 @@ func TestIBMCloudManagedClusterWebhookDelete(t *testing.T) {
 		// prepare creates the objects of the row, apart from the IBMCloudManagedCluster, which the loop creates.
 		prepare    func(t *testing.T, g *WithT, clusterName string)
 		annotation bool
-		wantErr    bool
+		// wantErr returns the rejection the row expects for the Cluster clusterName; nil means the deletion is allowed.
+		wantErr func(clusterName string) string
 	}{
 		{
 			name: "rejected while the cluster lives and the control plane has a clusterID",
@@ -267,7 +324,7 @@ func TestIBMCloudManagedClusterWebhookDelete(t *testing.T) {
 				createCluster(t, namespace, clusterName, false)
 				createControlPlane(g, newControlPlane(namespace, clusterName), clusterIDStatus)
 			},
-			wantErr: true,
+			wantErr: infraClusterDeleteDeniedMessage,
 		},
 		{
 			name: "rejected while the cluster lives and the control plane has only a controlPlaneEndpoint",
@@ -278,7 +335,7 @@ func TestIBMCloudManagedClusterWebhookDelete(t *testing.T) {
 				withEndpoint(cp)
 				createControlPlane(g, cp, nil)
 			},
-			wantErr: true,
+			wantErr: infraClusterDeleteDeniedMessage,
 		},
 		{
 			name: "rejected while the cluster lives and the control plane has only a createIntent",
@@ -291,14 +348,27 @@ func TestIBMCloudManagedClusterWebhookDelete(t *testing.T) {
 				status := &controlplanev1.IBMCloudManagedControlPlaneStatus{CreateIntent: cp.Status.CreateIntent}
 				createControlPlane(g, cp, status)
 			},
-			wantErr: true,
+			wantErr: infraClusterDeleteDeniedMessage,
 		},
 		{
-			name: "allowed while the cluster is deleting, held by a test finalizer",
+			// kubectl delete -f or a GitOps prune: the Cluster's deletion has started (held by a test finalizer), but
+			// its control plane still exists and needs this object to delete the IBM cluster.
+			name: "rejected while the cluster is deleting and the control plane has a clusterID",
 			prepare: func(t *testing.T, g *WithT, clusterName string) {
 				t.Helper()
 				createCluster(t, namespace, clusterName, true)
 				createControlPlane(g, newControlPlane(namespace, clusterName), clusterIDStatus)
+			},
+			wantErr: func(clusterName string) string {
+				return infraClusterDeletingClusterMessage(clusterName, testIBMClusterID)
+			},
+		},
+		{
+			// Cluster API's own order: it deletes this object only after the control plane is gone.
+			name: "allowed while the cluster is deleting and the control plane is gone",
+			prepare: func(t *testing.T, _ *WithT, clusterName string) {
+				t.Helper()
+				createCluster(t, namespace, clusterName, true)
 			},
 		},
 		{
@@ -368,14 +438,79 @@ func TestIBMCloudManagedClusterWebhookDelete(t *testing.T) {
 
 			err := testEnv.Delete(ctx, infra)
 
-			if !tc.wantErr {
+			if tc.wantErr == nil {
 				g.Expect(err).NotTo(HaveOccurred())
 				return
 			}
 			g.Expect(apierrors.IsForbidden(err)).To(BeTrue(), "want Forbidden, got %v", err)
-			g.Expect(err.Error()).To(ContainSubstring(infraClusterDeleteDeniedMessage(clusterName)))
+			g.Expect(err.Error()).To(ContainSubstring(tc.wantErr(clusterName)))
 		})
 	}
+}
+
+// TestIBMCloudManagedClusterWebhookDeleteWithCluster deletes a whole cluster through the API server the way
+// `kubectl delete -f` of a template does (the Cluster first, then the IBMCloudManagedCluster, then the control plane)
+// and then lets the deletion finish the way Cluster API does. Envtest runs no controller, so test finalizers stand in
+// for Cluster API's and the control plane's: the IBMCloudManagedCluster must stay while the control plane still
+// exists, even while that control plane is itself being deleted, and must go once the control plane is gone, so that
+// the guard never blocks Cluster API's own ordered deletion.
+func TestIBMCloudManagedClusterWebhookDeleteWithCluster(t *testing.T) {
+	g := NewWithT(t)
+	namespace := newTestNamespace(t, "ibmcmc-webhook-delete-all")
+	const clusterName = "dev"
+	// The test finalizers stand in for Cluster API's on the Cluster and for the control plane's own, which holds the
+	// control plane while it deletes the IBM cluster.
+	cluster := newCluster(namespace, clusterName)
+	cluster.Finalizers = []string{holdFinalizer}
+	g.Expect(testEnv.Create(ctx, cluster)).To(Succeed())
+	t.Cleanup(func() { g.Expect(client.IgnoreNotFound(removeFinalizers(cluster))).To(Succeed()) })
+	cp := newControlPlane(namespace, clusterName)
+	cp.Finalizers = []string{holdFinalizer}
+	createControlPlane(g, cp, &controlplanev1.IBMCloudManagedControlPlaneStatus{ClusterID: testIBMClusterID})
+	t.Cleanup(func() { g.Expect(client.IgnoreNotFound(removeFinalizers(cp))).To(Succeed()) })
+	infra := newInfraCluster(namespace, clusterName)
+	g.Expect(testEnv.Create(ctx, infra)).To(Succeed())
+	wantRejection := infraClusterDeletingClusterMessage(clusterName, testIBMClusterID)
+
+	// The Cluster is the first document of the template, so its deletion starts first.
+	g.Expect(testEnv.Delete(ctx, cluster)).To(Succeed())
+
+	// The IBMCloudManagedCluster comes next: rejected, because the control plane still needs it.
+	err := testEnv.Delete(ctx, infra)
+	g.Expect(apierrors.IsForbidden(err)).To(BeTrue(), "want Forbidden, got %v", err)
+	g.Expect(err.Error()).To(ContainSubstring(wantRejection))
+
+	// The control plane's deletion is admitted, because its Cluster is being deleted, and its finalizer holds it while
+	// it deletes the IBM cluster; the IBMCloudManagedCluster stays guarded meanwhile.
+	g.Expect(testEnv.Delete(ctx, cp)).To(Succeed())
+	err = testEnv.Delete(ctx, infra)
+	g.Expect(apierrors.IsForbidden(err)).To(BeTrue(), "want Forbidden, got %v", err)
+	g.Expect(err.Error()).To(ContainSubstring(wantRejection))
+
+	// The IBM cluster is gone and the control plane removes its finalizer, which removes the object at once; Cluster API
+	// then deletes the IBMCloudManagedCluster, which the guard admits. The check reads through the API reader, like the
+	// webhook does: the API server removes the object within the finalizer patch, while the manager's cache (testEnv.Get)
+	// may still hold it for a moment.
+	g.Expect(removeFinalizers(cp)).To(Succeed())
+	err = testEnv.GetAPIReader().Get(ctx, client.ObjectKeyFromObject(cp), &controlplanev1.IBMCloudManagedControlPlane{})
+	g.Expect(apierrors.IsNotFound(err)).To(BeTrue(),
+		"the control plane must be gone once its last finalizer is removed, got %v", err)
+	g.Expect(testEnv.Delete(ctx, infra)).To(Succeed())
+}
+
+// removeFinalizers removes every finalizer of obj with a merge patch, after re-reading obj from the API server so that
+// the patch applies to the stored object. The read goes through the API reader, not the manager's cache, because the
+// cache may not have seen an object created or deleted a moment ago: a stale read could miss an object that exists or
+// return one that is gone. It returns the error of the read or of the patch, NotFound when obj is already gone.
+//
+// obj is the envtest object whose finalizers are removed; it is updated to the stored state.
+func removeFinalizers(obj client.Object) error {
+	if err := testEnv.GetAPIReader().Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+		return err
+	}
+	patch := client.MergeFrom(obj.DeepCopyObject().(client.Object))
+	obj.SetFinalizers(nil)
+	return testEnv.Patch(ctx, obj, patch)
 }
 
 // TestIBMCloudManagedClusterWebhookUpdate re-tests the field rules of IBMCloudManagedCluster through the API server with the

@@ -423,7 +423,8 @@ func TestIBMCloudManagedControlPlaneValidateUpdate(t *testing.T) {
 }
 
 // TestIBMCloudManagedControlPlaneValidateDelete covers every case of the delete guard on the typed validator with a
-// strict reader, which also proves which reads each case makes (none for the exemptions that need no read).
+// strict reader, which also proves which reads each case makes (none for the exemptions that need no read). Every case
+// runs with the feature gate on and off, because the guard does not depend on it.
 func TestIBMCloudManagedControlPlaneValidateDelete(t *testing.T) {
 	readFailure := errors.New("connection refused")
 	testCases := []struct {
@@ -508,26 +509,30 @@ func TestIBMCloudManagedControlPlaneValidateDelete(t *testing.T) {
 		},
 	}
 	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			g := NewWithT(t)
-			cp := newControlPlane(unitNamespace, "dev")
-			tc.mutate(cp)
-			reader := newStrictReader(t, tc.allowed, tc.errs, tc.objs...)
+		// The guard must answer the same whatever the feature gate value.
+		for _, gate := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s (gate on: %t)", tc.name, gate), func(t *testing.T) {
+				g := NewWithT(t)
+				cp := newControlPlane(unitNamespace, "dev")
+				tc.mutate(cp)
+				reader := newStrictReader(t, tc.allowed, tc.errs, tc.objs...)
 
-			warnings, err := (&IBMCloudManagedControlPlane{ManagedKubernetesEnabled: true, Reader: reader}).ValidateDelete(context.Background(), cp)
+				validator := &IBMCloudManagedControlPlane{ManagedKubernetesEnabled: gate, Reader: reader}
+				warnings, err := validator.ValidateDelete(context.Background(), cp)
 
-			g.Expect(warnings).To(BeEmpty())
-			g.Expect(reader.calls).To(Equal(tc.allowed))
-			switch {
-			case tc.wantErr == "":
-				g.Expect(err).NotTo(HaveOccurred())
-			case tc.errs != nil:
-				g.Expect(apierrors.IsInternalError(err)).To(BeTrue(), "want InternalError, got %v", err)
-				g.Expect(err.Error()).To(ContainSubstring(tc.wantErr))
-			default:
-				expectForbidden(g, err, tc.wantErr)
-			}
-		})
+				g.Expect(warnings).To(BeEmpty())
+				g.Expect(reader.calls).To(Equal(tc.allowed))
+				switch {
+				case tc.wantErr == "":
+					g.Expect(err).NotTo(HaveOccurred())
+				case tc.errs != nil:
+					g.Expect(apierrors.IsInternalError(err)).To(BeTrue(), "want InternalError, got %v", err)
+					g.Expect(err.Error()).To(ContainSubstring(tc.wantErr))
+				default:
+					expectForbidden(g, err, tc.wantErr)
+				}
+			})
+		}
 	}
 }
 

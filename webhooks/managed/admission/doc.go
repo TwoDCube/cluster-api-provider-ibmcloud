@@ -21,8 +21,11 @@ limitations under the License.
 // tested next to the fields it guards. Four rules do not fit there, so they live here:
 //
 //   - The feature gate. With the ManagedKubernetes gate off the controllers do not run, but the webhooks stay
-//     registered and reject only CREATE, naming EXP_MANAGED_KUBERNETES. An unregistered webhook would give an opaque
-//     "webhook not found" error and block updates and deletes of objects that already exist.
+//     registered and reject only CREATE for the gate, naming EXP_MANAGED_KUBERNETES. An unregistered webhook would give
+//     an opaque "webhook not found" error and block updates and deletes of objects that already exist. The delete
+//     guards (below) run with the gate off too: a deletionTimestamp cannot be taken back, so a deletion admitted while
+//     the gate is off is carried out once the gate is on again, and an InfraCluster, which has no finalizer, goes at
+//     once.
 //   - The master minor step. spec.distributionVersion may rise by one minor at a time and never go below the master's
 //     minor. The observed minor is in status.distributionVersion, written in IBM's version grammar
 //     (pkg/util/ibmversion), which a CEL rule on spec can neither see nor parse.
@@ -38,7 +41,9 @@ limitations under the License.
 //     spec.infrastructureRef still names it and the Cluster's control plane. A control plane deleted on its own would
 //     delete the IBM cluster while the CAPI objects remain; an InfraCluster deleted on its own (it has no finalizer)
 //     would take away the resource group and the credentials holder that the control plane needs to find and delete
-//     its IBM cluster.
+//     its IBM cluster. The InfraCluster stays guarded while its Cluster is being deleted, until the control plane is
+//     gone: Cluster API deletes it only after the control plane, so an earlier deletion comes from a tool that deletes
+//     every object at once (kubectl delete -f, a GitOps prune).
 //
 // Pool deletions are never rejected: blocking them is the regret CAPZ documented, and the pool controller drains
 // before it removes workers.

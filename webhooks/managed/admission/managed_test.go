@@ -465,16 +465,20 @@ func TestNoIBMClusterCanExist(t *testing.T) {
 	}
 }
 
-func TestLiveOwnerCluster(t *testing.T) {
+// TestOwnerCluster covers the Cluster lookup of both delete guards. A Cluster that is being deleted is returned with its
+// deletionTimestamp, because the two guards treat it differently: the control plane's guard allows the deletion, the
+// IBMCloudManagedCluster's guard keeps the object until the control plane is gone.
+func TestOwnerCluster(t *testing.T) {
 	readFailure := errors.New("connection refused")
 	testCases := []struct {
-		name        string
-		objs        []client.Object
-		labels      map[string]string
-		allowed     []string
-		errs        map[string]error
-		wantCluster string
-		wantErr     string
+		name         string
+		objs         []client.Object
+		labels       map[string]string
+		allowed      []string
+		errs         map[string]error
+		wantCluster  string
+		wantDeleting bool
+		wantErr      string
 	}{
 		{
 			name: "object names no Cluster: nothing is read",
@@ -485,10 +489,12 @@ func TestLiveOwnerCluster(t *testing.T) {
 			allowed: []string{clusterGet("dev")},
 		},
 		{
-			name:    "Cluster being deleted",
-			objs:    []client.Object{deleting(newCluster(unitNamespace, "dev"))},
-			labels:  map[string]string{clusterv1.ClusterNameLabel: "dev"},
-			allowed: []string{clusterGet("dev")},
+			name:         "Cluster being deleted is returned with its deletionTimestamp",
+			objs:         []client.Object{deleting(newCluster(unitNamespace, "dev"))},
+			labels:       map[string]string{clusterv1.ClusterNameLabel: "dev"},
+			allowed:      []string{clusterGet("dev")},
+			wantCluster:  "dev",
+			wantDeleting: true,
 		},
 		{
 			name:        "Cluster live",
@@ -512,7 +518,7 @@ func TestLiveOwnerCluster(t *testing.T) {
 			reader := newStrictReader(t, tc.allowed, tc.errs, tc.objs...)
 			obj := &infrav1.IBMCloudManagedCluster{ObjectMeta: metav1.ObjectMeta{Name: "dev", Namespace: unitNamespace, Labels: tc.labels}}
 
-			cluster, err := liveOwnerCluster(context.Background(), reader, obj, "IBMCloudManagedCluster")
+			cluster, err := ownerCluster(context.Background(), reader, obj, "IBMCloudManagedCluster")
 
 			g.Expect(reader.calls).To(Equal(tc.allowed))
 			if tc.wantErr != "" {
@@ -527,6 +533,7 @@ func TestLiveOwnerCluster(t *testing.T) {
 			}
 			g.Expect(cluster).NotTo(BeNil())
 			g.Expect(cluster.Name).To(Equal(tc.wantCluster))
+			g.Expect(cluster.DeletionTimestamp.IsZero()).To(Equal(!tc.wantDeleting))
 		})
 	}
 }
@@ -569,13 +576,15 @@ func TestValidateDeleteWithNilReader(t *testing.T) {
 }
 
 // TestGateOff covers the feature gate for all three kinds with the typed validators: with the ManagedKubernetes gate
-// off, create is rejected with a message naming EXP_MANAGED_KUBERNETES, and update and delete are allowed without
-// any read, even for objects the delete guards would otherwise protect (neither delete guard applies while the gate
-// is off).
+// off, create is rejected with a message naming EXP_MANAGED_KUBERNETES and update is allowed without any read, while
+// delete still passes the delete guards. A deletionTimestamp cannot be taken back: a control plane deleted while the
+// gate is off would only run its delete flow once the gate is on again, and the IBMCloudManagedCluster, which has no
+// finalizer, would go at once. The delete guard tables run with both gate values as well; this test adds the rows that
+// the gate alone used to allow.
 func TestGateOff(t *testing.T) {
 	ctx := context.Background()
-	// The objects carry every mark of an IBM cluster and a live Cluster exists, so only the gate can allow the
-	// deletions; the strict reader allows no read at all.
+	// The objects carry every mark of an IBM cluster and a live Cluster exists, so each guard must reject the deletion
+	// whatever the gate value.
 	cp := newControlPlane(unitNamespace, "dev")
 	withClusterID(cp)
 	withEndpoint(cp)
@@ -583,19 +592,21 @@ func TestGateOff(t *testing.T) {
 	pool := newMachinePool(unitNamespace, "dev-pool", "dev")
 
 	testCases := []struct {
-		name string
-		// deleteCase prefixes the name of the delete subtest: "webhook" for the delete rules of the control plane and pool
-		// webhooks, "infracluster_guard" for the delete guard of IBMCloudManagedCluster.
-		deleteCase     string
+		name           string
 		validateCreate func(reader client.Reader) ([]string, error)
 		validateUpdate func(reader client.Reader) ([]string, error)
 		validateDelete func(reader client.Reader) ([]string, error)
 		resource       string
+		// deleteReads are the reads the delete guard makes; deleteDenied is its rejection, "" for a kind whose deletions
+		// are never rejected (the pool).
+		deleteReads  []string
+		deleteDenied string
 	}{
 		{
-			name:       "IBMCloudManagedControlPlane",
-			deleteCase: "webhook",
-			resource:   "ibmcloudmanagedcontrolplanes.controlplane.cluster.x-k8s.io",
+			name:         "IBMCloudManagedControlPlane",
+			resource:     "ibmcloudmanagedcontrolplanes.controlplane.cluster.x-k8s.io",
+			deleteReads:  []string{clusterGet("dev")},
+			deleteDenied: controlPlaneDeleteDeniedMessage("dev"),
 			validateCreate: func(reader client.Reader) ([]string, error) {
 				return (&IBMCloudManagedControlPlane{Reader: reader}).ValidateCreate(ctx, cp)
 			},
@@ -612,9 +623,10 @@ func TestGateOff(t *testing.T) {
 			},
 		},
 		{
-			name:       "IBMCloudManagedCluster",
-			deleteCase: "infracluster_guard",
-			resource:   "ibmcloudmanagedclusters.infrastructure.cluster.x-k8s.io",
+			name:         "IBMCloudManagedCluster",
+			resource:     "ibmcloudmanagedclusters.infrastructure.cluster.x-k8s.io",
+			deleteReads:  []string{clusterGet("dev"), controlPlaneGet(controlPlaneNameFor("dev"))},
+			deleteDenied: infraClusterDeleteDeniedMessage("dev"),
 			validateCreate: func(reader client.Reader) ([]string, error) {
 				return (&IBMCloudManagedCluster{Reader: reader}).ValidateCreate(ctx, infra)
 			},
@@ -626,9 +638,8 @@ func TestGateOff(t *testing.T) {
 			},
 		},
 		{
-			name:       "IBMCloudManagedMachinePool",
-			deleteCase: "webhook",
-			resource:   "ibmcloudmanagedmachinepools.infrastructure.cluster.x-k8s.io",
+			name:     "IBMCloudManagedMachinePool",
+			resource: "ibmcloudmanagedmachinepools.infrastructure.cluster.x-k8s.io",
 			validateCreate: func(client.Reader) ([]string, error) {
 				return (&IBMCloudManagedMachinePool{}).ValidateCreate(ctx, pool)
 			},
@@ -657,12 +668,17 @@ func TestGateOff(t *testing.T) {
 			warnings, err := tc.validateUpdate(reader)
 			expectAllowed(g, warnings, err)
 		})
-		t.Run(tc.deleteCase+"_gate_off_"+tc.name+"_delete_allowed_without_reads", func(t *testing.T) {
+		t.Run("gate_off_"+tc.name+"_delete_guarded", func(t *testing.T) {
 			g := NewWithT(t)
-			reader := newStrictReader(t, nil, nil, newCluster(unitNamespace, "dev"), cp)
+			reader := newStrictReader(t, tc.deleteReads, nil, newCluster(unitNamespace, "dev"), cp)
 			warnings, err := tc.validateDelete(reader)
-			expectAllowed(g, warnings, err)
-			g.Expect(reader.calls).To(BeEmpty())
+			g.Expect(reader.calls).To(Equal(tc.deleteReads))
+			if tc.deleteDenied == "" {
+				expectAllowed(g, warnings, err)
+				return
+			}
+			g.Expect(warnings).To(BeEmpty())
+			expectForbidden(g, err, tc.deleteDenied)
 		})
 	}
 }

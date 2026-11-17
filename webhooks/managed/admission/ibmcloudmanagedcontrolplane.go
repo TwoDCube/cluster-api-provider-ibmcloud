@@ -41,11 +41,14 @@ var _ admission.Validator[*controlplanev1.IBMCloudManagedControlPlane] = &IBMClo
 
 // IBMCloudManagedControlPlane validates IBMCloudManagedControlPlane objects: on create the feature gate and the IBM
 // cluster name (IBM's rule, and a warning when the name defaults to the Cluster's), on update the master minor step,
-// and on delete the delete guard. It never calls IBM Cloud.
+// and on delete the delete guard, whatever the feature gate value. It never calls IBM Cloud.
 type IBMCloudManagedControlPlane struct {
 	// ManagedKubernetesEnabled is the value of the ManagedKubernetes feature gate. When false, CREATE is rejected and
-	// every other operation is allowed unchecked: no controller reconciles the object, and the controller repeats the
-	// minor-step check once the gate is on again.
+	// updates are allowed unchecked, because no controller reconciles the object and the controller repeats the
+	// minor-step check once the gate is on again. DELETE still passes the delete guard: a deletionTimestamp cannot be
+	// taken back, so a control plane deleted while the gate is off would only run its delete flow once the gate is on
+	// again (no more kubeconfig refresh or master updates, and the IBM cluster deleted as soon as the Cluster's pools
+	// are gone), while its Cluster stays.
 	ManagedKubernetesEnabled bool
 
 	// Reader reads the owning Cluster for the delete guard and, on create, lists the Clusters of the namespace to find
@@ -152,21 +155,22 @@ func (r *IBMCloudManagedControlPlane) ValidateUpdate(_ context.Context, oldCP, n
 
 // ValidateDelete is the delete guard of IBMCloudManagedControlPlane: deleting the control plane deletes the IBM
 // cluster with every worker pool, so a control plane deleted on its own (kubectl, a GitOps prune or a forced replace)
-// would destroy the cluster while the CAPI objects remain. The deletion is allowed when the gate is off, when
-// clusterctl move deletes the object (delete-for-move), when no IBM cluster can exist yet, and when the owning
-// Cluster is gone or being deleted; otherwise it is rejected with "delete Cluster <name> instead". The checks that
-// need no read run first, so most allowed deletions read nothing.
+// would destroy the cluster while the CAPI objects remain. The deletion is allowed when clusterctl move deletes the
+// object (delete-for-move), when no IBM cluster can exist yet, and when the owning Cluster is gone or being deleted,
+// because Cluster API deletes the control plane as part of the Cluster's deletion; otherwise it is rejected with
+// "delete Cluster <name> instead". The guard runs whatever the feature gate value (see ManagedKubernetesEnabled). The
+// checks that need no read run first, so most allowed deletions read nothing.
 //
 // ctx is the admission request's context, used for the Cluster read; cp is the control plane being deleted.
 func (r *IBMCloudManagedControlPlane) ValidateDelete(ctx context.Context, cp *controlplanev1.IBMCloudManagedControlPlane) (admission.Warnings, error) {
-	if !r.ManagedKubernetesEnabled || isBeingMoved(cp) || noIBMClusterCanExist(cp) {
+	if isBeingMoved(cp) || noIBMClusterCanExist(cp) {
 		return nil, nil
 	}
 	if err := requireReader("IBMCloudManagedControlPlane", r.Reader); err != nil {
 		return nil, apierrors.NewInternalError(err)
 	}
-	cluster, err := liveOwnerCluster(ctx, r.Reader, cp, "IBMCloudManagedControlPlane")
-	if err != nil || cluster == nil {
+	cluster, err := ownerCluster(ctx, r.Reader, cp, "IBMCloudManagedControlPlane")
+	if err != nil || cluster == nil || !cluster.DeletionTimestamp.IsZero() {
 		return nil, err
 	}
 	return nil, apierrors.NewForbidden(controlPlaneResource, cp.Name, fmt.Errorf(

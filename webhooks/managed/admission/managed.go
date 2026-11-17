@@ -32,9 +32,10 @@ import (
 	infrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/v1alpha1"
 )
 
-// This file holds what the three validators share: the gate-off rejection, the lookup of the owning Cluster, the
-// test for a Cluster's spec references and the "no IBM cluster can exist" test of the control plane's delete guard,
-// which the IBMCloudManagedCluster delete guard reuses so that both guards exempt exactly the same control planes.
+// This file holds what the three validators share: the gate-off rejection of a create, the lookup of the owning
+// Cluster, the test for a Cluster's spec references and the "no IBM cluster can exist" test of the control plane's
+// delete guard, which the IBMCloudManagedCluster delete guard reuses so that both guards exempt exactly the same
+// control planes.
 
 // The webhooks get Clusters and IBMCloudManagedControlPlanes for the delete guards, and list the Clusters of a
 // namespace to name the Cluster in the ibmCloudClusterName warning of a control plane created from a template, which
@@ -73,8 +74,8 @@ func requireReader(kind string, reader client.Reader) error {
 }
 
 // gateOffCreateError is the rejection of a CREATE while the ManagedKubernetes feature gate is off. Only creates are
-// rejected: objects that already exist must stay updatable and deletable, and a create is the one request that cannot
-// be useful while no controller reconciles the kind.
+// rejected for the gate: objects that already exist must stay updatable, and deletable under the same delete guards as
+// with the gate on, and a create is the one request that cannot be useful while no controller reconciles the kind.
 //
 // resource names the kind in the error, for example ibmcloudmanagedcontrolplanes.controlplane.cluster.x-k8s.io; kind is
 // the kind's name for the message text; name is the name of the object being created (it may be empty when the
@@ -153,17 +154,18 @@ func hasCreateIntent(intent controlplanev1.CreateIntent) bool {
 		!intent.LastUnknownOutcomeTime.IsZero()
 }
 
-// liveOwnerCluster returns the Cluster that obj belongs to when that Cluster exists and is not being deleted, and nil
-// when obj names no Cluster, the Cluster is gone, or it has a deletionTimestamp. In the nil cases a deletion is part of
-// a Cluster deletion (CAPI deletes the control plane and then the InfraCluster while the Cluster is held by its
-// finalizer: reconcileDelete in core/reconcilers/cluster/cluster_controller.go, lines 407-465 in CAPI v1.14.0) or
-// concerns an object no Cluster uses, so both delete guards allow it.
+// ownerCluster returns the Cluster that obj belongs to when that Cluster exists, whether or not it is being deleted,
+// and nil when obj names no Cluster or the Cluster is gone. Both delete guards allow the nil cases, because the object
+// then belongs to no Cluster that could still use it. They treat a Cluster that is being deleted differently, so the
+// lookup returns it and leaves that decision to them: Cluster API deletes the control plane while the Cluster is held
+// by its finalizer, and the InfraCluster only after the control plane is gone (reconcileDelete in
+// core/reconcilers/cluster/cluster_controller.go, CAPI v1.14.4).
 //
 // ctx is the admission request's context. reader must be the manager's API reader (see the package documentation).
 // obj is the managed object being deleted; the Cluster is looked up in its namespace, by clusterNameOf. kind is obj's
 // kind, used only in the error message. A read error other than NotFound is returned as an InternalError that names
 // the Cluster, so the deletion is rejected and can be retried (fail closed).
-func liveOwnerCluster(ctx context.Context, reader client.Reader, obj client.Object, kind string) (*clusterv1.Cluster, error) {
+func ownerCluster(ctx context.Context, reader client.Reader, obj client.Object, kind string) (*clusterv1.Cluster, error) {
 	name := clusterNameOf(obj)
 	if name == "" {
 		return nil, nil
@@ -175,9 +177,6 @@ func liveOwnerCluster(ctx context.Context, reader client.Reader, obj client.Obje
 			return nil, nil
 		}
 		return nil, readError("Cluster", key, kind, obj.GetName(), err)
-	}
-	if !cluster.DeletionTimestamp.IsZero() {
-		return nil, nil
 	}
 	return cluster, nil
 }
