@@ -73,12 +73,13 @@ credentials.
 
 ```console
 kubectl get cluster,ibmcmc,ibmcmcp,machinepool,ibmcmmp -n <namespace>
-kubectl get ibmcmcp -n <namespace> -o wide     # adds the IBM cluster ID and the endpoint host
+kubectl get ibmcmcp -n <namespace> -o wide     # adds the IBM cluster ID, the endpoint host and newer minors
 ```
 
 * `IBMCloudManagedControlPlane` columns: `Distribution`, `Version` (IBM's master version, for example `1.36.5_1537` or
   `4.21.35_1537_openshift`), `Kubernetes` (the version the API server reports, for example `v1.36.5+IKS` or `v1.34.9`),
-  `State` (IBM's cluster state) and `Available`.
+  `State` (IBM's cluster state) and `Available`; with `-o wide` also `ID`, `Endpoint` and `Upgrades` (the newer minors
+  IBM offers for the master, information only; see [Upgrades](./upgrades.md#seeing-that-a-newer-minor-is-available)).
 * `IBMCloudManagedMachinePool` columns: `Pool` (the IBM pool name), `Flavor`, `Replicas`, `Ready` and `Updates` (workers
   with a newer minor or fix pack available).
 

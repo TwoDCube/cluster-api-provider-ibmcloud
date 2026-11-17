@@ -42,7 +42,7 @@ CAPIBM makes no IBM call and writes nothing to the workload cluster.
 | | False | `EndpointUnreachable` | "The management cluster cannot reach <url> (...); private-only clusters need private connectivity" |
 | | Unknown | `CARotationInProgress` | IBM rotates the cluster CA; checked every minute |
 | | False | `UserProvidedSecretInvalid` | a user-provided Secret lacks the `cluster.x-k8s.io/cluster-name` label or a non-empty `value` key |
-| `MasterVersionUpToDate` | True | `UpToDate` | the master runs the minor of `spec.distributionVersion`, whatever patch; an end of support within 45 days is mentioned |
+| `MasterVersionUpToDate` | True | `UpToDate` | the master runs the minor of `spec.distributionVersion`, whatever patch; an end of support within 45 days is mentioned; while IBM offers newer minors (`status.availableDistributionVersions`) the message ends with "update available: IBM offers <minors>; raise spec.distributionVersion to update", which never makes the condition `False` |
 | | False | `UpgradePending` | a requested minor update is in flight at IBM |
 | | False | `UpgradeFailed` | the requested update has not taken effect and IBM shows no update in progress; the message names the retry time. Also after a refused `UpdateMaster` whose `PermissionDenied` a failed listing (below) replaced, with the same retry time |
 | | False | `VersionSkipNotAllowed` | `spec.distributionVersion` is more than one minor above the master |
@@ -167,6 +167,7 @@ Events: `WorkerPoolAdopted`, `DrainStarted`, `DrainCompleted`, `NodeUncordoned`,
 | `clusterID`, `clusterCRN` | the bound IBM cluster |
 | `state`, `master.state`, `master.health` | IBM's cluster state and master tokens (IBM's free text is never stored) |
 | `distributionVersion`, `targetDistributionVersion`, `distributionVersionEndOfSupport` | IBM's master version, target version and end of service |
+| `availableDistributionVersions` | the minors newer than the master's that IBM offers for the distribution, ascending, for example `["1.37", "1.38"]` (the `Upgrades` column of `kubectl get ibmcmcp -o wide`); information only, CAPIBM requests none of them; read from IBM at most once an hour per set of credentials and region, and kept when IBM cannot be asked |
 | `versions[0].version`, `version` | the Kubernetes version the API server reports (contract fields) |
 | `initialization.controlPlaneInitialized`, `externalManagedControlPlane` | contract fields |
 | `createIntent` | create attempts whose outcome is not known yet; lets a lost create answer be told apart from a foreign cluster |

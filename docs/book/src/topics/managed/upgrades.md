@@ -41,6 +41,28 @@ spec.distributionVersion <next-minor>". Minors reach their end
 of service on IBM's schedule (in November 2026 IBM listed 2027-01-20 for IKS 1.34), so plan regular upgrades; on an
 `unsupported` cluster IBM adds and replaces no workers until the master is upgraded.
 
+### Seeing that a newer minor is available
+
+`status.availableDistributionVersions` lists the minors newer than the master's that IBM offers for the cluster's
+distribution, in ascending order, for example `["1.37", "1.38"]` for an IKS master on 1.36 or `["4.22"]` for a ROKS
+master on 4.21. `kubectl get ibmcmcp -o wide` shows it in the `Upgrades` column. While the list is not empty, the
+`True` message of `MasterVersionUpToDate` ends with a note, for example:
+
+```text
+the master runs 1.36.5_1537, minor 1.36 as spec.distributionVersion asks; IBM applies master patches itself; update available: IBM offers 1.37, 1.38; raise spec.distributionVersion to update
+```
+
+This is information only. The master stays up to date (`MasterVersionUpToDate=True`), because it runs the minor you
+asked for, and CAPIBM updates nothing until you raise `spec.distributionVersion`, one minor at a time as above.
+
+* CAPIBM reads IBM's list of offered versions at most once an hour per set of credentials and region, so a minor that
+  IBM starts to offer shows up within about an hour.
+* If IBM cannot be asked, the list keeps its last value (without a minor the master has reached since), and CAPIBM asks
+  again a few minutes later, after a 429 not before IBM's `Retry-After`.
+* Master patches are not listed: IBM applies them itself, and `RollingOut=True` (`MasterUpdateInProgress`, "IBM is
+  applying master patch <version>") shows one in progress. A master patch that IBM offers but has not applied yet is not
+  reported.
+
 ### When IBM does not take the update
 
 * If the master is still on the old minor some time after the request and IBM shows no update in progress, the reason
@@ -59,8 +81,8 @@ of service on IBM's schedule (in November 2026 IBM listed 2027-01-20 for IKS 1.3
     incident ID in the controller log; if it points to no fix on your side, open an IBM support case with them.
 
   Unlike a refused `UpdateMaster`, a refused listing is tried again at every poll of the control plane (about every
-  5 minutes), so a granted role takes effect within minutes. A 401, a 429 or a 5xx answer changes no condition: CAPIBM
-  rebuilds the credentials, waits for IBM's `Retry-After`, or retries with a backoff. Once the listings succeed, the
+  5 minutes), so a granted role takes effect within minutes. After a 401, a 429 or a 5xx answer CAPIBM rebuilds the
+  credentials, waits for IBM's `Retry-After`, or retries with a backoff. Once the listings succeed, the
   update continues; a request already on record keeps its retry time. A refused `UpdateMaster` that the condition
   showed before the listing failed is not shown again: the reason then reads `UpgradeFailed` ("... CAPIBM requests it
   again at <retry time>"), with the same retry time, so no request is lost or added.
