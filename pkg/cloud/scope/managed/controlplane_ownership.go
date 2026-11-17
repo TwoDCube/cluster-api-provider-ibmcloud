@@ -101,8 +101,8 @@ func credentialProblem(err error) string {
 }
 
 // probeOwnership rebuilds the kubeconfig for the candidate with the flavor's trust mode and, after a TLS failure, the
-// other one (the trust of a private-only master is not yet verified against IBM Cloud), probes it, and reads the
-// cluster-admin access review (ProvesOwnership).
+// other one (the trust of a private-only OpenShift master is not yet verified against IBM Cloud), probes it, and reads
+// the cluster-admin access review (ProvesOwnership).
 //
 // Parameters:
 //   - ctx is the reconcile context.
