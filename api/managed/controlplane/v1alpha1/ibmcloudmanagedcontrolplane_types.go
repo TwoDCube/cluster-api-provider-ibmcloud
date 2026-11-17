@@ -112,15 +112,19 @@ type IBMCloudManagedControlPlaneSpec struct {
 	OpenShift OpenShiftSpec `json:"openShift,omitempty,omitzero"`
 
 	// ibmCloudClusterName is the IBM Cloud cluster name. Omitted means the owning CAPI Cluster's metadata.name; that
-	// derivation never changes in this API version. IBM rules: starts with a letter; letters, digits, '.' and '-';
-	// at most 35 characters; unique in the account across regions. Keep the first 24 characters unique: re-creating
-	// the same prefix five times in seven days hits the Let's Encrypt limit for the Ingress subdomain. Immutable.
-	// CAPI Cluster names are unique only per namespace, so the admission webhook returns a warning when this field is
-	// omitted; management clusters with several namespaces should use a convention such as <namespace>-<name>.
+	// derivation never changes in this API version. IBM's rule, which its API enforces when the cluster is created:
+	// 1 to 32 characters, starting with a letter (a-z or A-Z), then letters, digits, '-', '_' and '.'; unique in the
+	// account across regions. Keep the first 24 characters unique: re-creating the same prefix five times in seven
+	// days hits the Let's Encrypt limit for the Ingress subdomain. Immutable.
+	// When this field is omitted, the Cluster's name must follow IBM's rule too, and a Cluster name may be longer than
+	// 32 characters or start with a digit: the admission webhook then rejects the control plane, or, when it cannot
+	// tell the Cluster yet, the controller stops with InvalidConfiguration before any IBM call. A valid omitted name
+	// gets an admission warning instead, because CAPI Cluster names are unique only per namespace; management clusters
+	// with several namespaces should use a convention such as <namespace>-<name>.
 	// +optional
 	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=35
-	// +kubebuilder:validation:Pattern=`^[a-zA-Z][a-zA-Z0-9.-]*$`
+	// +kubebuilder:validation:MaxLength=32
+	// +kubebuilder:validation:XValidation:rule="self.matches('^[a-zA-Z][a-zA-Z0-9._-]*$')",message="ibmCloudClusterName must start with a letter (a-z or A-Z) and contain only letters, digits, '-', '_' and '.' (IBM's cluster name rule; at most 32 characters)"
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="ibmCloudClusterName is immutable"
 	IBMCloudClusterName string `json:"ibmCloudClusterName,omitempty"`
 
@@ -338,7 +342,7 @@ type CreateIntent struct {
 	// clusterName is the IBM name the requests used.
 	// +required
 	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=35
+	// +kubebuilder:validation:MaxLength=32
 	ClusterName string `json:"clusterName,omitempty"`
 
 	// inFlightAttemptTime is written immediately BEFORE a POST. A definitive refusal clears it; a timeout, 429 or 5xx

@@ -65,6 +65,10 @@ func setup() {
 			panic(fmt.Sprintf("Failed to start the envtest manager: %v", err))
 		}
 	}()
+	// StartManager stores the cancel function that Stop calls, in the goroutine above. The manager closes Elected()
+	// once it runs (at once, without leader election), so waiting for it orders that store before teardown's Stop;
+	// without the wait, go test -race reports the store and Stop's read as a data race.
+	<-testEnv.Elected()
 }
 
 func teardown() {

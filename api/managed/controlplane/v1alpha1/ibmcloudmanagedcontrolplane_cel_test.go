@@ -37,6 +37,7 @@ const (
 	distributionRuleMessage    = "distribution Kubernetes needs a 1.x distributionVersion and no openShift"
 	distributionVersionMessage = "distributionVersion must be MAJOR.MINOR"
 	clusterNamePresenceMessage = "ibmCloudClusterName cannot be added or removed after creation"
+	clusterNameRuleMessage     = "ibmCloudClusterName must start with a letter (a-z or A-Z) and contain only letters, digits, '-', '_' and '.'"
 	publicEndpointMessage      = "endpoints.publicServiceEndpoint is immutable"
 	endpointAddOnceMessage     = "controlPlaneEndpoint cannot be changed or removed once set"
 	endpointHostPortMessage    = "controlPlaneEndpoint needs both host and port"
@@ -61,6 +62,16 @@ func newROKSControlPlane(namespace string) *controlplanev1.IBMCloudManagedContro
 	cp.Spec.DistributionVersion = "4.21"
 	cp.Spec.OpenShift = openShiftWithCOS(testCOSInstanceCRN)
 	return cp
+}
+
+// withIBMCloudClusterName returns a constructor of a valid IKS control plane in namespace whose spec.ibmCloudClusterName
+// is name, for the table rows of the IBM name rule.
+func withIBMCloudClusterName(namespace, name string) func() *controlplanev1.IBMCloudManagedControlPlane {
+	return func() *controlplanev1.IBMCloudManagedControlPlane {
+		cp := newIKSControlPlane(namespace)
+		cp.Spec.IBMCloudClusterName = name
+		return cp
+	}
 }
 
 // openShiftWithCOS returns the ROKS settings with the registry stored in the COS instance crn.
@@ -189,25 +200,46 @@ func TestIBMCloudManagedControlPlaneCreateValidation(t *testing.T) {
 				cp.Spec.IBMCloudClusterName = "1cluster"
 				return cp
 			},
-			wantErr: "spec.ibmCloudClusterName",
+			wantErr: clusterNameRuleMessage,
+		},
+		// IBM's rule as its API states it when it refuses a name: at most 32 characters, a letter first, then letters,
+		// digits, '-', '_' and '.'. The schema must accept every name IBM accepts and refuse the others.
+		{
+			name:   "ibm_cloud_cluster_name_of_31_characters_allowed",
+			object: withIBMCloudClusterName(namespace, "a"+strings.Repeat("b", 30)),
 		},
 		{
-			name: "ibm_cloud_cluster_name_with_underscore_rejected",
-			object: func() *controlplanev1.IBMCloudManagedControlPlane {
-				cp := newIKSControlPlane(namespace)
-				cp.Spec.IBMCloudClusterName = "my_cluster"
-				return cp
-			},
-			wantErr: "spec.ibmCloudClusterName",
+			name:   "ibm_cloud_cluster_name_of_32_characters_allowed",
+			object: withIBMCloudClusterName(namespace, "a"+strings.Repeat("b", 31)),
 		},
 		{
-			name: "ibm_cloud_cluster_name_longer_than_35_rejected",
-			object: func() *controlplanev1.IBMCloudManagedControlPlane {
-				cp := newIKSControlPlane(namespace)
-				cp.Spec.IBMCloudClusterName = "a" + strings.Repeat("b", 35)
-				return cp
-			},
-			wantErr: "spec.ibmCloudClusterName: Too long",
+			// The live refusal: IBM answered createCluster for a 33-character name with HTTP 400, code E0125.
+			name:    "ibm_cloud_cluster_name_of_33_characters_rejected",
+			object:  withIBMCloudClusterName(namespace, "a"+strings.Repeat("b", 32)),
+			wantErr: "spec.ibmCloudClusterName: Too long: may not be more than 32",
+		},
+		{
+			name:   "ibm_cloud_cluster_name_with_underscore_and_dot_allowed",
+			object: withIBMCloudClusterName(namespace, "team_a.dev-1"),
+		},
+		{
+			name:   "ibm_cloud_cluster_name_with_upper_case_allowed",
+			object: withIBMCloudClusterName(namespace, "Team-A"),
+		},
+		{
+			name:    "ibm_cloud_cluster_name_with_space_rejected",
+			object:  withIBMCloudClusterName(namespace, "my cluster"),
+			wantErr: clusterNameRuleMessage,
+		},
+		{
+			name:    "ibm_cloud_cluster_name_with_unicode_letter_rejected",
+			object:  withIBMCloudClusterName(namespace, "clüster"),
+			wantErr: clusterNameRuleMessage,
+		},
+		{
+			name:    "ibm_cloud_cluster_name_starting_with_hyphen_rejected",
+			object:  withIBMCloudClusterName(namespace, "-cluster"),
+			wantErr: clusterNameRuleMessage,
 		},
 		{
 			name: "public_service_endpoint_not_in_enum_rejected",
@@ -554,6 +586,14 @@ func TestIBMCloudManagedControlPlaneStatusValidation(t *testing.T) {
 				CreateIntent: controlplanev1.CreateIntent{InFlightAttemptTime: now},
 			},
 			wantErr: "status.createIntent.clusterName: Required value",
+		},
+		{
+			// The intent records a name sent to IBM, and IBM refuses names longer than 32 characters.
+			name: "create_intent_cluster_name_longer_than_ibm_allows_rejected",
+			status: controlplanev1.IBMCloudManagedControlPlaneStatus{
+				CreateIntent: controlplanev1.CreateIntent{ClusterName: "a" + strings.Repeat("b", 32), InFlightAttemptTime: now},
+			},
+			wantErr: "status.createIntent.clusterName: Too long",
 		},
 		{
 			// The controller writes each offered minor once (the list is a set).
