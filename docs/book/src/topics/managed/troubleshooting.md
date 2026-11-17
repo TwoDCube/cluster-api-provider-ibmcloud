@@ -15,23 +15,6 @@ are in the controller log. Quote both when you open an IBM support case.
 
 ## Installation
 
-### The manager does not start: --service-endpoint
-
-With the `ManagedKubernetes` gate on, the manager refuses to start when a `containers`, `vpc` or `rm` entry of
-`--service-endpoint` (the `SERVICE_ENDPOINT` variable) is not an absolute https URL without user information, query or
-fragment (with the gate off, this rule is not applied), for example:
-
-```text
-managed client builder: --service-endpoint entry us-south:containers=http://private.us-south.containers.cloud.ibm.com/global
-is not an absolute https URL without user information, query or fragment; ...
-```
-
-The error names the region and service of the entry and prints the URL with its whole user information (user name and
-password) replaced by `xxxxx` and without query or fragment; a URL without a host, or with an `@` after the host (which
-counts as user information too), is not printed at all, and a URL that does not parse is reported as "... is not a
-valid URL (<kind of problem>) ..." without the URL. Fix the entry (`<region>:containers=https://<host>/<path>`), see
-[Prerequisites](./prerequisites.md#private-service-endpoints), and restart the manager.
-
 ### Creating a managed object is rejected
 
 "... objects cannot be created while the ManagedKubernetes feature gate is off ...": install or upgrade the provider

@@ -110,24 +110,14 @@ To see whose key a cluster uses, run `ibmcloud ks api-key info --cluster <cluste
 ### Private service endpoints
 
 To send the Kubernetes Service, VPC or Resource Manager calls of one region to another URL (for example IBM's private
-endpoint), set `SERVICE_ENDPOINT` at install time; it becomes the manager's `--service-endpoint` flag. The service IDs
-are `containers`, `vpc` and `rm`:
+endpoint, or a staging endpoint), set `SERVICE_ENDPOINT` at install time; it becomes the manager's `--service-endpoint`
+flag. The service IDs are `containers`, `vpc` and `rm`:
 
 ```console
 export SERVICE_ENDPOINT='us-south:containers=https://private.us-south.containers.cloud.ibm.com/global'
 ```
 
-Every `containers`, `vpc` and `rm` entry must be an **absolute https URL without user information, query or
-fragment** (also no bare trailing `?` or `#`, and no `@` after the host, which counts as user information because a
-secret that holds a `/`, `?` or `#` would otherwise hide in the path). Every request carries an IAM bearer token, and
-the client appends each operation path to the URL, so a query or fragment would send every request to a wrong path.
-With the
-`ManagedKubernetes` gate on (`EXP_MANAGED_KUBERNETES=true`), the manager does not start with such an entry. With the
-gate off, the managed controllers are not set up and this rule is not applied; only the general flag parsing runs. The
-error names the region and service of the entry and prints the URL with its whole user information replaced by
-`xxxxx` and without query or fragment; a URL without a host or with an `@` after the host is not printed at all, and
-for a URL that does not parse only the kind of problem is named. A region without an entry uses
-`https://containers.cloud.ibm.com/global`.
+Each URL is used as given. A region without a `containers` entry uses `https://containers.cloud.ibm.com/global`.
 
 ## VPC and other IBM resources
 
