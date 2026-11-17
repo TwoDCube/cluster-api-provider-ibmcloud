@@ -21,14 +21,11 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
 	"github.com/IBM-Cloud/container-services-go-sdk/kubernetesserviceapiv1"
 	"github.com/IBM/go-sdk-core/v5/core"
-
-	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/serviceurl"
 )
 
 // DefaultUserAgent is the User-Agent sent when ServiceOptions.UserAgent is empty, so that IBM never sees the SDK's
@@ -40,10 +37,12 @@ const providerVPCGen2 = "vpc-gen2"
 
 var _ KubernetesService = &Service{}
 
-// ServiceOptions configures NewService. Every field is explicit; NewService validates each one and never reads the
-// environment or falls back to a global authenticator.
+// ServiceOptions configures NewService. Every field is explicit; NewService never reads the environment or falls back
+// to a global authenticator.
 type ServiceOptions struct {
-	// URL is the absolute https base URL, for example https://containers.cloud.ibm.com/global. Required.
+	// URL is the base URL of the IBM Cloud Kubernetes Service API, for example https://containers.cloud.ibm.com/global
+	// or a private regional endpoint. It goes to the SDK as it is, as with CAPIBM's other IBM clients; empty selects the
+	// SDK's default, kubernetesserviceapiv1.DefaultServiceURL.
 	URL string
 	// Authenticator signs every request. Required. The client builder passes its delegating identityAuthenticator.
 	Authenticator core.Authenticator
@@ -110,13 +109,10 @@ func newService(opts ServiceOptions, base http.RoundTripper) (*Service, error) {
 	return &Service{sdk: sdk, userAgent: userAgent}, nil
 }
 
-// validate checks every field of o and returns one error that names each invalid field, its value where safe, and
-// the accepted form.
+// validate checks the authenticator, the limiter, the timeout and the User-Agent of o and returns one error that names
+// each invalid field and the accepted form. The URL is not checked: it goes to the SDK as it is.
 func (o ServiceOptions) validate() error {
 	var errs []error
-	if err := validateServiceURL(o.URL); err != nil {
-		errs = append(errs, err)
-	}
 	if core.IsNil(o.Authenticator) {
 		errs = append(errs, errors.New("kubernetesservice: ServiceOptions.Authenticator is nil; pass the authenticator of the resolved identity (NewService never falls back to the environment)"))
 	}
@@ -130,48 +126,6 @@ func (o ServiceOptions) validate() error {
 		errs = append(errs, errors.New("kubernetesservice: ServiceOptions.UserAgent contains a line break; pass a single-line product token such as cluster-api-provider-ibmcloud/<version>"))
 	}
 	return errors.Join(errs...)
-}
-
-// validateServiceURL returns an error unless rawURL is an absolute https URL with a host and without user information,
-// query or fragment: the rule of the VPC and Resource Manager clients, so that every --service-endpoint of the
-// managed client builder is held to the same form at start-up. Each message prints the URL only in the form
-// serviceurl.Printable returns, and a URL that does not parse only as serviceurl.ParseFailureReason describes it, so no
-// user information, query or fragment typed into it (any of them may carry a token) reaches a log, an event or a
-// condition; the VPC and Resource Manager clients and the client builder print through the same helpers. A URL that
-// passes holds no user information in any form, so newService may print it as it is. rawURL is ServiceOptions.URL.
-func validateServiceURL(rawURL string) error {
-	const accepted = "pass the absolute https URL of the IBM Cloud Kubernetes Service API, for example https://containers.cloud.ibm.com/global"
-	if rawURL == "" {
-		return fmt.Errorf("kubernetesservice: ServiceOptions.URL is empty; %s", accepted)
-	}
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return fmt.Errorf("kubernetesservice: ServiceOptions.URL is not a valid URL (%s); %s", serviceurl.ParseFailureReason(err), accepted)
-	}
-	// User information that holds a "/", "?" or "#" leaves parsed.User nil: url.Parse ends the host there and leaves the
-	// "@" after it (serviceurl.HasAtAfterHost). It is rejected here too, and Printable does not show it; otherwise
-	// "https://<token>/<rest>@host/global" would pass and reach the logs as it is, through newService's error that
-	// names the URL and through go-sdk-core's transport errors.
-	if parsed.User != nil || serviceurl.HasAtAfterHost(parsed) {
-		return fmt.Errorf("kubernetesservice: ServiceOptions.URL %q must not contain user information (credentials come "+
-			"only from ServiceOptions.Authenticator); %s", serviceurl.Printable(parsed), accepted)
-	}
-	// url.Parse lower-cases the scheme, so "HTTPS://" is accepted; an opaque URL such as "https:host" has no Host.
-	if parsed.Scheme != "https" || parsed.Host == "" {
-		return fmt.Errorf("kubernetesservice: ServiceOptions.URL %q is not an absolute https URL; %s", serviceurl.Printable(parsed), accepted)
-	}
-	// The SDK and the compat calls build each request URL by appending the operation path to the service URL string
-	// (go-sdk-core v5.25.3, RequestBuilder.ResolveRequestURL), so with "https://host/global?x" a GetCluster call would
-	// send GET /global with the query "x/v2/vpc/getCluster", and a fragment would swallow the path the same way. Such a
-	// URL fails only later, as a confusing API error, so it is rejected here. A bare trailing "?" leaves only ForceQuery
-	// and a bare "#" no trace in the parsed URL, which is why the raw string is checked as well; url.Parse cuts the
-	// fragment at the first "#", so any "#" in it starts a fragment.
-	if parsed.RawQuery != "" || parsed.ForceQuery || strings.Contains(rawURL, "#") {
-		return fmt.Errorf("kubernetesservice: ServiceOptions.URL must end at the API path: remove the query (?...) or "+
-			"fragment (#...) after %q, because the client appends each operation path (for example /v2/vpc/getCluster) "+
-			"to the URL; %s", serviceurl.Printable(parsed), accepted)
-	}
-	return nil
 }
 
 // GetCluster implements KubernetesService.
