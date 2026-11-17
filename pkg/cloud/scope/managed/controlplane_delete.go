@@ -367,9 +367,12 @@ func (s *ControlPlaneScope) recordLeftovers(clusterID string) {
 // LeftoverResourcesMessage is the LeftoverResources event of a deleted IBM cluster. The IBMCloudManagedCluster only
 // references the user's VPC, so CAPIBM deletes nothing in it and names what IKS leaves there: permanently the shared
 // VPE gateways iks-*-<vpcID> and the security group kube-vpegw-<vpcID>, which IBM documents it never deletes, because
-// other resources may use them; for about 10 minutes the per-cluster load balancers, security groups and VPE gateway,
-// which IKS removes by itself (observed on IBM Cloud); and, because CAPIBM's DELETE keeps them, the VPC Block volumes
-// (deleteResources=false) and, for OpenShift, the registry bucket in the user's Cloud Object Storage instance.
+// other resources may use them, and possibly the VPE gateway for IAM that IKS adds to every VPC with a cluster since
+// November 2026 (https://cloud.ibm.com/docs/containers?topic=containers-vpc-iam-vpe-gateway, which names neither the
+// gateway nor its deletion, so the message says "possibly" and names no ID); for about 10 minutes the per-cluster
+// load balancers, security groups and VPE gateway, which IKS removes by itself (observed on IBM Cloud); and, because
+// CAPIBM's DELETE keeps them, the VPC Block volumes (deleteResources=false) and, for OpenShift, the registry bucket in
+// the user's Cloud Object Storage instance.
 //
 // Parameters:
 //   - clusterID is the deleted cluster's ID.
@@ -386,9 +389,11 @@ func LeftoverResourcesMessage(clusterID, vpcID string, distribution controlplane
 	return fmt.Sprintf("IBM cluster %[1]s is deleted. CAPIBM deletes nothing in VPC %[2]s, so these resources remain there. "+
 		"Permanently, because IBM never deletes them, even when the last cluster leaves the VPC (delete them only when no "+
 		"cluster or other resource in the VPC uses them): the VPE gateways iks-api-%[2]s, iks-cos-%[2]s, iks-cos-config-%[2]s, "+
-		"iks-riaas-%[2]s and iks-registry-%[2]s and the security group kube-vpegw-%[2]s. Removed by IKS within about 10 "+
-		"minutes, and until then blocking the deletion of the subnets or the VPC: the load balancers kube-%[1]s-*, the "+
-		"security groups kube-%[1]s, kube-lbaas-%[1]s and kube-vpegw-%[1]s and the VPE gateway iks-%[1]s. Kept by design: %[3]s",
+		"iks-riaas-%[2]s and iks-registry-%[2]s and the security group kube-vpegw-%[2]s. Possibly also the VPE gateway for "+
+		"IAM that IKS adds to every VPC with a cluster since November 2026 (IBM documents neither its name nor whether it "+
+		"is ever deleted). Removed by IKS within about 10 minutes, and until then blocking the deletion of the subnets or "+
+		"the VPC: the load balancers kube-%[1]s-*, the security groups kube-%[1]s, kube-lbaas-%[1]s and kube-vpegw-%[1]s "+
+		"and the VPE gateway iks-%[1]s. Kept by design: %[3]s",
 		clusterID, vpcID, kept)
 }
 

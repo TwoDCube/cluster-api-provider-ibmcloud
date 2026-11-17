@@ -52,8 +52,9 @@ func TestLeftoverResourcesMessage(t *testing.T) {
 				"there. Permanently, because IBM never deletes them, even when the last cluster leaves the VPC (delete them only " +
 				"when no cluster or other resource in the VPC uses them): the VPE gateways iks-api-r006-vpc, iks-cos-r006-vpc, " +
 				"iks-cos-config-r006-vpc, iks-riaas-r006-vpc and iks-registry-r006-vpc and the security group " +
-				"kube-vpegw-r006-vpc. Removed by IKS within about 10 minutes, and until then blocking the deletion of the subnets " +
-				"or the VPC: the load balancers kube-iksclusterid00000001-*, the security groups kube-iksclusterid00000001, " +
+				"kube-vpegw-r006-vpc. Possibly also the VPE gateway for IAM that IKS adds to every VPC with a cluster since " +
+				"November 2026 (IBM documents neither its name nor whether it is ever deleted). Removed by IKS within about " +
+				"10 minutes, and until then blocking the deletion of the subnets or the VPC: the load balancers kube-iksclusterid00000001-*, the security groups kube-iksclusterid00000001, " +
 				"kube-lbaas-iksclusterid00000001 and kube-vpegw-iksclusterid00000001 and the VPE gateway iks-iksclusterid00000001. " +
 				"Kept by design: the VPC Block volumes of its persistent volumes (deleteResources=false)",
 		},
