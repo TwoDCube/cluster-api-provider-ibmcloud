@@ -26,7 +26,7 @@ The controllers write exactly two spec fields, both required by the Cluster API 
 
 Besides status and their finalizers, the only metadata they write on these objects is the transient
 `ibmcloudmanaged.controlplane.cluster.x-k8s.io/create-hold-until` annotation on the control plane after a definitive
-create refusal, never once an IBM cluster can exist ([Troubleshooting](./troubleshooting.md#the-create-hold-after-a-refusal)).
+create refusal, never once an IBM cluster is bound ([Troubleshooting](./troubleshooting.md#the-create-hold-after-a-refusal)).
 Leave all of these out of Git. If your tool reports drift on the two spec fields, tell it to ignore them (for example
 Argo CD `ignoreDifferences` with the JSON pointers `/spec/controlPlaneEndpoint` and `/spec/providerIDList`).
 

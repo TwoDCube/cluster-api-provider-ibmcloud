@@ -38,7 +38,18 @@ disappears sets `NetworkReady` to `False` but does not affect the running cluste
 | `SubnetNotInVPC` | the subnet belongs to another VPC |
 | `SubnetZoneMismatch` | the subnet lies in another zone than the one it is listed for, for example "subnet dev-sn-2 (<subnet-id>) is in zone us-south-1, but IBMCloudManagedCluster/dev lists it for us-south-2" |
 | `SubnetNameAmbiguous` | several subnets in the VPC have that name; give the subnet `id` instead |
-| `IBMAPIError` | another IBM error; see the code in the message and the controller log |
+| `IBMAPIError` | another IBM error; see the HTTP status in the message and the controller log; a refusal of the credentials by IAM has neither an HTTP status nor an IBM code (below) |
+
+`IBMAPIError` with "The IAM token service of IBM Cloud rejected the credentials of <identity> while <call>, so the
+request was not sent; ..." means that IAM refused the API key before any VPC or Resource Manager request was made: the
+key was deleted, disabled or mistyped, so no role or network fix helps. The message has no HTTP status and no IBM code,
+because no request reached those services. Put a valid API key into the `IBMCLOUD_APIKEY` line of `ibm-credentials.env`
+in the Secret `capi-ibmcloud-manager-bootstrap-credentials`, in the namespace of the provider (`capi-ibmcloud-system`
+by default), and leave the other lines of that file as they are. The manager mounts this Secret as a file, so the
+kubelet updates the file after a short delay, and no restart is needed: after a refusal CAPIBM rebuilds its
+authenticator at every check, about every 5 minutes, and the rebuild reads the file again. Use the same key as
+`IBMCLOUD_API_KEY` for later `clusterctl upgrade` runs, which write the Secret from that variable again
+([Enable the feature gate](./prerequisites.md#enable-the-feature-gate)).
 
 Region, resource group and VPC cannot change after creation; zones can only be added.
 
@@ -130,13 +141,18 @@ creates nothing) was observed live; this CLI form of the check, and the `A0656` 
 After a definitive create refusal (`A0656`, 400, 403, 422, or `E0007` "name exists" when no such cluster can be found)
 the control plane carries the controller-owned annotation
 `ibmcloudmanaged.controlplane.cluster.x-k8s.io/create-hold-until` with an RFC 3339 time. Before that time CAPIBM sends no
-new create request, makes no IBM call for that control plane and writes nothing:
+new create request for that control plane, and `IBMClusterProvisioned` keeps IBM's refusal. It makes no IBM call
+either, unless an earlier create request of unknown outcome (a timeout, a 5xx or a 429) is still on record: then each
+check looks the cluster name up once, so that a cluster that earlier request created is still found and bound. While
+the hold lasts, a lookup that fails (for example with a timeout, a 5xx or a 429) or credentials that cannot be resolved
+do not replace the refusal in the condition: the controller log has the failure ("A create refusal holds the next
+create request; ..."), CAPIBM retries it, and the condition reports it only if it still fails after the hold.
 
 * the hold is **12 minutes** after a refusal and **4 minutes** after a 401, so the next check (about 15 minutes after a
   refusal, 5 minutes after a 401) sends exactly one new request;
 * a **spec change ends the hold at once**, so fix the cause in the spec, or grant the missing role and wait for the
   next check;
-* the hold exists only while no IBM cluster can exist; the next create attempt and any binding remove it, and it never
+* the hold exists only while no IBM cluster is bound; the next create attempt and any binding remove it, and it never
   appears on an initialized or moved control plane;
 * do **not** edit it: CAPIBM ignores a value more than 12 minutes ahead, an unparseable value, and any value once the
   refusal's condition is gone, so an edit shifts the next create by at most 12 minutes.
