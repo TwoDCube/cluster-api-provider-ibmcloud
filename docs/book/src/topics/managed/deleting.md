@@ -56,7 +56,10 @@ Until IKS has removed them, deleting the cluster's subnets or the VPC fails with
 
 * the VPE gateways `iks-api-<vpcID>`, `iks-cos-<vpcID>`, `iks-cos-config-<vpcID>`, `iks-riaas-<vpcID>` and
   `iks-registry-<vpcID>`;
-* the security group `kube-vpegw-<vpcID>`.
+* the security group `kube-vpegw-<vpcID>`;
+* possibly a VPE gateway for IAM: since November 2026 IKS adds one to every VPC that contains a cluster
+  ([IBM](https://cloud.ibm.com/docs/containers?topic=containers-vpc-iam-vpe-gateway)). IBM documents neither its name
+  nor whether it is ever deleted, so look for it among the VPC's VPE gateways.
 
 IBM: "These shared VPE Gateways are not deleted, even if all the clusters in a VPC are deleted, in case other resources
 are using them. If you no longer have any VPC clusters in the VPC, and if no other resources are using these shared VPE
