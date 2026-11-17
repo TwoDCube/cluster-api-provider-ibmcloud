@@ -172,7 +172,7 @@ reconcile, so an edit takes effect during a drain.
 | Setting | Where | Default | Effect |
 |---|---|---|---|
 | Drain time limit | `MachinePool.spec.template.spec.deletion.nodeDrainTimeoutSeconds` | no limit | after it, CAPIBM stops evicting, emits the Warning `DrainTimeoutExceeded` listing the remaining pods, and continues |
-| Volume detach time limit | `MachinePool.spec.template.spec.deletion.nodeVolumeDetachTimeoutSeconds` | no limit | the same for the detach wait |
+| Volume detach time limit | `MachinePool.spec.template.spec.deletion.nodeVolumeDetachTimeoutSeconds` | no limit | counted from the end of the drain, as in Cluster API, so a long drain never shortens it; after it, CAPIBM stops waiting for the volumes and continues |
 | Replacement soak | `MachinePool.spec.template.spec.minReadySeconds` | 0 | a replacement Node must be `Ready` this long before the next worker is touched |
 | Skip drain | annotation `machine.cluster.x-k8s.io/exclude-node-draining` | absent | no cordon, no load balancer label, no eviction |
 | Skip volume detach wait | annotation `machine.cluster.x-k8s.io/exclude-wait-for-node-volume-detach` | absent | no wait for volume detach |
@@ -190,15 +190,17 @@ IBM call, because it has to see the new Node become `Ready`.
 ### What survives restarts and moves
 
 CAPIBM records the drain on each Node with annotations (prefix
-`ibmcloudmanagedmachinepool.infrastructure.cluster.x-k8s.io/`): `drain-start-time` (time limits never restart),
-`drain-owner` (`<namespace>/<pool>`; a second pool waits for it while that pool object exists), and `cordoned` and
-`excluded-from-lb`, which record what CAPIBM changed. After a controller restart or `clusterctl move`, the drain
-resumes from these markers and IBM's worker states. An aborted operation reverts only CAPIBM's own changes: a Node a
-person cordoned stays cordoned. A `drain-owner` that names a pool object that no longer exists (for example after its
-finalizer was removed by hand mid-drain) holds no other pool: a pool whose operation drains that Node reverts what the
-markers record and cordons the Node as its own, so its drain time limit counts from then. On a Node that no operation
-drains, the markers stay, with the cordon and the load-balancer exclusion they record, until you remove the annotations
-and revert what they record: uncordon the Node if `cordoned` is `true`, and remove the label
+`ibmcloudmanagedmachinepool.infrastructure.cluster.x-k8s.io/`): `drain-start-time` (the drain time limit never
+restarts), `drain-owner` (`<namespace>/<pool>`; a second pool waits for it while that pool object exists), and
+`cordoned` and `excluded-from-lb`, which record what CAPIBM changed. After a controller restart or `clusterctl move`,
+the drain resumes from these markers and IBM's worker states. The volume detach wait is timed from
+`status.disruption.volumeDetachStartTime` of the `IBMCloudManagedMachinePool`; if that status is lost, the wait starts
+again, which can only make it longer. An aborted operation reverts only CAPIBM's own changes: a Node a person cordoned
+stays cordoned. A `drain-owner` that names a pool object that no longer exists (for example after its finalizer was
+removed by hand mid-drain) holds no other pool: a pool whose operation drains that Node reverts what the markers record
+and cordons the Node as its own, so its drain time limit counts from then. On a Node that no operation drains, the
+markers stay, with the cordon and the load-balancer exclusion they record, until you remove the annotations and revert
+what they record: uncordon the Node if `cordoned` is `true`, and remove the label
 `node.kubernetes.io/exclude-from-external-load-balancers` if `excluded-from-lb` is `true`. A paused Cluster stops
 evictions, uncordons and IBM calls.
 

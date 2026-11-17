@@ -186,7 +186,7 @@ Events: `WorkerPoolAdopted`, `DrainStarted`, `DrainCompleted`, `NodeUncordoned`,
 | `poolID`, `sizePerZone`, `zones` | the IBM pool, IBM's per-zone worker count, and the observed zones |
 | `workerVersions`, `targetWorkerVersion`, `workersWithUpdateAvailable` | workers per IBM version, the newest fix pack offered, and how many workers have an update |
 | `missingWorkers` | workers that one listing omitted; a worker leaves `providerIDList` only when IBM lists it as deleted or two listings at least 30 seconds apart omit it, so a glitch in IBM's answer never makes Cluster API delete a live Node |
-| `disruption` | the worker removal in flight, absent when idle: `operation` (`Replace`, `ScaleDown`, `DeletePool`), `phase` (`Draining`, `WaitingForVolumeDetach`, `WaitingForIBM`, `WaitingForRemoval`, `WaitingForReplacement`), `workerIDs`, `drainStartTime`, `ibmRequestTime` |
+| `disruption` | the worker removal in flight, absent when idle: `operation` (`Replace`, `ScaleDown`, `DeletePool`), `phase` (`Draining`, `WaitingForVolumeDetach`, `WaitingForIBM`, `WaitingForRemoval`, `WaitingForReplacement`), `workerIDs`, `drainStartTime`, `volumeDetachStartTime` (when the wait for the drained Nodes' volumes to detach began; `nodeVolumeDetachTimeoutSeconds` counts from it), `ibmRequestTime` |
 | `lastDisruptionTime` | when this pool last asked IBM to remove capacity; every pool of the Cluster waits 3 minutes after the newest one |
 
 In phase `WaitingForIBM`, CAPIBM has finished the drain and is about to call IBM, or IBM refused the call: with `E1437`

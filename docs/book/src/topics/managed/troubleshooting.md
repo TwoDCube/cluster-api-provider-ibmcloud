@@ -238,6 +238,12 @@ per zone ([Topology](./topology.md#smaller-topologies-are-not-ha)). CAPIBM ignor
 * **`PatchUpdateAvailable`**: not an error; the `Manual` policy waits for `spec.rollout.after`.
 * **`DrainBlocked`** (`Draining` condition): a PodDisruptionBudget refuses an eviction; the message lists the pods and
   budgets. Add capacity, fix the budget, or set `nodeDrainTimeoutSeconds` on the `MachinePool`. CAPIBM never forces.
+* **`WaitingForVolumeDetach`** (`Draining` condition): the drained Nodes still have volumes attached; the message lists
+  the claims and volumes. Set `nodeVolumeDetachTimeoutSeconds` on the `MachinePool` to bound the wait; it counts from
+  the end of the drain. If the controller reports that a VolumeAttachment attached to the Node names no
+  PersistentVolume, CAPIBM cannot tell which claim the volume serves and waits until the volume is detached, the time
+  limit runs out, or `machine.cluster.x-k8s.io/exclude-wait-for-node-volume-detach` is set in the `MachinePool`'s
+  `spec.template.metadata.annotations` or on the `IBMCloudManagedMachinePool` (on the Node it has no effect).
 * **`WaitingForSettledCluster`**: another worker of the Cluster is changing; a worker stuck for more than 60 minutes is
   named with `WorkerOperationStuck` and no longer blocks. Check it in IBM Cloud.
 * **`WaitingForDisruptionToken`**: another pool of the Cluster is disrupting; it continues when that one is done.
@@ -263,8 +269,9 @@ per zone ([Topology](./topology.md#smaller-topologies-are-not-ha)). CAPIBM ignor
 
 CAPIBM drains Nodes through the workload cluster's API. If it cannot reach the workload cluster:
 
-* when the cluster was reachable when the drain started (Nodes cordoned), a drain or volume detach time limit
-  (`nodeDrainTimeoutSeconds`, `nodeVolumeDetachTimeoutSeconds`) still runs out and then lets the removal continue;
+* when the cluster was reachable when the drain started (Nodes cordoned), the time limits still run out and then let
+  the removal continue: `nodeDrainTimeoutSeconds` ends the drain, and `nodeVolumeDetachTimeoutSeconds`, which counts
+  from the end of the drain as in Cluster API, ends the wait for the volumes;
 * when CAPIBM **never reached** it for this removal, the removal holds before anything is cordoned (reason
   `WaitingForWorkloadCluster`: `Deleting=True` for a pool removal, `WorkerPoolReady=False` for a scale-down) and **a
   time limit alone does not end the wait**, because no drain has started. This fails safe on purpose.
@@ -284,8 +291,8 @@ the workers (IBM's own drain gives them about 60 seconds). A whole-Cluster delet
 The escape hatch does **not** cover a **worker replacement**. A replacement waits in `WaitingForWorkloadCluster`
 (`WorkersUpToDate=False`) before its IBM call while CAPIBM cannot reach the workload cluster, with or without the
 annotations, because it has to see its new Node become `Ready` before the next worker. If the workload cluster went
-away after the drain had started, a drain or detach time limit that runs out still lets the replacement call IBM; the
-replacement then waits in `WaitingForReplacement` until the workload cluster is reachable again. Restore access to the
+away after the drain had started, the drain and detach time limits still run out as above and let the replacement
+call IBM; the replacement then waits in `WaitingForReplacement` until the workload cluster is reachable again. Restore access to the
 workload cluster (network, CBR rules, a valid kubeconfig Secret), or, if the pool can go, remove the whole pool with
 the annotations above.
 
