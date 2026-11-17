@@ -2253,6 +2253,209 @@ func TestControlPlaneCreateHold(t *testing.T) {
 		})
 	}
 
+	// An earlier create attempt of unknown outcome (a timeout, a 5xx or a 429) stays in the intent when IBM refuses a
+	// later attempt definitively. Its cluster may still show up, so every reconcile looks the name up; once that attempt
+	// is older than CreateGracePeriod the lookup decides a new create, and the refusal must hold it all the same.
+	for _, tc := range cpRefusalCases() {
+		t.Run(tc.name+"_after_an_attempt_of_unknown_outcome_holds_the_next_create", func(t *testing.T) {
+			g := NewWithT(t)
+			objs := newCPObjects()
+			withInitialPool(objs)
+			earlier := cpTestStart.Add(-10 * time.Minute)
+			objs.cp.Status.CreateIntent = controlplanev1.CreateIntent{ClusterName: cpTestName,
+				FirstUnknownOutcomeTime: metav1.NewTime(earlier), LastUnknownOutcomeTime: metav1.NewTime(earlier)}
+			f := newCPFixture(t, objs)
+			creates := 0
+			f.expectRefusedCreate(tc, true, &creates)
+
+			_, err := f.reconcile()
+
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(creates).To(Equal(1))
+			cp := f.controlPlane()
+			g.Expect(cp.Status.CreateIntent.InFlightAttemptTime.IsZero()).To(BeTrue(), "the refused attempt left the intent")
+			g.Expect(cp.Status.CreateIntent.LastUnknownOutcomeTime.Time).To(BeTemporally("==", earlier), "the earlier attempt stays")
+			g.Expect(cp.Annotations).To(HaveKeyWithValue(controlplanev1.CreateHoldAnnotation,
+				cpTestStart.Add(tc.wantHold).Format(time.RFC3339)))
+			patches, invalidated := len(f.patches()), len(f.builder.invalidated)
+
+			// The own-patch reconcile (one second later, as the For() watch brings it) and the rechecks during the hold
+			// look the name up, because the earlier attempt's cluster may show up, but send no create and write nothing.
+			for _, at := range []time.Duration{time.Second, time.Minute, tc.wantHold - time.Second} {
+				f.clock.SetTime(cpTestStart.Add(at))
+				f.expectLookupByName(nil)
+				result, err := f.reconcile()
+				g.Expect(err).NotTo(HaveOccurred())
+				expectRequeue(g, result, 5*time.Minute)
+			}
+			g.Expect(creates).To(Equal(1), "no create request while the refusal holds")
+			g.Expect(f.patches()).To(HaveLen(patches), "a held reconcile writes no status, so nothing re-triggers it")
+			g.Expect(f.builder.invalidated).To(HaveLen(invalidated))
+			expectCondition(g, f.controlPlane(), controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition,
+				metav1.ConditionFalse, tc.wantReason)
+
+			// The hold is over: the next reconcile sends the create again, and IBM's second refusal holds it again.
+			f.clock.SetTime(cpTestStart.Add(tc.wantHold))
+			f.expectRefusedCreate(tc, false, &creates)
+			_, err = f.reconcile()
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(creates).To(Equal(2))
+			g.Expect(f.controlPlane().Annotations).To(HaveKeyWithValue(controlplanev1.CreateHoldAnnotation,
+				cpTestStart.Add(2*tc.wantHold).Format(time.RFC3339)))
+		})
+	}
+
+	t.Run("the cluster of an earlier attempt of unknown outcome is still bound while a refusal holds", func(t *testing.T) {
+		g := NewWithT(t)
+		objs := newCPObjects()
+		withInitialPool(objs)
+		earlier := cpTestStart.Add(-10 * time.Minute)
+		objs.cp.Status.CreateIntent = controlplanev1.CreateIntent{ClusterName: cpTestName,
+			FirstUnknownOutcomeTime: metav1.NewTime(earlier), LastUnknownOutcomeTime: metav1.NewTime(earlier)}
+		f := newCPFixture(t, objs)
+		creates := 0
+		f.expectRefusedCreate(cpRefusalCases()[1], true, &creates)
+		_, err := f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(f.controlPlane().Annotations).To(HaveKey(controlplanev1.CreateHoldAnnotation))
+
+		// A minute later IBM lists the cluster the earlier attempt created (createdDate inside its window): the hold
+		// does not stop the binding, which binds it, and a bound control plane carries no hold.
+		f.clock.SetTime(cpTestStart.Add(time.Minute))
+		found := cpCluster("deploying")
+		found.CreatedDate = earlier.Add(time.Minute).Format("2006-01-02T15:04:05-0700")
+		f.expectLookupByName(found)
+		_, err = f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		cp := f.controlPlane()
+		g.Expect(cp.Status.ClusterID).To(Equal(cpIKSClusterID))
+		g.Expect(cp.Annotations).NotTo(HaveKey(controlplanev1.CreateHoldAnnotation))
+		g.Expect(creates).To(Equal(1))
+	})
+
+	// While the hold holds, a failure before the create (the lookup by name that the earlier attempt needs, or the
+	// credentials) must leave the refusal's condition in place. The hold lasts only while that condition does, and the
+	// failure's own status write would trigger the next reconcile at once, whose lookup (404) decides row 10 again and
+	// sends the refused create. Each failure is therefore followed by a reconcile whose lookup answers 404, as the
+	// For() watch would bring it; lookups that fail on and off would otherwise send a refused create every second
+	// reconcile.
+	heldFailures := []struct {
+		name string
+		// fail makes the next reconcile fail before the create; the returned func undoes it.
+		fail func(f *cpFixture) func()
+		// wantErr is true for a Transient outcome, which the controller returns as its error.
+		wantErr bool
+		// wantRequeue is the requeue of an outcome that is not Transient.
+		wantRequeue time.Duration
+		// wantInvalidated is how many authenticator rebuilds each failure asks for.
+		wantInvalidated int
+	}{
+		{name: "a lookup answered 503", wantErr: true, fail: func(f *cpFixture) func() {
+			f.kube.EXPECT().GetCluster(gomock.Any(), cpTestName, testResourceGroupID).
+				Return(nil, ibmError(kubernetesservice.OpGetCluster, http.StatusServiceUnavailable, ""))
+			return func() {}
+		}},
+		{name: "a lookup answered 429", wantRequeue: kubernetesservice.MinRateLimitBackoff, fail: func(f *cpFixture) func() {
+			f.kube.EXPECT().GetCluster(gomock.Any(), cpTestName, testResourceGroupID).
+				Return(nil, ibmError(kubernetesservice.OpGetCluster, http.StatusTooManyRequests, ""))
+			return func() {}
+		}},
+		{name: "a lookup answered 401", wantRequeue: 5 * time.Minute, wantInvalidated: 1, fail: func(f *cpFixture) func() {
+			f.kube.EXPECT().GetCluster(gomock.Any(), cpTestName, testResourceGroupID).
+				Return(nil, ibmError(kubernetesservice.OpGetCluster, http.StatusUnauthorized, ""))
+			return func() {}
+		}},
+		{name: "credentials that cannot be resolved", wantErr: true, fail: func(f *cpFixture) func() {
+			f.resolver.err = errors.New("the identity Secret is gone")
+			return func() { f.resolver.err = nil }
+		}},
+	}
+	for _, failure := range heldFailures {
+		t.Run(failure.name+"_during_the_hold_keeps_the_refusal_and_sends_no_create", func(t *testing.T) {
+			g := NewWithT(t)
+			objs := newCPObjects()
+			withInitialPool(objs)
+			earlier := cpTestStart.Add(-10 * time.Minute)
+			objs.cp.Status.CreateIntent = controlplanev1.CreateIntent{ClusterName: cpTestName,
+				FirstUnknownOutcomeTime: metav1.NewTime(earlier), LastUnknownOutcomeTime: metav1.NewTime(earlier)}
+			f := newCPFixture(t, objs)
+			creates := 0
+			tc := cpRefusalCases()[1] // 400 P4102, held for CreateRefusalHold
+			f.expectRefusedCreate(tc, true, &creates)
+			_, err := f.reconcile()
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(creates).To(Equal(1))
+			hold := cpTestStart.Add(tc.wantHold).Format(time.RFC3339)
+			refusal := *conditions.Get(f.controlPlane(), controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition)
+			g.Expect(refusal.Reason).To(Equal(tc.wantReason))
+			patches, invalidated := len(f.patches()), len(f.builder.invalidated)
+
+			for round := 1; round <= 3; round++ {
+				f.clock.SetTime(cpTestStart.Add(time.Duration(2*round-1) * time.Second))
+				undo := failure.fail(f)
+				result, err := f.reconcile()
+				undo()
+				if failure.wantErr {
+					g.Expect(err).To(HaveOccurred())
+				} else {
+					g.Expect(err).NotTo(HaveOccurred())
+					expectRequeue(g, result, failure.wantRequeue)
+				}
+
+				f.clock.SetTime(cpTestStart.Add(time.Duration(2*round) * time.Second))
+				f.expectLookupByName(nil)
+				result, err = f.reconcile()
+				g.Expect(err).NotTo(HaveOccurred())
+				expectRequeue(g, result, 5*time.Minute)
+
+				cp := f.controlPlane()
+				g.Expect(creates).To(Equal(1), "round %d: no create request while the refusal holds", round)
+				g.Expect(f.patches()).To(HaveLen(patches), "round %d: neither the failure nor the held reconcile writes status", round)
+				condition := conditions.Get(cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition)
+				g.Expect(condition.Reason).To(Equal(refusal.Reason), "round %d", round)
+				g.Expect(condition.Message).To(Equal(refusal.Message), "round %d", round)
+				g.Expect(cp.Annotations).To(HaveKeyWithValue(controlplanev1.CreateHoldAnnotation, hold))
+				g.Expect(f.builder.invalidated).To(HaveLen(invalidated+round*failure.wantInvalidated),
+					"a 401 still rebuilds the authenticator for the next call")
+			}
+
+			// The hold is over: the next reconcile sends exactly one create, which IBM refuses again.
+			f.clock.SetTime(cpTestStart.Add(tc.wantHold))
+			f.expectRefusedCreate(tc, false, &creates)
+			_, err = f.reconcile()
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(creates).To(Equal(2))
+			g.Expect(f.controlPlane().Annotations).To(HaveKeyWithValue(controlplanev1.CreateHoldAnnotation,
+				cpTestStart.Add(2*tc.wantHold).Format(time.RFC3339)))
+		})
+	}
+
+	t.Run("a lookup failure after the hold ended is reported", func(t *testing.T) {
+		g := NewWithT(t)
+		objs := newCPObjects()
+		withInitialPool(objs)
+		earlier := cpTestStart.Add(-10 * time.Minute)
+		objs.cp.Status.CreateIntent = controlplanev1.CreateIntent{ClusterName: cpTestName,
+			FirstUnknownOutcomeTime: metav1.NewTime(earlier), LastUnknownOutcomeTime: metav1.NewTime(earlier)}
+		f := newCPFixture(t, objs)
+		creates := 0
+		f.expectRefusedCreate(cpRefusalCases()[1], true, &creates)
+		_, err := f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+
+		f.clock.SetTime(cpTestStart.Add(managedscope.CreateRefusalHold))
+		f.kube.EXPECT().GetCluster(gomock.Any(), cpTestName, testResourceGroupID).
+			Return(nil, ibmError(kubernetesservice.OpGetCluster, http.StatusServiceUnavailable, ""))
+		_, err = f.reconcile()
+
+		g.Expect(err).To(HaveOccurred())
+		condition := expectCondition(g, f.controlPlane(), controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition,
+			metav1.ConditionFalse, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason)
+		g.Expect(condition.Message).To(ContainSubstring("getting IBM cluster dev"))
+		g.Expect(creates).To(Equal(1))
+	})
+
 	t.Run("a spec change sends the next create at once and a created cluster ends the hold", func(t *testing.T) {
 		g := NewWithT(t)
 		objs := newCPObjects()

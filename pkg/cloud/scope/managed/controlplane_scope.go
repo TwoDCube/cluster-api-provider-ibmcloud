@@ -195,7 +195,7 @@ func (s *ControlPlaneScope) ReconcileNormal(ctx context.Context) Outcome {
 	}
 	infra, err := s.loadInfraCluster(ctx)
 	if err != nil {
-		return s.infraClusterProblem(err)
+		return s.infraClusterProblem(ctx, err)
 	}
 	if infra == nil {
 		return s.waitForInfrastructure(fmt.Sprintf("Waiting for %s, named by spec.infrastructureRef of Cluster %s, to exist",
@@ -206,12 +206,19 @@ func (s *ControlPlaneScope) ReconcileNormal(ctx context.Context) Outcome {
 	if err != nil {
 		return s.notProvisioned(controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason, err.Error())
 	}
-	if outcome, held := s.createHeld(ctx); held {
-		return outcome
+	// A control plane that cannot be bound to any IBM cluster has nothing to look up while a refusal holds its creates,
+	// so the hold applies before any IBM call. One with an earlier create attempt of unknown outcome on record still
+	// runs the binding, because that attempt's cluster may show up (rows 6 and 9); createCluster applies the hold there,
+	// and report keeps the refusal's condition when the credentials, the Secret read or the lookup fail before it, so
+	// that such a failure does not end the hold.
+	if NoIBMClusterCanExist(cp) {
+		if outcome, held := s.createHeld(ctx); held {
+			return outcome
+		}
 	}
 	clients, err := s.ibm(ctx)
 	if err != nil {
-		return s.clientsProblem(err)
+		return s.clientsProblem(ctx, err)
 	}
 	decision, err := s.decideBinding(ctx, clients, name, false)
 	if err != nil {
@@ -222,17 +229,23 @@ func (s *ControlPlaneScope) ReconcileNormal(ctx context.Context) Outcome {
 
 // createHeld applies the hold after a definitive create refusal, so that a refused create is sent again only at the
 // recheck its outcome scheduled (about 15 minutes later, 5 after a 401), never in a hot loop. IBM's refusal changes
-// status (the cleared intent, the refusal condition), and the For() watch has no predicate, so this controller's own
-// patch brings the control plane straight back; without the hold that reconcile would decide binding row 10 again
-// and send the next create at once. While cpCreateHold holds, the reconcile makes no IBM call and writes nothing, so
-// the refusal condition stays as IBM's last answer and nothing re-triggers. held is false when no hold applies. ctx
-// carries the reconcile's logger.
+// status (the attempt taken out of the intent, the refusal condition), and the For() watch has no predicate, so this
+// controller's own patch brings the control plane straight back; without the hold that reconcile would decide binding
+// row 10 again and send the next create at once. It is checked at two points: in ReconcileNormal, before any IBM
+// call, for a control plane that cannot be bound (NoIBMClusterCanExist), and in createCluster, where every create
+// would be sent, which also covers one whose intent still records an earlier attempt of unknown outcome: such a
+// control plane is looked up by name on every reconcile, and the lookup decides row 10 again once that attempt is
+// older than CreateGracePeriod.
+// While cpCreateHold holds, the reconcile sends no create and writes nothing: at most it looks the name up once, a
+// failure of that lookup (or of anything before it) leaves the refusal's condition in place (report), and only a
+// lookup that finds a cluster is reported. So the refusal condition stays as IBM's last answer and nothing
+// re-triggers. held is false when no hold applies. ctx carries the reconcile's logger.
 func (s *ControlPlaneScope) createHeld(ctx context.Context) (Outcome, bool) {
 	until, held := cpCreateHold(s.ControlPlane, s.params.Clock.Now())
 	if !held {
 		return Outcome{}, false
 	}
-	ctrl.LoggerFrom(ctx).V(4).Info("IBM refused the last create request; no IBM call before the hold ends", "until", bindingTime(until))
+	ctrl.LoggerFrom(ctx).V(4).Info("IBM refused the last create request; no create request before the hold ends", "until", bindingTime(until))
 	// The steady interval is shorter than CreateRefusalHold, so a long hold is looked at a few times without an IBM
 	// call; CreateRefusalHold and CreateUnauthorizedHold end before the recheck the refusal itself scheduled.
 	reason := conditions.GetReason(s.ControlPlane, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition)
@@ -603,7 +616,7 @@ func (s *ControlPlaneScope) callProblem(ctx context.Context, err error) Outcome 
 	if errors.As(err, &callErr) {
 		return s.reportCall(ctx, callErr)
 	}
-	return s.report(cpProblem{reason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason,
+	return s.report(ctx, cpProblem{reason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason,
 		message:   "CAPIBM could not decide which IBM cluster this control plane stands for; it retries, and the controller log names the cause",
 		outcome:   Transient(err),
 		transient: true})
@@ -611,8 +624,12 @@ func (s *ControlPlaneScope) callProblem(ctx context.Context, err error) Outcome 
 
 // clientsProblem reports a failure of ibm, before any IBM call. The message names the identity by its Description
 // when it resolved, but never carries the error text, which goes to the controller log through the outcome, so the
-// condition stays the same while the same failure repeats. err is the error of ibm.
-func (s *ControlPlaneScope) clientsProblem(err error) Outcome {
+// condition stays the same while the same failure repeats.
+//
+// Parameters:
+//   - ctx carries the reconcile's logger.
+//   - err is the error of ibm.
+func (s *ControlPlaneScope) clientsProblem(ctx context.Context, err error) Outcome {
 	message := fmt.Sprintf("CAPIBM cannot resolve the IBM Cloud credentials of this control plane through IBMCloudManagedCluster/%s; "+
 		"the controller log names the cause", s.InfraCluster.Name)
 	var buildErr *clientBuildError
@@ -620,18 +637,22 @@ func (s *ControlPlaneScope) clientsProblem(err error) Outcome {
 		message = fmt.Sprintf("CAPIBM cannot build the Kubernetes Service client of %s for region %s; the controller log names the cause",
 			buildErr.identity.Description, s.InfraCluster.Spec.Region)
 	}
-	return s.report(cpProblem{reason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason,
+	return s.report(ctx, cpProblem{reason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason,
 		message: message, outcome: Transient(err)})
 }
 
 // infraClusterProblem reports a failure of loadInfraCluster: a reference to another kind needs a spec change
-// (Terminal InvalidConfiguration); a failed read is retried. err is the error of loadInfraCluster.
-func (s *ControlPlaneScope) infraClusterProblem(err error) Outcome {
+// (Terminal InvalidConfiguration); a failed read is retried.
+//
+// Parameters:
+//   - ctx carries the reconcile's logger.
+//   - err is the error of loadInfraCluster.
+func (s *ControlPlaneScope) infraClusterProblem(ctx context.Context, err error) Outcome {
 	var configErr *controlPlaneConfigError
 	if errors.As(err, &configErr) {
 		return s.notProvisioned(controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason, configErr.message)
 	}
-	return s.report(cpProblem{reason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInfrastructureReason,
+	return s.report(ctx, cpProblem{reason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedWaitingForInfrastructureReason,
 		message:   fmt.Sprintf("CAPIBM could not read %s; it retries, and the controller log names the cause", s.infraRefName()),
 		outcome:   Transient(err),
 		transient: true})
@@ -649,7 +670,7 @@ func (s *ControlPlaneScope) reportCall(ctx context.Context, callErr *controlPlan
 	if problem.outcome.Kind != OutcomeTransient {
 		logIBMRefusal(ctx, callErr)
 	}
-	return s.report(problem)
+	return s.report(ctx, problem)
 }
 
 // logIBMRefusal logs IBM's whole answer to a failed call, with its description and incident ID, which conditions
@@ -662,10 +683,32 @@ func logIBMRefusal(ctx context.Context, callErr *controlPlaneCallError) {
 	ctrl.LoggerFrom(ctx).Info("IBM Cloud did not complete a call", "call", callErr.action, "error", callErr.err.Error())
 }
 
-// report writes problem into IBMClusterProvisioned, unless it is transient and the condition is already True, and
-// returns its outcome. problem is the failure to report.
-func (s *ControlPlaneScope) report(problem cpProblem) Outcome {
+// report writes problem into IBMClusterProvisioned (and Available WaitingForIBMCluster) and returns its outcome. It
+// keeps the condition instead in two cases, because the condition then records more than the problem says:
+//   - a True condition, when problem is transient: a blip says nothing about the cluster and must not ripple into the
+//     Cluster's conditions;
+//   - the condition of a definitive create refusal while that refusal holds the next create request (cpCreateHold),
+//     for every problem. Only a failure before a create can be reported then (resolving the credentials, reading the
+//     IBMCloudManagedCluster or the kubeconfig Secret, the lookup by name that an earlier create attempt of unknown
+//     outcome needs): createCluster sends nothing while the hold holds, and every create removes the hold before it
+//     is sent. Such a failure says nothing about why IBM refused the create, but writing it would end the hold, which
+//     lasts only while the refusal's condition does; the write itself then triggers the next reconcile through the
+//     For() watch, whose lookup may decide binding row 10 again and send the refused create at once. Lookups that fail
+//     on and off (the 429s of the shared IKS rate limit) would turn that into a loop of refused creates. The failure
+//     is logged instead and retried at its outcome's pace, and it is reported as usual once the hold is over.
+//
+// Parameters:
+//   - ctx carries the reconcile's logger.
+//   - problem is the failure to report.
+func (s *ControlPlaneScope) report(ctx context.Context, problem cpProblem) Outcome {
 	if problem.transient && conditions.IsTrue(s.ControlPlane, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition) {
+		return problem.outcome
+	}
+	if until, held := cpCreateHold(s.ControlPlane, s.params.Clock.Now()); held {
+		// The message is CAPIBM's own text without IBM's description, as in a condition; a failed IBM call has its whole
+		// answer in the log already (logIBMRefusal) or in the error that a Transient outcome returns.
+		ctrl.LoggerFrom(ctx).Info("A create refusal holds the next create request; this failure is retried without replacing "+
+			"the refusal's condition", "reason", problem.reason, "message", problem.message, "until", bindingTime(until))
 		return problem.outcome
 	}
 	s.setProvisioned(metav1.ConditionFalse, problem.reason, problem.message)
@@ -798,7 +841,8 @@ const (
 	cpNonCriticalCodesMaxLength = 16
 )
 
-// createCluster creates the IBM cluster of the control plane. The configuration is checked first (the initial pool,
+// createCluster creates the IBM cluster of the control plane. A create hold that still holds (createHeld) stops it
+// first, before anything is read or written. The configuration is checked next (the initial pool,
 // BuildCreateClusterRequest, the offered versions), so a configuration IBM would refuse records nothing and sends no
 // create. Then the attempt is persisted in status.createIntent, and only after that write succeeded is the request
 // sent: a lost response can then be told apart from a foreign same-named cluster (DecideBinding rows 3, 6, 9).
@@ -807,6 +851,11 @@ const (
 //   - ctx is the reconcile context.
 //   - name is the effective IBM cluster name.
 func (s *ControlPlaneScope) createCluster(ctx context.Context, name string) Outcome {
+	// Every create request goes through here, so this check holds a refused create whatever led to row 10, also when
+	// an earlier attempt of unknown outcome kept ReconcileNormal from applying the hold before the lookup.
+	if outcome, held := s.createHeld(ctx); held {
+		return outcome
+	}
 	pool, mp, outcome, ok := s.initialPool(ctx)
 	if !ok {
 		return outcome
@@ -817,7 +866,7 @@ func (s *ControlPlaneScope) createCluster(ctx context.Context, name string) Outc
 	}
 	clients, err := s.ibm(ctx)
 	if err != nil {
-		return s.clientsProblem(err)
+		return s.clientsProblem(ctx, err)
 	}
 	if outcome, ok := s.checkVersionOffered(ctx, clients); !ok {
 		return outcome
@@ -826,7 +875,7 @@ func (s *ControlPlaneScope) createCluster(ctx context.Context, name string) Outc
 	cp := s.ControlPlane
 	previous := cp.Status.CreateIntent
 	cp.Status.CreateIntent = cpIntentForAttempt(previous, name, s.now())
-	// A hold that reaches this point is over (ReconcileNormal returned while it held); it goes with the intent's write.
+	// A hold that reaches this point is over (createHeld returned above while it held); it goes with the intent's write.
 	delete(cp.Annotations, controlplanev1.CreateHoldAnnotation)
 	s.setProvisioned(metav1.ConditionFalse, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCreatingReason,
 		fmt.Sprintf("CAPIBM creates IBM cluster %s in resource group %s", name, s.InfraCluster.Spec.ResourceGroup.ID))
@@ -1000,7 +1049,7 @@ func (s *ControlPlaneScope) createFailed(ctx context.Context, clients *controlPl
 			s.createRefusedMessage(name, err))
 	default:
 		// createFailed has logged IBM's whole answer already, so classifyCall is reported without reportCall's log.
-		return s.report(s.classifyCall(&controlPlaneCallError{identity: clients.identity, op: kubernetesservice.OpCreateCluster,
+		return s.report(ctx, s.classifyCall(&controlPlaneCallError{identity: clients.identity, op: kubernetesservice.OpCreateCluster,
 			action: "creating IBM cluster " + name, err: err}, rg))
 	}
 }
@@ -1216,10 +1265,12 @@ func cpNonCriticalEventMessage(name, clusterID, incidentID string, item kubernet
 }
 
 // The hold after a definitive create refusal: a refused create is rechecked after about 15 minutes (5 minutes after a
-// 401), never in a hot loop. A refusal that proves nothing was created clears the intent, so the next reconcile would
-// decide binding row 10 again and send the same request, which IBM refuses again. The controller's own status patch
-// brings that reconcile at once (the For() watch has no predicate), so without a hold one refusal turns into a create
-// request every few milliseconds, each spending the shared IKS rate limit of every other cluster and pool.
+// 401), never in a hot loop. A refusal that proves nothing was created takes its attempt out of the intent, so the
+// next reconcile would decide binding row 10 again and send the same request, which IBM refuses again; an earlier
+// attempt of unknown outcome that the intent still records changes nothing once it is older than CreateGracePeriod.
+// The controller's own status patch brings that reconcile at once (the For() watch has no predicate), so without a
+// hold one refusal turns into a create request every few milliseconds, each spending the shared IKS rate limit of
+// every other cluster and pool.
 //
 // The hold is recorded in controlplanev1.CreateHoldAnnotation (RFC 3339, UTC). The key lives in the API package with
 // the other controller-owned annotations, so that tooling and the book can name it without importing the controller.
@@ -1271,20 +1322,24 @@ func (s *ControlPlaneScope) holdCreates(hold time.Duration) {
 
 // cpCreateHold reports whether a definitive create refusal still holds the next create request of cp, and until when.
 // It holds while all of these are true, so that only the refusal itself, unchanged, keeps CAPIBM from asking again:
-//   - no IBM cluster can be bound (NoIBMClusterCanExist): no status.clusterID, no endpoint and no create attempt of
-//     unknown outcome, which the binding rows resolve on every reconcile;
+//   - no IBM cluster is bound: no status.clusterID and no endpoint, because a bound control plane sends no create. An
+//     earlier create attempt of unknown outcome does not end the hold: it only makes the caller run the binding first
+//     (createHeld), so that the cluster that attempt may have created is still bound or waited for;
 //   - controlplanev1.CreateHoldAnnotation parses and lies after now, but at most CreateRefusalHold after it; a later
 //     value was not written by CAPIBM (or by a clock far ahead) and is ignored, so that no edit of the annotation stops
 //     creates;
 //   - IBMClusterProvisioned is still the refusal's condition: False with a reason of cpCreateRefusalReasons, observed
 //     at the current generation. A spec change therefore ends the hold at once (a Terminal outcome waits for a spec
-//     edit or its recheck), and so does any other report that replaced the refusal's condition since.
+//     edit or its recheck), and so does a later state that replaced the refusal's condition since, such as
+//     infrastructure that is no longer provisioned or a cluster the lookup by name found. A failure does not replace it
+//     while the hold holds (report), because the failure alone would then end the hold.
 //
 // Parameters:
 //   - cp is the control plane as read.
 //   - now is the clock's time.
 func cpCreateHold(cp *controlplanev1.IBMCloudManagedControlPlane, now time.Time) (time.Time, bool) {
-	if cp == nil || !NoIBMClusterCanExist(cp) || cp.Annotations[controlplanev1.CreateHoldAnnotation] == "" {
+	if cp == nil || cp.Status.ClusterID != "" || cp.Spec.ControlPlaneEndpoint != (controlplanev1.APIEndpoint{}) ||
+		cp.Annotations[controlplanev1.CreateHoldAnnotation] == "" {
 		return time.Time{}, false
 	}
 	until, err := time.Parse(time.RFC3339, cp.Annotations[controlplanev1.CreateHoldAnnotation])

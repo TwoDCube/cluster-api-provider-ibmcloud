@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/util/conditions"
 
 	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
 	infrav1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/v1alpha1"
@@ -500,9 +501,17 @@ func TestCPCreateHold(t *testing.T) {
 		{name: "a bound control plane is never held", cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) {
 			cp.Status.ClusterID = "iksclusterid00000001"
 		})},
-		{name: "an attempt of unknown outcome is left to the binding", cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) {
-			cp.Status.CreateIntent = controlplanev1.CreateIntent{ClusterName: "dev", LastUnknownOutcomeTime: metav1.NewTime(now)}
+		{name: "a control plane with an endpoint is never held", cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) {
+			cp.Spec.ControlPlaneEndpoint = controlplanev1.APIEndpoint{Host: "c111.us-south.containers.cloud.ibm.com", Port: 30101}
 		})},
+		// The refusal took its own attempt out of the intent; an earlier attempt of unknown outcome stays, and the
+		// lookup by name decides a new create once that attempt is older than CreateGracePeriod, so the hold must hold.
+		{name: "an earlier attempt of unknown outcome still holds", want: true,
+			cp: refused(func(cp *controlplanev1.IBMCloudManagedControlPlane) {
+				earlier := metav1.NewTime(now.Add(-10 * time.Minute))
+				cp.Status.CreateIntent = controlplanev1.CreateIntent{ClusterName: "dev", FirstUnknownOutcomeTime: earlier,
+					LastUnknownOutcomeTime: earlier}
+			})},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -563,4 +572,77 @@ func TestControlPlaneHoldCreates(t *testing.T) {
 
 	// The fake clock of newCPScopeParams starts at 03:05:30 UTC; the annotation is UTC at second precision.
 	g.Expect(cp.Annotations).To(HaveKeyWithValue(controlplanev1.CreateHoldAnnotation, "2026-11-16T03:17:30Z"))
+}
+
+// TestControlPlaneReportKeepsAHeldRefusal covers the two conditions report keeps: a True condition against a transient
+// problem, and the condition of a definitive create refusal against any problem while that refusal holds the next
+// create (cpCreateHold). A failure written over the refusal would end the hold, and the write itself would trigger the
+// reconcile that sends the refused create again.
+func TestControlPlaneReportKeepsAHeldRefusal(t *testing.T) {
+	// The fake clock of newCPScopeParams starts at 03:05:30 UTC.
+	now := time.Date(2026, 11, 16, 3, 5, 30, 0, time.UTC)
+	provisioned := controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition
+	refusal := metav1.Condition{Type: provisioned, Status: metav1.ConditionFalse, ObservedGeneration: 2,
+		Reason:  controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedInvalidConfigurationReason,
+		Message: "IBM Cloud refused to create cluster dev (IBM code P4102)"}
+	ready := metav1.Condition{Type: provisioned, Status: metav1.ConditionTrue, ObservedGeneration: 2,
+		Reason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedReason, Message: "IBM cluster dev exists"}
+	controlPlane := func(condition metav1.Condition, holdUntil time.Time) *controlplanev1.IBMCloudManagedControlPlane {
+		cp := &controlplanev1.IBMCloudManagedControlPlane{ObjectMeta: metav1.ObjectMeta{Name: "dev", Generation: 2}}
+		cp.Status.Conditions = []metav1.Condition{condition}
+		if !holdUntil.IsZero() {
+			cp.Annotations = map[string]string{controlplanev1.CreateHoldAnnotation: holdUntil.Format(time.RFC3339)}
+		}
+		return cp
+	}
+	lookupFailed := cpProblem{reason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason,
+		message: "CAPIBM could not complete getting IBM cluster dev; it retries", outcome: Transient(errors.New("HTTP 503")),
+		transient: true}
+	lookupRateLimited := cpProblem{reason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason,
+		message: "IBM Cloud rate limited CAPIBM (HTTP 429) while getting IBM cluster dev; CAPIBM retries",
+		outcome: RateLimited(time.Minute), transient: true}
+	credentialsFailed := cpProblem{reason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason,
+		message: "CAPIBM cannot resolve the IBM Cloud credentials of this control plane", outcome: Transient(errors.New("no Secret"))}
+	lookupDenied := cpProblem{reason: controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedPermissionDeniedReason,
+		message: "IBM Cloud refused getting IBM cluster dev with HTTP 403", outcome: Terminal("PermissionDenied", "denied")}
+
+	testCases := []struct {
+		name    string
+		cp      *controlplanev1.IBMCloudManagedControlPlane
+		problem cpProblem
+		// want is the condition after report.
+		want metav1.Condition
+	}{
+		{name: "a held refusal is kept against a failed lookup", cp: controlPlane(refusal, now.Add(time.Minute)),
+			problem: lookupFailed, want: refusal},
+		{name: "a held refusal is kept against a rate limited lookup", cp: controlPlane(refusal, now.Add(time.Minute)),
+			problem: lookupRateLimited, want: refusal},
+		{name: "a held refusal is kept against credentials that cannot be resolved", cp: controlPlane(refusal, now.Add(time.Minute)),
+			problem: credentialsFailed, want: refusal},
+		{name: "a held refusal is kept against a refused lookup", cp: controlPlane(refusal, now.Add(time.Minute)),
+			problem: lookupDenied, want: refusal},
+		{name: "a refusal whose hold has ended is replaced", cp: controlPlane(refusal, now),
+			problem: lookupFailed, want: metav1.Condition{Reason: lookupFailed.reason, Message: lookupFailed.message}},
+		{name: "a refusal without a hold is replaced", cp: controlPlane(refusal, time.Time{}),
+			problem: credentialsFailed, want: metav1.Condition{Reason: credentialsFailed.reason, Message: credentialsFailed.message}},
+		{name: "a True condition is kept against a transient problem", cp: controlPlane(ready, time.Time{}),
+			problem: lookupFailed, want: ready},
+		{name: "a True condition is replaced by a problem that is not transient", cp: controlPlane(ready, time.Time{}),
+			problem: credentialsFailed, want: metav1.Condition{Reason: credentialsFailed.reason, Message: credentialsFailed.message}},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			scope, err := NewControlPlaneScope(newCPScopeParams(&cpScopeBuilder{}), &clusterv1.Cluster{}, tc.cp, cpNoPersist)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			outcome := scope.report(context.Background(), tc.problem)
+
+			g.Expect(outcome).To(Equal(tc.problem.outcome), "the problem's outcome sets the retry pace either way")
+			condition := conditions.Get(tc.cp, provisioned)
+			g.Expect(condition).NotTo(BeNil())
+			g.Expect(condition.Reason).To(Equal(tc.want.Reason))
+			g.Expect(condition.Message).To(Equal(tc.want.Message))
+		})
+	}
 }
