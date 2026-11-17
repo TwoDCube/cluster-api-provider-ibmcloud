@@ -41,7 +41,8 @@ import (
 // TestAssumptionsCiteTheirSource checks:
 //
 //   - "Observed on IBM Cloud": confirmed by the live probes of 2026-11-16 against IKS 1.36 and ROKS 4.21 clusters on
-//     VPC; the comment states what was observed;
+//     VPC, and of 2026-11-17 against a private-only IKS 1.36 cluster managed from inside its VPC; the comment states
+//     what was observed;
 //   - "Not yet verified against IBM Cloud": still open; the comment names the default and the fallback, and switching
 //     to the fallback is a one-line change here plus its test;
 //   - "CAPI parity": the value Cluster API v1.14.0 uses for the same step; the comment cites the line.
