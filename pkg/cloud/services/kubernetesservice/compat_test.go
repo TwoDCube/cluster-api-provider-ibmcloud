@@ -413,6 +413,12 @@ func TestGetAdminKubeconfigAuthentication(t *testing.T) {
 			_, err = service.GetAdminKubeconfig(context.Background(), testIKSClusterID)
 			g.Expect(Classify(OpGetAdminKubeconfig, err)).To(Equal(tc.expected))
 			g.Expect(errors.Is(err, ErrCredentialsRejected)).To(Equal(tc.rejected))
+			var rejected *CredentialsRejectedError
+			g.Expect(errors.As(err, &rejected)).To(Equal(tc.rejected))
+			if tc.rejected {
+				g.Expect(rejected.IAMStatus).To(Equal(tc.iamStatus), "IAM's status is kept for the condition message")
+				g.Expect(rejected.Operation).To(Equal(OpGetAdminKubeconfig))
+			}
 			g.Expect(fake.received()).To(BeEmpty())
 			g.Expect(limiter.count()).To(BeZero())
 		})

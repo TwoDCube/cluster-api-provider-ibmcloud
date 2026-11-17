@@ -426,14 +426,15 @@ func callError(op Operation, tracker *callTracker, response *core.DetailedRespon
 	return fmt.Errorf("kubernetesservice: %s: %w", op, err)
 }
 
-// rejectedCredentialsError is the error of a request the IAM token service refused to authorize.
+// rejectedCredentialsError is the error of a request the IAM token service refused to authorize. It is a
+// *CredentialsRejectedError, so that a caller can name IAM's status without parsing the error text.
 //
 // Parameters:
 //   - op is the operation.
 //   - iamStatus is the IAM answer's status.
 //   - err is the authenticator's error.
 func rejectedCredentialsError(op Operation, iamStatus int, err error) error {
-	return fmt.Errorf("%w: %s: the IAM token service answered HTTP %d: %w", ErrCredentialsRejected, op, iamStatus, err)
+	return &CredentialsRejectedError{Operation: op, IAMStatus: iamStatus, Err: err}
 }
 
 // authenticationError is the error of a request whose authenticator failed before it was sent, for the compat path

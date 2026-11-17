@@ -249,6 +249,12 @@ func TestCredentialsRejectedBeforeSending(t *testing.T) {
 			_, err = service.GetCluster(context.Background(), testIKSClusterID, "")
 			g.Expect(Classify(OpGetCluster, err)).To(Equal(tc.expected))
 			g.Expect(errors.Is(err, ErrCredentialsRejected)).To(Equal(tc.rejected))
+			var rejected *CredentialsRejectedError
+			g.Expect(errors.As(err, &rejected)).To(Equal(tc.rejected))
+			if tc.rejected {
+				g.Expect(rejected.IAMStatus).To(Equal(tc.iamStatus), "IAM's status is kept for the condition message")
+				g.Expect(rejected.Operation).To(Equal(OpGetCluster))
+			}
 			var apiErr *APIError
 			g.Expect(errors.As(err, &apiErr)).To(BeFalse(), "an IAM answer is never an APIError")
 			g.Expect(iamCalls.Load()).To(BeNumerically(">=", 1))
