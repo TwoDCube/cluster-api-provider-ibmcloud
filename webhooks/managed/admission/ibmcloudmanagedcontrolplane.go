@@ -149,6 +149,9 @@ func validateMinorStep(observed, desired string) *field.Error {
 			"after that", observed, err))
 	}
 	currentMinor := current.MinorVersion()
+	// TODO: the highest allowed value and its message assume that the master's next version is its next minor. After
+	// OpenShift 4.22 a master can move to 4.23 or to 5.0; once IBM's per-cluster upgrade-path endpoint is stable, allow
+	// the versions it lists for the cluster instead (see the TODO on ibmversion.Minor.Next).
 	switch {
 	case want.Compare(currentMinor) < 0:
 		return field.Invalid(path, desired, fmt.Sprintf("a master cannot be downgraded: it runs %s "+
