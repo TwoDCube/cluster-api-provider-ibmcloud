@@ -39,11 +39,15 @@ import (
 // made the call only in the condition the caller wrote from that answer: DecideMasterAction reads it back
 // (MasterVersionInput.CurrentUpToDate) and keeps it until the retry, instead of reporting an update IBM never took. The
 // inputs that may cost a call, the offered versions (VersionsCache) and the worker listing, are asked for only when a
-// row needs them, so that a reconcile that requests nothing makes no IBM call beyond GetCluster. Every version named in
-// a condition comes from masterKubeVersion or targetVersion through ibmversion.Version.WithoutPending, so IBM's
-// " (pending)" marker never reaches status. Two answers keep MasterVersionUpToDate from claiming more than CAPIBM
-// knows: a masterKubeVersion that does not parse is Unknown, and masterInputFailure reports a call for an input that
-// IBM refused after a raise of spec.distributionVersion, where the condition of the old minor no longer holds.
+// row needs them; the worker listing is therefore made only right before a request. (The caller reads the offered
+// versions on every run anyway, for the newer minors in status; the VersionsCache asks IBM for them at most once an
+// hour per identity and region.) Every version named in a condition comes from masterKubeVersion or targetVersion
+// through ibmversion.Version.WithoutPending, so IBM's " (pending)" marker never reaches status. Two answers keep
+// MasterVersionUpToDate from claiming more than CAPIBM knows: a masterKubeVersion that does not parse is Unknown, and
+// masterInputFailure reports a call for an input that IBM refused after a raise of spec.distributionVersion, where the
+// condition of the old minor no longer holds. A newer minor that IBM offers never makes the master outdated: the True
+// condition only names it (MasterVersionInput.Available, status.availableDistributionVersions), because the master runs
+// what the spec asks for and only the user decides when to raise it.
 
 // masterEndOfSupportNotice is how long before IBM's versionEOS the MasterVersionUpToDate message mentions the end of
 // support; a CAPIBM choice, not an IBM fact.
@@ -111,6 +115,11 @@ type MasterVersionInput struct {
 	// WorkersListed is true when Workers holds the answer of a ListWorkers call (an empty list then means no workers).
 	WorkersListed bool
 
+	// Available is status.availableDistributionVersions as this reconcile leaves it: the minors newer than the master's
+	// that IBM offers for the distribution (newerOfferedMinors). The True MasterVersionUpToDate message names them, so
+	// that an available update is visible while the condition stays True; nil or empty names nothing. Optional.
+	Available []string
+
 	// Now is the caller's clock reading. Required.
 	Now time.Time
 }
@@ -125,7 +134,7 @@ type MasterAction struct {
 	// NeedsWorkers is true when the decision would request the update and WorkersListed is false: the caller lists the
 	// workers (one ListWorkers call), sets Workers and WorkersListed, and decides again. No other field is set then. It
 	// is never set for a minor IBM does not offer, or for a request that waits out its grace, backoff or refusal, so
-	// those reconciles make no IBM call beyond GetCluster.
+	// those reconciles make no ListWorkers call.
 	NeedsWorkers bool
 
 	// RequestUpdate is true when the caller requests the update: first a direct status patch of status.masterUpdate to
@@ -339,6 +348,10 @@ func (in MasterVersionInput) upToDateCondition(v masterVersions) metav1.Conditio
 // 7): DowngradeNotAllowed below the master's minor, VersionSkipNotAllowed more than one minor above it. ok is false
 // for the master's minor and its next minor.
 //
+// TODO: the skip rule (row 7) and its message assume that the master's next version is its next minor. After
+// OpenShift 4.22 a master can move to 4.23 or to 5.0; once IBM's per-cluster upgrade-path endpoint is stable, accept
+// every version it lists for the cluster and name those in the message (see the TODO on ibmversion.Minor.Next).
+//
 // Parameters:
 //   - v: the parsed versions.
 func (in MasterVersionInput) specProblem(v masterVersions) (metav1.Condition, bool) {
@@ -359,32 +372,138 @@ func (in MasterVersionInput) specProblem(v masterVersions) (metav1.Condition, bo
 	}
 }
 
-// upToDateMessage is the message of MasterVersionUpToDate=True: the IBM version the master runs, and, when it applies,
-// that IBM no longer supports the minor (state unsupported) or ends its support within 45 days.
+// upToDateMessage is the message of MasterVersionUpToDate=True: the IBM version the master runs, and, when they apply,
+// that IBM no longer supports the minor (state unsupported) or ends its support within 45 days (supportNote), and the
+// newer minors IBM offers (availableNote).
 //
 // Parameters:
 //   - v: the parsed versions.
 func (in MasterVersionInput) upToDateMessage(v masterVersions) string {
-	message := fmt.Sprintf("the master runs %s, minor %s as spec.distributionVersion asks; IBM applies master patches "+
-		"itself", v.master, v.observed)
+	return fmt.Sprintf("the master runs %s, minor %s as spec.distributionVersion asks; IBM applies master patches itself",
+		v.master, v.observed) + in.supportNote(v) + availableNote(in.Available)
+}
+
+// supportNote returns the part of the True MasterVersionUpToDate message about the end of IBM's support of the master's
+// minor: that IBM no longer supports it (state unsupported), or the end of support when it is less than 45 days away
+// or cannot be parsed; "" otherwise.
+//
+// TODO: both notes name the master's next minor as the version to update to. After OpenShift 4.22 a master can move to
+// 4.23 or to 5.0; once IBM's per-cluster upgrade-path endpoint is stable, name the versions it lists for the cluster
+// (see the TODO on ibmversion.Minor.Next).
+//
+// Parameters:
+//   - v: the parsed versions.
+func (in MasterVersionInput) supportNote(v masterVersions) string {
 	if in.Cluster.State == clusterStateUnsupported {
-		return message + fmt.Sprintf("; IBM no longer supports %s: upgrade one minor at a time, starting with "+
+		return fmt.Sprintf("; IBM no longer supports %s: upgrade one minor at a time, starting with "+
 			"spec.distributionVersion %s", v.observed, v.observed.Next())
 	}
 	eos := in.Cluster.VersionEOS
 	if eos == "" {
-		return message
+		return ""
 	}
 	end, err := ParseCreatedDate(eos)
 	switch {
 	case err != nil:
-		return message + fmt.Sprintf("; IBM reports the end of support of %s as %s", v.observed, eos)
+		return fmt.Sprintf("; IBM reports the end of support of %s as %s", v.observed, eos)
 	case end.Before(in.Now.Add(masterEndOfSupportNotice)):
-		return message + fmt.Sprintf("; IBM ends support for %s on %s, so plan the update to %s", v.observed,
+		return fmt.Sprintf("; IBM ends support for %s on %s, so plan the update to %s", v.observed,
 			end.UTC().Format(time.DateOnly), v.observed.Next())
 	default:
-		return message
+		return ""
 	}
+}
+
+// availableNote returns the part of the True MasterVersionUpToDate message that names the newer minors IBM offers
+// (status.availableDistributionVersions), or "" when there are none. It only informs: the condition stays True because
+// the master runs the minor the spec asks for, and the master changes only when the user raises
+// spec.distributionVersion.
+//
+// Parameters:
+//   - available: the newer minors, MAJOR.MINOR in ascending order (MasterVersionInput.Available).
+func availableNote(available []string) string {
+	if len(available) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("; update available: IBM offers %s; raise spec.distributionVersion to update",
+		strings.Join(available, ", "))
+}
+
+// maxAvailableDistributionVersions is the MaxItems bound of status.availableDistributionVersions. IBM offers about
+// five minors per distribution, so the bound is never reached in practice; should it be, the nearest minors are kept,
+// because an upgrade starts with them.
+const maxAvailableDistributionVersions = 16
+
+// maxAvailableDistributionVersionLength is the items MaxLength bound of status.availableDistributionVersions. A minor
+// whose MAJOR.MINOR is longer is left out, because the API server would refuse the whole status write for it.
+const maxAvailableDistributionVersionLength = 8
+
+// newerOfferedMinors returns the minors that IBM offers for distribution d above the master's minor, MAJOR.MINOR in
+// ascending order and each once, for status.availableDistributionVersions. Only the list of the master's distribution
+// counts (Kubernetes minors for IKS, OpenShift minors for ROKS), and a minor is newer when Minor.Compare puts it above
+// the master's, so a new major counts too. It is pure.
+//
+// TODO: the list is every newer minor of IBM's /versions list, which is what IBM offers for new clusters. Once IBM's
+// per-cluster upgrade-path endpoint is stable, list the versions it offers this cluster instead (after OpenShift 4.22
+// both 4.23 and 5.0), and also report a master patch that IBM offers but has not applied (see the TODO on
+// ibmversion.Minor.Next).
+//
+// Parameters:
+//   - d: spec.distribution.
+//   - master: the master's minor.
+//   - offered: IBM's offered versions; nil gives nil.
+func newerOfferedMinors(d controlplanev1.Distribution, master ibmversion.Minor, offered *kubernetesservice.Versions) []string {
+	if offered == nil {
+		return nil
+	}
+	in := MasterVersionInput{Distribution: d, Offered: offered}
+	var newer []ibmversion.Minor
+	for _, version := range in.offeredVersions() {
+		if minor := (ibmversion.Minor{Major: version.Major, Minor: version.Minor}); minor.Compare(master) > 0 {
+			newer = append(newer, minor)
+		}
+	}
+	return availableMinorNames(newer)
+}
+
+// keptNewerMinors returns the entries of an earlier status.availableDistributionVersions that are still above the
+// master's minor, in the same form as newerOfferedMinors. It is the list a reconcile keeps when IBM cannot be asked: the
+// last answer, without the minors the master has reached since, which are no longer an update. An entry that does not
+// parse is dropped; only CAPIBM writes the field. It is pure.
+//
+// Parameters:
+//   - kept: status.availableDistributionVersions as the reconcile read it.
+//   - master: the master's minor.
+func keptNewerMinors(kept []string, master ibmversion.Minor) []string {
+	var newer []ibmversion.Minor
+	for _, entry := range kept {
+		if minor, err := ibmversion.ParseMinor(entry); err == nil && minor.Compare(master) > 0 {
+			newer = append(newer, minor)
+		}
+	}
+	return availableMinorNames(newer)
+}
+
+// availableMinorNames sorts minors in ascending order, drops duplicates and names that the API bounds would refuse
+// (maxAvailableDistributionVersionLength), and returns at most maxAvailableDistributionVersions of them, the lowest
+// first, as MAJOR.MINOR; nil when none is left.
+//
+// Parameters:
+//   - minors: the minors to name; the slice is sorted in place.
+func availableMinorNames(minors []ibmversion.Minor) []string {
+	slices.SortFunc(minors, ibmversion.Minor.Compare)
+	var names []string
+	for _, minor := range slices.Compact(minors) {
+		name := minor.String()
+		if len(name) > maxAvailableDistributionVersionLength {
+			continue
+		}
+		names = append(names, name)
+		if len(names) == maxAvailableDistributionVersions {
+			break
+		}
+	}
+	return names
 }
 
 // decidePending decides row 1: IBM shows a master update, so CAPIBM waits and reports it.
@@ -622,6 +741,11 @@ func (in MasterVersionInput) offeredMinors() string {
 // whose version does not parse (fail safe: CAPIBM cannot show they are close enough). Deleted workers and workers
 // without an actual version yet (provisioning) are left out.
 //
+// TODO: the lowest allowed minor is counted back within the target's major, which assumes that versions follow each
+// other minor by minor. A master update from OpenShift 4.22 to 5.0 would find every 4.x worker skewed. Once IBM's
+// per-cluster upgrade-path endpoint is stable, take the allowed worker versions from IBM's upgrade graph (see the TODO on
+// ibmversion.Minor.Next).
+//
 // Parameters:
 //   - target: the minor the master would be updated to.
 func (in MasterVersionInput) skewedWorkers(target ibmversion.Minor) []string {
@@ -757,6 +881,11 @@ func MasterUpdateCallOutcome(err error, request controlplanev1.MasterUpdateReque
 // masterUpdateOutcome builds MasterUpdateCallOutcome's answer for a class. It takes the class as a parameter so that
 // the tests can show the VersionSkipNotAllowed row, which Classify returns only once IBM's error code for the skip
 // refusal is recorded (it is not yet verified against IBM Cloud).
+//
+// TODO: both refusal messages assume that the master's next version is its next minor ("CAPIBM requests one minor at a
+// time", "set spec.distributionVersion to the master's next minor"). After OpenShift 4.22 a master can move to 4.23 or
+// to 5.0; once IBM's per-cluster upgrade-path endpoint is stable, name the versions it lists for the cluster (see the
+// TODO on ibmversion.Minor.Next).
 //
 // Parameters:
 //   - class: the class of IBM's answer.

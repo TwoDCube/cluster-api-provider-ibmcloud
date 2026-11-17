@@ -1283,3 +1283,188 @@ func TestMasterMessagesNeverCarryThePendingMarker(t *testing.T) {
 		}
 	}
 }
+
+// masterNewerNote is availableNote's text for 1.37 and 1.38.
+const masterNewerNote = "; update available: IBM offers 1.37, 1.38; raise spec.distributionVersion to update"
+
+// TestDecideMasterActionAvailableNote checks that the newer minors IBM offers (MasterVersionInput.Available) are named
+// only in a True MasterVersionUpToDate, after the end-of-support notes, and never turn it False or ask for a call.
+func TestDecideMasterActionAvailableNote(t *testing.T) {
+	fx := loadMasterFixtures(t)
+	available := []string{"1.37", "1.38"}
+	testCases := []struct {
+		name string
+		in   func() MasterVersionInput
+		// wantStatus is the MasterVersionUpToDate status.
+		wantStatus metav1.ConditionStatus
+		// wantMessage is the whole message when set; wantNote is the note the message ends with, "" for none.
+		wantMessage string
+		wantNote    string
+	}{
+		{name: "the True message names the newer minors", wantStatus: metav1.ConditionTrue, wantNote: masterNewerNote,
+			wantMessage: "the master runs 1.36.5_1537, minor 1.36 as spec.distributionVersion asks; IBM applies master patches " +
+				"itself" + masterNewerNote,
+			in: func() MasterVersionInput { in := fx.iks("1.36"); in.Available = available; return in }},
+		{name: "without newer minors the True message has no note", wantStatus: metav1.ConditionTrue,
+			wantMessage: "the master runs 1.36.5_1537, minor 1.36 as spec.distributionVersion asks; IBM applies master patches itself",
+			in:          func() MasterVersionInput { in := fx.iks("1.36"); in.Available = []string{}; return in }},
+		{name: "the note follows the end-of-support note", wantStatus: metav1.ConditionTrue, wantNote: masterNewerNote,
+			wantMessage: "the master runs 1.36.5_1537, minor 1.36 as spec.distributionVersion asks; IBM applies master patches " +
+				"itself; IBM ends support for 1.36 on 2027-01-03, so plan the update to 1.37" + masterNewerNote,
+			in: func() MasterVersionInput {
+				in := fx.iks("1.36")
+				in.Cluster.VersionEOS, in.Available = "2027-01-03T23:59:59+0000", available
+				return in
+			}},
+		{name: "the note follows the unsupported note", wantStatus: metav1.ConditionTrue, wantNote: masterNewerNote,
+			wantMessage: "the master runs 1.36.5_1537, minor 1.36 as spec.distributionVersion asks; IBM applies master patches " +
+				"itself; IBM no longer supports 1.36: upgrade one minor at a time, starting with spec.distributionVersion 1.37" +
+				masterNewerNote,
+			in: func() MasterVersionInput {
+				in := fx.iks("1.36")
+				in.Cluster.State, in.Available = "unsupported", available
+				return in
+			}},
+		{name: "an IBM patch in progress keeps the True with the note", wantStatus: metav1.ConditionTrue, wantNote: masterNewerNote,
+			in: func() MasterVersionInput {
+				in := fx.iks("1.36")
+				in.Cluster.TargetVersion, in.Available = "1.36.6_1540", available
+				return in
+			}},
+		{name: "ROKS names the OpenShift minors", wantStatus: metav1.ConditionTrue,
+			wantNote: "; update available: IBM offers 4.22; raise spec.distributionVersion to update",
+			wantMessage: "the master runs 4.21.35_1537_openshift, minor 4.21 as spec.distributionVersion asks; IBM applies master " +
+				"patches itself; update available: IBM offers 4.22; raise spec.distributionVersion to update",
+			in: func() MasterVersionInput { in := fx.roks("4.21"); in.Available = []string{"4.22"}; return in }},
+		{name: "a raise is not up to date and names no note", wantStatus: metav1.ConditionFalse,
+			in: func() MasterVersionInput {
+				in := fx.iks("1.37")
+				in.MasterUpdate, in.Available = masterRequested("1.37", time.Minute, 1), available
+				return in
+			}},
+		{name: "a version skip names no note", wantStatus: metav1.ConditionFalse,
+			in: func() MasterVersionInput { in := fx.iks("1.38"); in.Available = available; return in }},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			got, err := DecideMasterAction(tc.in())
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(got.NeedsOfferedVersions || got.NeedsWorkers || got.RequestUpdate).To(BeFalse(), "the note asks for nothing")
+			g.Expect(got.UpToDate.Status).To(Equal(tc.wantStatus), got.UpToDate.Message)
+			if tc.wantMessage != "" {
+				g.Expect(got.UpToDate.Message).To(Equal(tc.wantMessage))
+			}
+			if tc.wantNote != "" {
+				g.Expect(got.UpToDate.Message).To(HaveSuffix(tc.wantNote))
+			} else {
+				g.Expect(got.UpToDate.Message).NotTo(ContainSubstring("update available"))
+			}
+		})
+	}
+}
+
+func TestNewerOfferedMinors(t *testing.T) {
+	fx := loadMasterFixtures(t)
+	release := func(major, minor, patch int) kubernetesservice.ReleaseVersion {
+		return kubernetesservice.ReleaseVersion{Major: major, Minor: minor, Patch: patch}
+	}
+	var many []kubernetesservice.ReleaseVersion
+	var firstSixteen []string
+	for minor := 56; minor >= 37; minor-- {
+		many = append(many, release(1, minor, 0))
+	}
+	for minor := 37; minor < 37+maxAvailableDistributionVersions; minor++ {
+		firstSixteen = append(firstSixteen, fmt.Sprintf("1.%d", minor))
+	}
+	testCases := []struct {
+		name    string
+		d       controlplanev1.Distribution
+		master  ibmversion.Minor
+		offered *kubernetesservice.Versions
+		want    []string
+	}{
+		{name: "IKS on the live capture lists 1.37", d: controlplanev1.DistributionKubernetes, master: ibmversion.Minor{Major: 1, Minor: 36},
+			offered: fx.offered, want: []string{"1.37"}},
+		{name: "ROKS on the live capture lists 4.22", d: controlplanev1.DistributionOpenShift, master: ibmversion.Minor{Major: 4, Minor: 21},
+			offered: fx.offered, want: []string{"4.22"}},
+		{name: "an older master lists every newer minor of its distribution", d: controlplanev1.DistributionOpenShift,
+			master: ibmversion.Minor{Major: 4, Minor: 18}, offered: fx.offered, want: []string{"4.19", "4.20", "4.21", "4.22"}},
+		{name: "the other distribution's minors never count", d: controlplanev1.DistributionKubernetes,
+			master: ibmversion.Minor{Major: 1, Minor: 36}, offered: &kubernetesservice.Versions{OpenShift: []kubernetesservice.ReleaseVersion{
+				release(4, 22, 16)}}},
+		{name: "minors are sorted and listed once", d: controlplanev1.DistributionKubernetes, master: ibmversion.Minor{Major: 1, Minor: 35},
+			offered: &kubernetesservice.Versions{Kubernetes: []kubernetesservice.ReleaseVersion{release(1, 38, 0), release(1, 36, 5),
+				release(1, 37, 1), release(1, 37, 2), release(1, 35, 9)}}, want: []string{"1.36", "1.37", "1.38"}},
+		{name: "a master on the newest minor lists nothing", d: controlplanev1.DistributionKubernetes,
+			master: ibmversion.Minor{Major: 1, Minor: 37}, offered: fx.offered},
+		{name: "a master above every offered minor lists nothing", d: controlplanev1.DistributionKubernetes,
+			master: ibmversion.Minor{Major: 1, Minor: 40}, offered: fx.offered},
+		{name: "a new major counts as newer", d: controlplanev1.DistributionOpenShift, master: ibmversion.Minor{Major: 4, Minor: 22},
+			offered: &kubernetesservice.Versions{OpenShift: []kubernetesservice.ReleaseVersion{release(5, 0, 1), release(4, 23, 0),
+				release(4, 22, 16)}}, want: []string{"4.23", "5.0"}},
+		{name: "no answer lists nothing", d: controlplanev1.DistributionKubernetes, master: ibmversion.Minor{Major: 1, Minor: 36}},
+		{name: "the list stops at the API bound with the nearest minors", d: controlplanev1.DistributionKubernetes,
+			master: ibmversion.Minor{Major: 1, Minor: 36}, offered: &kubernetesservice.Versions{Kubernetes: many}, want: firstSixteen},
+		{name: "a minor longer than the API bound is left out", d: controlplanev1.DistributionKubernetes,
+			master: ibmversion.Minor{Major: 1, Minor: 36}, offered: &kubernetesservice.Versions{Kubernetes: []kubernetesservice.ReleaseVersion{
+				release(1, 123456789, 0), release(1, 37, 1)}}, want: []string{"1.37"}},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			got := newerOfferedMinors(tc.d, tc.master, tc.offered)
+			g.Expect(got).To(Equal(tc.want))
+			g.Expect(len(got)).To(BeNumerically("<=", maxAvailableDistributionVersions))
+			for _, name := range got {
+				g.Expect(len(name)).To(BeNumerically("<=", maxAvailableDistributionVersionLength))
+				_, err := ibmversion.ParseMinor(name)
+				g.Expect(err).NotTo(HaveOccurred(), "every entry is MAJOR.MINOR like spec.distributionVersion")
+			}
+		})
+	}
+}
+
+func TestKeptNewerMinors(t *testing.T) {
+	testCases := []struct {
+		name   string
+		kept   []string
+		master ibmversion.Minor
+		want   []string
+	}{
+		{name: "the master on the same minor keeps the list", kept: []string{"1.37", "1.38"},
+			master: ibmversion.Minor{Major: 1, Minor: 36}, want: []string{"1.37", "1.38"}},
+		{name: "a minor the master reached is dropped", kept: []string{"1.37", "1.38"},
+			master: ibmversion.Minor{Major: 1, Minor: 37}, want: []string{"1.38"}},
+		{name: "a master past every entry keeps nothing", kept: []string{"1.37", "1.38"},
+			master: ibmversion.Minor{Major: 1, Minor: 38}},
+		{name: "entries that do not parse are dropped and the rest sorted", kept: []string{"1.38", "garbage", "1.37.1_1517", "1.37"},
+			master: ibmversion.Minor{Major: 1, Minor: 36}, want: []string{"1.37", "1.38"}},
+		{name: "nothing kept keeps nothing", master: ibmversion.Minor{Major: 1, Minor: 36}},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(keptNewerMinors(tc.kept, tc.master)).To(Equal(tc.want))
+		})
+	}
+}
+
+func TestAvailableNote(t *testing.T) {
+	testCases := []struct {
+		name      string
+		available []string
+		want      string
+	}{
+		{name: "none", want: ""},
+		{name: "empty", available: []string{}, want: ""},
+		{name: "one", available: []string{"4.22"}, want: "; update available: IBM offers 4.22; raise spec.distributionVersion to update"},
+		{name: "two", available: []string{"1.37", "1.38"}, want: masterNewerNote},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(availableNote(tc.available)).To(Equal(tc.want))
+		})
+	}
+}

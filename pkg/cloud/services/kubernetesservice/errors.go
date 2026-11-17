@@ -274,6 +274,12 @@ func classifyUpdateMaster(apiErr *APIError, skipCodes []string) ErrorClass {
 		// Every other 403 is left to classifyStatus, which makes it ClassPermissionDenied like a 403 on any other
 		// operation. CAPIBM requests only the observed minor + 1, so IBM's documented skip refusal cannot be the cause, and
 		// a 403 is almost certainly a missing Kubernetes Service IAM role.
+		//
+		// TODO: "the observed minor + 1" (here, in the ClassVersionSkipNotAllowed documentation and in the
+		// KubernetesService.UpdateMaster documentation) stops describing the request once IBM's per-cluster
+		// upgrade-path endpoint is used: after OpenShift 4.22 the next version can be 4.23 or 5.0. The reasoning holds
+		// as long as CAPIBM requests only a version that endpoint lists for the cluster; reword these comments then
+		// (see the TODO on ibmversion.Minor.Next).
 		return ClassUnknown
 	}
 }

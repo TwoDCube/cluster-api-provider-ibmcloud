@@ -94,7 +94,8 @@ func TestControlPlaneMoveBinding(t *testing.T) {
 		creds := newKubeconfigCredentials(t, time.Hour)
 		f, prober := newKubeconfigFixture(t, func(objs *cpObjects) { withMovedStatus(objs, movedSecret(t, creds)) })
 		prober.setAnswer(alwaysPassing("v1.36.5+IKS"))
-		// One lookup by the Secret's cluster-id, the CA of the proof; no create, no ListVersions, no credential fetch.
+		// One lookup by the Secret's cluster-id, the CA of the proof; no create, no credential fetch. (The version listing
+		// of the master version step, once the control plane is initialized, is the fixture's.)
 		gomock.InOrder(f.expectObserve(cpCluster("normal")), f.expectCAForProof(creds.ca))
 		before := f.kubeconfigSecret()
 
@@ -476,6 +477,8 @@ func TestControlPlaneEnvtestMove(t *testing.T) {
 	gomock.InOrder(
 		kube.EXPECT().GetCluster(gomock.Any(), cpIKSClusterID, "").Return(c, nil),
 		kube.EXPECT().GetCACertificate(gomock.Any(), cpIKSClusterID).Return(&kubernetesservice.CACertificate{PEM: creds.ca.pem}, nil),
+		// The master version step of the now initialized control plane lists IBM's offered versions (nothing newer).
+		kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil),
 	)
 
 	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})

@@ -263,6 +263,7 @@ func TestReconcileMasterVersionUnparsableMaster(t *testing.T) {
 	rollingBefore := conditions.Get(cp, controlplanev1.IBMCloudManagedControlPlaneRollingOutCondition).DeepCopy()
 	scope, err := NewControlPlaneScope(newCPScopeParams(&cpScopeBuilder{kubernetes: kube}), &clusterv1.Cluster{}, cp, cpNoPersist)
 	g.Expect(err).NotTo(HaveOccurred())
+	scope.InfraCluster = &infrav1.IBMCloudManagedCluster{Spec: infrav1.IBMCloudManagedClusterSpec{Region: "us-south"}}
 
 	scope.reconcileMasterVersion(context.Background(), &kubernetesservice.Cluster{ID: "c1", MasterKubeVersion: "not-a-version"}, Done())
 
@@ -281,7 +282,9 @@ func TestReconcileMasterVersionUnparsableMaster(t *testing.T) {
 	g.Expect(cp.Status.MasterUpdate).To(BeZero())
 
 	// IBM reports a version that parses again, the minor spec.distributionVersion asks for: row 3 replaces the Unknown
-	// with True, RollingOut is reported again, and still no IBM call is needed.
+	// with True and RollingOut is reported again. The only IBM call is the listing of the newer minors for status.
+	kube.EXPECT().ListVersions(gomock.Any()).Return(&kubernetesservice.Versions{
+		Kubernetes: []kubernetesservice.ReleaseVersion{{Major: 1, Minor: 37, Patch: 1}}}, nil)
 	scope.reconcileMasterVersion(context.Background(), &kubernetesservice.Cluster{ID: "c1", MasterKubeVersion: "1.37.1_1517",
 		TargetVersion: "1.37.1_1517"}, Done())
 
@@ -473,4 +476,156 @@ func TestMasterConditionCopy(t *testing.T) {
 	g.Expect(copied.Reason).To(Equal(controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDatePermissionDeniedReason),
 		"a later Set does not change the copy a decision read")
 	g.Expect(copied.Message).To(Equal("refused"))
+}
+
+// TestReconcileMasterVersionAvailableVersions checks the informational "update available" signal of the step: the
+// minors IBM offers above the master's go to status.availableDistributionVersions and into the True message, a repeat
+// changes nothing and asks the VersionsCache instead of IBM, and a failed listing keeps the last list and never
+// touches MasterVersionUpToDate or the step's outcome.
+func TestReconcileMasterVersionAvailableVersions(t *testing.T) {
+	const upToDate = "the master runs 1.36.5_1537, minor 1.36 as spec.distributionVersion asks; IBM applies master patches itself"
+	offered := func(minors ...int) *kubernetesservice.Versions {
+		versions := &kubernetesservice.Versions{OpenShift: []kubernetesservice.ReleaseVersion{{Major: 4, Minor: 22, Patch: 16}}}
+		for _, minor := range minors {
+			versions.Kubernetes = append(versions.Kubernetes, kubernetesservice.ReleaseVersion{Major: 1, Minor: minor, Patch: 1})
+		}
+		return versions
+	}
+	master := &kubernetesservice.Cluster{ID: "c1", MasterKubeVersion: "1.36.5_1537", TargetVersion: "1.36.5_1537", State: "normal"}
+	// newControlPlane returns an initialized IKS control plane whose spec asks for desired.
+	newControlPlane := func(desired string) *controlplanev1.IBMCloudManagedControlPlane {
+		cp := &controlplanev1.IBMCloudManagedControlPlane{Spec: controlplanev1.IBMCloudManagedControlPlaneSpec{
+			Distribution: controlplanev1.DistributionKubernetes, DistributionVersion: desired}}
+		cp.Generation = 2
+		cp.Status.Initialization.ControlPlaneInitialized = ptr.To(true)
+		return cp
+	}
+	// run runs the step once on cp with params and returns its outcome.
+	run := func(g Gomega, params *ScopeParams, cp *controlplanev1.IBMCloudManagedControlPlane, c *kubernetesservice.Cluster) Outcome {
+		scope, err := NewControlPlaneScope(params, &clusterv1.Cluster{}, cp, cpNoPersist)
+		g.Expect(err).NotTo(HaveOccurred())
+		scope.InfraCluster = &infrav1.IBMCloudManagedCluster{Spec: infrav1.IBMCloudManagedClusterSpec{Region: testRegion}}
+		scope.reconcileMasterVersion(context.Background(), c, Done())
+		return scope.MasterVersionOutcome()
+	}
+
+	t.Run("newer minors are listed and named while the master stays True, and a repeat changes nothing", func(t *testing.T) {
+		g := NewWithT(t)
+		kube := ksmock.NewMockKubernetesService(gomock.NewController(t))
+		kube.EXPECT().ListVersions(gomock.Any()).Return(offered(38, 35, 36, 37), nil) // once: the cache answers the repeat
+		params := newCPScopeParams(&cpScopeBuilder{kubernetes: kube})
+		cp := newControlPlane("1.36")
+
+		g.Expect(run(g, params, cp, master)).To(Equal(Done()))
+
+		g.Expect(cp.Status.AvailableDistributionVersions).To(Equal([]string{"1.37", "1.38"}))
+		condition := conditions.Get(cp, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition)
+		g.Expect(condition.Status).To(Equal(metav1.ConditionTrue))
+		g.Expect(condition.Reason).To(Equal(controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateReason))
+		g.Expect(condition.Message).To(Equal(upToDate + "; update available: IBM offers 1.37, 1.38; raise spec.distributionVersion to update"))
+		g.Expect(cp.Status.MasterUpdate).To(BeZero(), "an available minor is never requested")
+
+		written := cp.DeepCopy()
+		g.Expect(run(g, params, cp, master)).To(Equal(Done()))
+		g.Expect(cp).To(Equal(written), "the same list writes nothing")
+	})
+
+	t.Run("nothing newer leaves the field empty and the message without a note", func(t *testing.T) {
+		g := NewWithT(t)
+		kube := ksmock.NewMockKubernetesService(gomock.NewController(t))
+		kube.EXPECT().ListVersions(gomock.Any()).Return(offered(35, 36), nil)
+		cp := newControlPlane("1.36")
+
+		g.Expect(run(g, newCPScopeParams(&cpScopeBuilder{kubernetes: kube}), cp, master)).To(Equal(Done()))
+
+		g.Expect(cp.Status.AvailableDistributionVersions).To(BeNil())
+		g.Expect(conditions.Get(cp, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition).Message).To(Equal(upToDate))
+	})
+
+	for _, answer := range []error{
+		&kubernetesservice.APIError{Operation: kubernetesservice.OpListVersions, StatusCode: http.StatusServiceUnavailable},
+		&kubernetesservice.APIError{Operation: kubernetesservice.OpListVersions, StatusCode: http.StatusForbidden, Code: "E3c1a"},
+		&kubernetesservice.APIError{Operation: kubernetesservice.OpListVersions, StatusCode: http.StatusUnauthorized},
+		&kubernetesservice.APIError{Operation: kubernetesservice.OpListVersions, StatusCode: http.StatusTooManyRequests, RetryAfter: time.Minute},
+		errors.New("connection reset"),
+	} {
+		t.Run("a failed listing keeps the last list and the condition: "+answer.Error(), func(t *testing.T) {
+			g := NewWithT(t)
+			kube := ksmock.NewMockKubernetesService(gomock.NewController(t))
+			kube.EXPECT().ListVersions(gomock.Any()).Return(nil, answer) // once: the cache holds the failure for the repeat
+			builder := &cpScopeBuilder{kubernetes: kube}
+			params := newCPScopeParams(builder)
+			cp := newControlPlane("1.36")
+			cp.Status.AvailableDistributionVersions = []string{"1.37"}
+			conditions.Set(cp, metav1.Condition{Type: controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition,
+				Status: metav1.ConditionTrue, Reason: controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateReason,
+				Message: upToDate + "; update available: IBM offers 1.37; raise spec.distributionVersion to update"})
+			conditions.Set(cp, masterRollingOut(false, ""))
+			before := cp.DeepCopy()
+
+			for range 2 {
+				g.Expect(run(g, params, cp, master)).To(Equal(Done()), "the listing never changes the step's outcome")
+				g.Expect(cp).To(Equal(before), "neither the list nor a condition changes")
+			}
+			g.Expect(builder.invalidated).To(BeEmpty(), "an informational listing rebuilds no authenticator; GetCluster does on a 401")
+		})
+	}
+
+	t.Run("a failed listing after the master reached a listed minor drops that minor", func(t *testing.T) {
+		g := NewWithT(t)
+		kube := ksmock.NewMockKubernetesService(gomock.NewController(t))
+		kube.EXPECT().ListVersions(gomock.Any()).Return(nil, &kubernetesservice.APIError{Operation: kubernetesservice.OpListVersions,
+			StatusCode: http.StatusBadGateway})
+		cp := newControlPlane("1.37")
+		cp.Status.AvailableDistributionVersions = []string{"1.37", "1.38"}
+		reached := &kubernetesservice.Cluster{ID: "c1", MasterKubeVersion: "1.37.1_1517", TargetVersion: "1.37.1_1517", State: "normal"}
+
+		g.Expect(run(g, newCPScopeParams(&cpScopeBuilder{kubernetes: kube}), cp, reached)).To(Equal(Done()))
+
+		g.Expect(cp.Status.AvailableDistributionVersions).To(Equal([]string{"1.38"}))
+		g.Expect(conditions.Get(cp, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition).Message).To(HaveSuffix(
+			"; update available: IBM offers 1.38; raise spec.distributionVersion to update"))
+	})
+
+	t.Run("a raise reuses the decision's listing for the list", func(t *testing.T) {
+		g := NewWithT(t)
+		kube := ksmock.NewMockKubernetesService(gomock.NewController(t))
+		kube.EXPECT().ListVersions(gomock.Any()).Return(offered(36, 37), nil)
+		cp := newControlPlane("1.37")
+		params := newCPScopeParams(&cpScopeBuilder{kubernetes: kube})
+		// A request on record a minute ago: the pending grace holds it, so no ListWorkers or UpdateMaster (gomock).
+		cp.Status.MasterUpdate = controlplanev1.MasterUpdateRequest{Version: "1.37",
+			LastRequestTime: metav1.NewTime(params.Clock.Now().Add(-time.Minute)), Attempts: 1}
+
+		run(g, params, cp, master)
+
+		g.Expect(cp.Status.AvailableDistributionVersions).To(Equal([]string{"1.37"}), "the master still runs 1.36")
+		g.Expect(conditions.GetReason(cp, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition)).To(
+			Equal(controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateUpgradePendingReason))
+	})
+
+	t.Run("a failed listing that a raise needs ends the step before the list changes", func(t *testing.T) {
+		g := NewWithT(t)
+		kube := ksmock.NewMockKubernetesService(gomock.NewController(t))
+		kube.EXPECT().ListVersions(gomock.Any()).Return(nil, &kubernetesservice.APIError{Operation: kubernetesservice.OpListVersions,
+			StatusCode: http.StatusForbidden, Code: "E3c1a"})
+		cp := newControlPlane("1.37")
+		cp.Status.AvailableDistributionVersions = []string{"1.37"}
+
+		g.Expect(run(g, newCPScopeParams(&cpScopeBuilder{kubernetes: kube}), cp, master)).To(Equal(NotDone(IntervalTerminalRecheck,
+			controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDatePermissionDeniedReason)))
+
+		g.Expect(cp.Status.AvailableDistributionVersions).To(Equal([]string{"1.37"}))
+	})
+
+	t.Run("an unparsable master leaves the list and makes no call", func(t *testing.T) {
+		g := NewWithT(t)
+		kube := ksmock.NewMockKubernetesService(gomock.NewController(t))
+		cp := newControlPlane("1.36")
+		cp.Status.AvailableDistributionVersions = []string{"1.37"}
+
+		run(g, newCPScopeParams(&cpScopeBuilder{kubernetes: kube}), cp, &kubernetesservice.Cluster{ID: "c1", MasterKubeVersion: "odd"})
+
+		g.Expect(cp.Status.AvailableDistributionVersions).To(Equal([]string{"1.37"}))
+	})
 }

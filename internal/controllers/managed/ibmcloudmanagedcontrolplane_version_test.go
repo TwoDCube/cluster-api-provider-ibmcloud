@@ -78,7 +78,7 @@ func newMasterFixture(t *testing.T, desired string, setup func(objs *cpObjects))
 		Type: corev1.SecretTypeOpaque,
 		Data: map[string][]byte{"value": buildTestKubeconfig(t, cpTestServer, managedkubeconfig.ClusterCA, creds)},
 	}
-	f, prober := newKubeconfigFixture(t, func(objs *cpObjects) {
+	f, prober := newBoundFixture(t, func(objs *cpObjects) {
 		objs.cp.Generation = masterTestGeneration
 		objs.cp.Status.Initialization.ControlPlaneInitialized = ptr.To(true)
 		objs.extra = append(objs.extra, userProvided)
@@ -534,10 +534,10 @@ func TestControlPlaneMasterUpdateRefusal(t *testing.T) {
 }
 
 func TestControlPlaneMasterVersionCallBudget(t *testing.T) {
-	t.Run("an up-to-date master costs only GetCluster", func(t *testing.T) {
+	t.Run("an up-to-date master costs GetCluster and an hourly version listing", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newMasterFixture(t, "1.36", nil)
-		f.expectObserve(cpCluster("normal"))
+		gomock.InOrder(f.expectObserve(cpCluster("normal")), f.kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil))
 
 		result, err := f.reconcile()
 
@@ -550,6 +550,17 @@ func TestControlPlaneMasterVersionCallBudget(t *testing.T) {
 			"applies master patches itself"))
 		g.Expect(rolling.Status).To(Equal(metav1.ConditionFalse))
 		g.Expect(rolling.Reason).To(Equal(controlplanev1.IBMCloudManagedControlPlaneNotRollingOutReason))
+
+		// Within the hour the VersionsCache answers: the steady polls cost GetCluster only.
+		for _, after := range []time.Duration{5 * time.Minute, 59 * time.Minute} {
+			_, err = f.reconcileAt(after, func() { f.expectObserve(cpCluster("normal")) })
+			g.Expect(err).NotTo(HaveOccurred())
+		}
+		// An hour after the listing IBM is asked again.
+		_, err = f.reconcileAt(time.Hour, func() {
+			gomock.InOrder(f.expectObserve(cpCluster("normal")), f.kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil))
+		})
+		g.Expect(err).NotTo(HaveOccurred())
 	})
 
 	t.Run("a held request lists no workers and reads versions through the cache", func(t *testing.T) {
@@ -573,7 +584,7 @@ func TestControlPlaneMasterVersionCallBudget(t *testing.T) {
 		// lifetime), so the kubeconfig step asks IBM for the admin kubeconfig, and IBM answers 429.
 		stored := newKubeconfigCredentials(t, 366*24*time.Hour)
 		value := buildTestKubeconfig(t, cpTestServer, managedkubeconfig.ClusterCA, stored)
-		f, prober := newKubeconfigFixture(t, func(objs *cpObjects) {
+		f, prober := newBoundFixture(t, func(objs *cpObjects) {
 			objs.cp.Generation = masterTestGeneration
 			objs.cp.Status.Initialization.ControlPlaneInitialized = ptr.To(true)
 			objs.cp.Spec.DistributionVersion = "1.37"
@@ -606,12 +617,12 @@ func TestControlPlaneMasterVersionCallBudget(t *testing.T) {
 		expectMasterUpdate(g, f.controlPlane().Status.MasterUpdate, masterRecorded("1.37", 10*time.Minute, 1))
 	})
 
-	t.Run("an IBM master patch is RollingOut with no call", func(t *testing.T) {
+	t.Run("an IBM master patch is RollingOut with no request", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newMasterFixture(t, "1.36", nil)
 		patching := cpCluster("normal")
 		patching.TargetVersion = "1.36.6_1541"
-		f.expectObserve(patching)
+		gomock.InOrder(f.expectObserve(patching), f.expectVersions())
 
 		result, err := f.reconcile()
 
@@ -624,12 +635,12 @@ func TestControlPlaneMasterVersionCallBudget(t *testing.T) {
 		g.Expect(rolling.Message).To(Equal("IBM is applying master patch 1.36.6_1541"))
 	})
 
-	t.Run("a newer patch on the same minor is UpToDate with no call", func(t *testing.T) {
+	t.Run("a newer patch on the same minor is UpToDate with no request", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newMasterFixture(t, "1.36", nil)
 		patched := cpCluster("normal")
 		patched.MasterKubeVersion, patched.TargetVersion = "1.36.6_1541", "1.36.6_1541"
-		f.expectObserve(patched)
+		gomock.InOrder(f.expectObserve(patched), f.expectVersions())
 
 		_, err := f.reconcile()
 
@@ -661,27 +672,162 @@ func TestControlPlaneMasterVersionCallBudget(t *testing.T) {
 	})
 }
 
+// masterAvailableNote is the note the True MasterVersionUpToDate message of the master version tests carries while IBM
+// offers 1.37 and 1.38 above the master's 1.36.
+const masterAvailableNote = "; update available: IBM offers 1.37, 1.38; raise spec.distributionVersion to update"
+
+// masterTwoNewerVersions are IBM's offered versions with two minors above the master's 1.36 and one above ROKS 4.21.
+func masterTwoNewerVersions() *kubernetesservice.Versions {
+	versions := masterTestVersions()
+	versions.Kubernetes = append(versions.Kubernetes, kubernetesservice.ReleaseVersion{Major: 1, Minor: 38, Patch: 0})
+	return versions
+}
+
+// TestControlPlaneMasterVersionAvailableUpdates runs the informational "update available" signal through Reconcile: the
+// minors IBM offers above the master's go to status.availableDistributionVersions and into the message of a
+// MasterVersionUpToDate that stays True, the VersionsCache keeps IBM's listing to once an hour, a repeat writes no
+// status, and a failed listing changes neither the list nor the condition.
+func TestControlPlaneMasterVersionAvailableUpdates(t *testing.T) {
+	const upToDate136 = "the master runs 1.36.5_1537, minor 1.36 as spec.distributionVersion asks; IBM applies master patches itself"
+
+	t.Run("newer minors are listed and named while the master stays up to date, and a repeat writes nothing", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newMasterFixture(t, "1.36", nil)
+		gomock.InOrder(f.expectObserve(cpCluster("normal")),
+			f.kube.EXPECT().ListVersions(gomock.Any()).Return(masterTwoNewerVersions(), nil))
+
+		result, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		expectRequeue(g, result, 5*time.Minute)
+		cp := f.controlPlane()
+		g.Expect(cp.Status.AvailableDistributionVersions).To(Equal([]string{"1.37", "1.38"}))
+		upToDate := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition,
+			metav1.ConditionTrue, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateReason)
+		g.Expect(upToDate.Message).To(Equal(upToDate136 + masterAvailableNote))
+		g.Expect(cp.Status.MasterUpdate).To(BeZero(), "an available minor is never requested")
+		settled := len(f.patches())
+
+		// The next poll: the VersionsCache answers, and the same list and condition write no status.
+		_, err = f.reconcileAt(5*time.Minute, func() { f.expectObserve(cpCluster("normal")) })
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(f.patches()).To(HaveLen(settled), "no status write for the same list")
+	})
+
+	t.Run("ROKS lists the newer OpenShift minors only", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newMasterFixture(t, "4.21", withOpenShift)
+		gomock.InOrder(f.expectObserve(roksCluster()), f.kube.EXPECT().ListVersions(gomock.Any()).Return(masterTwoNewerVersions(), nil))
+
+		_, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		cp := f.controlPlane()
+		g.Expect(cp.Status.AvailableDistributionVersions).To(Equal([]string{"4.22"}))
+		upToDate := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition,
+			metav1.ConditionTrue, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateReason)
+		g.Expect(upToDate.Message).To(HaveSuffix("; update available: IBM offers 4.22; raise spec.distributionVersion to update"))
+	})
+
+	t.Run("a failed listing keeps the list and the condition until IBM answers again", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newMasterFixture(t, "1.36", nil)
+		gomock.InOrder(f.expectObserve(cpCluster("normal")), f.expectVersions())
+		_, err := f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+		before := f.controlPlane()
+		g.Expect(before.Status.AvailableDistributionVersions).To(Equal([]string{"1.37"}))
+		kept := conditions.Get(before, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition).DeepCopy()
+		g.Expect(kept.Message).To(Equal(upToDate136 + "; update available: IBM offers 1.37; raise spec.distributionVersion to update"))
+		settled := len(f.patches())
+
+		failures := []error{
+			ibmError(kubernetesservice.OpListVersions, http.StatusInternalServerError, ""),
+			ibmErrorWithIncident(kubernetesservice.OpListVersions, http.StatusForbidden, "E3c1a", "incident-a"),
+			&kubernetesservice.APIError{Operation: kubernetesservice.OpListVersions, StatusCode: http.StatusTooManyRequests,
+				RetryAfter: 3 * time.Minute},
+		}
+		for i, answer := range failures {
+			// The first listing is an hour old, and each failure comes once the VersionsCache's hold of the one before
+			// is over, so IBM is asked each time.
+			at := time.Hour + time.Duration(i)*managedscope.VersionsFailureHold
+			result, err := f.reconcileAt(at, func() {
+				gomock.InOrder(f.expectObserve(cpCluster("normal")), f.kube.EXPECT().ListVersions(gomock.Any()).Return(nil, answer))
+			})
+
+			g.Expect(err).NotTo(HaveOccurred(), "the listing is informational: its failure is no reconcile error (%v)", answer)
+			expectRequeue(g, result, 5*time.Minute)
+			cp := f.controlPlane()
+			g.Expect(cp.Status.AvailableDistributionVersions).To(Equal([]string{"1.37"}), "the last list is kept (%v)", answer)
+			g.Expect(conditions.Get(cp, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition)).To(Equal(kept),
+				"the condition is not touched (%v)", answer)
+			g.Expect(f.patches()).To(HaveLen(settled), "no status write (%v)", answer)
+
+			// Within the hold the failure is answered from the cache: GetCluster only (gomock fails the test on a call).
+			_, err = f.reconcileAt(at+time.Minute, func() { f.expectObserve(cpCluster("normal")) })
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(f.patches()).To(HaveLen(settled))
+		}
+
+		// IBM answers again, now with a second newer minor: the list and the message follow.
+		_, err = f.reconcileAt(time.Hour+time.Duration(len(failures))*managedscope.VersionsFailureHold, func() {
+			gomock.InOrder(f.expectObserve(cpCluster("normal")), f.kube.EXPECT().ListVersions(gomock.Any()).Return(masterTwoNewerVersions(), nil))
+		})
+		g.Expect(err).NotTo(HaveOccurred())
+		cp := f.controlPlane()
+		g.Expect(cp.Status.AvailableDistributionVersions).To(Equal([]string{"1.37", "1.38"}))
+		upToDate := conditions.Get(cp, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition)
+		g.Expect(upToDate.Message).To(Equal(upToDate136 + masterAvailableNote))
+		g.Expect(upToDate.LastTransitionTime.Equal(&kept.LastTransitionTime)).To(BeTrue(), "the condition stayed True throughout")
+	})
+
+	t.Run("a failed listing after the master reached a listed minor drops that minor", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newMasterFixture(t, "1.37", func(objs *cpObjects) {
+			objs.cp.Status.MasterUpdate = masterRecorded("1.37", -40*time.Minute, 1)
+			objs.cp.Status.AvailableDistributionVersions = []string{"1.37", "1.38"}
+		})
+		done := cpCluster("normal")
+		done.MasterKubeVersion, done.TargetVersion = "1.37.1_1517", "1.37.1_1517"
+		gomock.InOrder(f.expectObserve(done), f.kube.EXPECT().ListVersions(gomock.Any()).
+			Return(nil, ibmError(kubernetesservice.OpListVersions, http.StatusBadGateway, "")))
+
+		_, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		cp := f.controlPlane()
+		g.Expect(cp.Status.AvailableDistributionVersions).To(Equal([]string{"1.38"}))
+		upToDate := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition,
+			metav1.ConditionTrue, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateReason)
+		g.Expect(upToDate.Message).To(Equal("the master runs 1.37.1_1517, minor 1.37 as spec.distributionVersion asks; IBM " +
+			"applies master patches itself; update available: IBM offers 1.38; raise spec.distributionVersion to update"))
+	})
+}
+
 func TestControlPlaneMasterVersionGuards(t *testing.T) {
 	testCases := []struct {
 		name    string
 		desired string
 		// cluster changes the bound cluster IBM reports.
 		cluster func(c *kubernetesservice.Cluster)
-		// expect sets the IBM calls after the GetCluster.
+		// expect sets the IBM calls after the GetCluster; nil expects one ListVersions answering masterTestVersions, which
+		// the step makes for status.availableDistributionVersions when the decision itself needs no version listing.
 		expect      func(f *cpFixture)
 		wantStatus  metav1.ConditionStatus
 		wantReason  string
 		wantMessage string
 		wantRequeue time.Duration
+		// wantAvailable is status.availableDistributionVersions afterwards.
+		wantAvailable []string
 	}{
-		{name: "skip more than one minor makes no call", desired: "1.38",
+		{name: "skip more than one minor makes no request", desired: "1.38",
 			wantStatus: metav1.ConditionFalse, wantReason: "VersionSkipNotAllowed", wantRequeue: 5 * time.Minute,
 			wantMessage: "spec.distributionVersion 1.38 is more than one minor above the master's minor 1.36; IBM updates a master " +
-				"one minor at a time, so set spec.distributionVersion to 1.37 first"},
-		{name: "downgrade makes no call", desired: "1.35",
+				"one minor at a time, so set spec.distributionVersion to 1.37 first", wantAvailable: []string{"1.37"}},
+		{name: "downgrade makes no request", desired: "1.35",
 			wantStatus: metav1.ConditionFalse, wantReason: "DowngradeNotAllowed", wantRequeue: 5 * time.Minute,
 			wantMessage: "spec.distributionVersion 1.35 is below the master's minor 1.36 (IBM version 1.36.5_1537); IBM cannot roll " +
-				"a master back, so set spec.distributionVersion to 1.36"},
+				"a master back, so set spec.distributionVersion to 1.36", wantAvailable: []string{"1.37"}},
 		{name: "a minor IBM does not offer lists no workers", desired: "1.37",
 			expect: func(f *cpFixture) {
 				f.kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil)
@@ -694,40 +840,43 @@ func TestControlPlaneMasterVersionGuards(t *testing.T) {
 			},
 			wantStatus: metav1.ConditionFalse, wantReason: "BlockedByWorkerSkew", wantRequeue: 5 * time.Minute,
 			wantMessage: "IBM refuses a master update to 1.37 while a worker runs more than 2 minor(s) below it: worker w1; the update " +
-				"waits until CAPIBM has replaced them with workers of the master's minor"},
+				"waits until CAPIBM has replaced them with workers of the master's minor", wantAvailable: []string{"1.37"}},
 		{name: "a CA rotation with an unknown status blocks the request", desired: "1.37",
 			cluster:    func(c *kubernetesservice.Cluster) { c.CARotationStatus = "something IBM has not documented" },
 			wantStatus: metav1.ConditionFalse, wantReason: "BlockedByCARotation", wantRequeue: time.Minute,
-			wantMessage: "IBM reports a CA certificate rotation that has not completed; the master update to 1.37 waits until it completes"},
+			wantMessage:   "IBM reports a CA certificate rotation that has not completed; the master update to 1.37 waits until it completes",
+			wantAvailable: []string{"1.37"}},
 		{name: "an up-to-date master during a CA rotation is UpToDate", desired: "1.36",
 			cluster:    func(c *kubernetesservice.Cluster) { c.CARotationStatus = "CA certificate rotation in progress" },
-			wantStatus: metav1.ConditionTrue, wantReason: "UpToDate", wantRequeue: 5 * time.Minute},
+			wantStatus: metav1.ConditionTrue, wantReason: "UpToDate", wantRequeue: 5 * time.Minute, wantAvailable: []string{"1.37"}},
 		{name: "a deny-listed state blocks the request", desired: "1.37",
 			cluster:    func(c *kubernetesservice.Cluster) { c.State = "critical" },
 			wantStatus: metav1.ConditionFalse, wantReason: "BlockedByClusterState", wantRequeue: 5 * time.Minute,
-			wantMessage: "IBM cluster state critical does not allow a master update; the update to 1.37 waits"},
+			wantMessage: "IBM cluster state critical does not allow a master update; the update to 1.37 waits", wantAvailable: []string{"1.37"}},
 		{name: "update_canceled is not blocked", desired: "1.37",
 			cluster: func(c *kubernetesservice.Cluster) { c.State = "update_canceled" },
 			expect: func(f *cpFixture) {
 				gomock.InOrder(f.expectVersions(), f.expectWorkers(nil), f.expectUpdateMaster("1.37", nil))
 			},
-			wantStatus: metav1.ConditionFalse, wantReason: "UpgradePending", wantRequeue: 2 * time.Minute},
+			wantStatus: metav1.ConditionFalse, wantReason: "UpgradePending", wantRequeue: 2 * time.Minute, wantAvailable: []string{"1.37"}},
 		{name: "unsupported is not blocked", desired: "1.37",
 			cluster: func(c *kubernetesservice.Cluster) { c.State = "unsupported" },
 			expect: func(f *cpFixture) {
 				gomock.InOrder(f.expectVersions(), f.expectWorkers(nil), f.expectUpdateMaster("1.37", nil))
 			},
-			wantStatus: metav1.ConditionFalse, wantReason: "UpgradePending", wantRequeue: 2 * time.Minute},
+			wantStatus: metav1.ConditionFalse, wantReason: "UpgradePending", wantRequeue: 2 * time.Minute, wantAvailable: []string{"1.37"}},
 		{name: "unsupported on the requested minor stays True with the note", desired: "1.36",
 			cluster:    func(c *kubernetesservice.Cluster) { c.State = "unsupported" },
 			wantStatus: metav1.ConditionTrue, wantReason: "UpToDate", wantRequeue: 5 * time.Minute,
 			wantMessage: "the master runs 1.36.5_1537, minor 1.36 as spec.distributionVersion asks; IBM applies master patches " +
-				"itself; IBM no longer supports 1.36: upgrade one minor at a time, starting with spec.distributionVersion 1.37"},
+				"itself; IBM no longer supports 1.36: upgrade one minor at a time, starting with spec.distributionVersion 1.37; " +
+				"update available: IBM offers 1.37; raise spec.distributionVersion to update", wantAvailable: []string{"1.37"}},
 		{name: "an end of support within 45 days is mentioned", desired: "1.36",
 			cluster:    func(c *kubernetesservice.Cluster) { c.VersionEOS = "2026-12-20T23:59:59+0000" },
 			wantStatus: metav1.ConditionTrue, wantReason: "UpToDate", wantRequeue: 5 * time.Minute,
 			wantMessage: "the master runs 1.36.5_1537, minor 1.36 as spec.distributionVersion asks; IBM applies master patches " +
-				"itself; IBM ends support for 1.36 on 2026-12-20, so plan the update to 1.37"},
+				"itself; IBM ends support for 1.36 on 2026-12-20, so plan the update to 1.37; update available: IBM offers 1.37; " +
+				"raise spec.distributionVersion to update", wantAvailable: []string{"1.37"}},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -740,6 +889,8 @@ func TestControlPlaneMasterVersionGuards(t *testing.T) {
 			f.expectObserve(c)
 			if tc.expect != nil {
 				tc.expect(f)
+			} else {
+				f.expectVersions()
 			}
 
 			result, err := f.reconcile()
@@ -752,6 +903,7 @@ func TestControlPlaneMasterVersionGuards(t *testing.T) {
 			if tc.wantMessage != "" {
 				g.Expect(upToDate.Message).To(Equal(tc.wantMessage))
 			}
+			g.Expect(f.controlPlane().Status.AvailableDistributionVersions).To(Equal(tc.wantAvailable))
 		})
 	}
 }
@@ -764,7 +916,7 @@ func TestControlPlaneMasterUpdateProgress(t *testing.T) {
 		})
 		pending := cpCluster("normal")
 		pending.MasterKubeVersion, pending.TargetVersion = "1.37.1_1517 (pending)", "1.37.1_1517"
-		f.expectObserve(pending)
+		gomock.InOrder(f.expectObserve(pending), f.expectVersions())
 
 		result, err := f.reconcile()
 
@@ -789,7 +941,7 @@ func TestControlPlaneMasterUpdateProgress(t *testing.T) {
 		updating := cpCluster("updating")
 		updating.MasterState, updating.MasterStatus = "updating", "Version update in progress."
 		updating.TargetVersion = "1.37.1_1517"
-		f.expectObserve(updating)
+		gomock.InOrder(f.expectObserve(updating), f.expectVersions())
 
 		result, err := f.reconcile()
 
@@ -799,24 +951,30 @@ func TestControlPlaneMasterUpdateProgress(t *testing.T) {
 		g.Expect(upToDate.Reason).To(Equal(controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateUpgradePendingReason))
 		g.Expect(rolling.Status).To(Equal(metav1.ConditionTrue))
 		g.Expect(rolling.Message).To(Equal("IBM is updating the master to 1.37.1_1517"))
+		g.Expect(f.controlPlane().Status.AvailableDistributionVersions).To(Equal([]string{"1.37"}),
+			"the master still runs 1.36, so 1.37 is still newer")
 	})
 
 	t.Run("the master on the requested minor clears masterUpdate", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newMasterFixture(t, "1.37", func(objs *cpObjects) {
 			objs.cp.Status.MasterUpdate = masterRecorded("1.37", -40*time.Minute, 1)
+			objs.cp.Status.AvailableDistributionVersions = []string{"1.37"}
 		})
 		done := cpCluster("normal")
 		done.MasterKubeVersion, done.TargetVersion = "1.37.1_1517", "1.37.1_1517"
-		f.expectObserve(done)
+		gomock.InOrder(f.expectObserve(done), f.expectVersions())
 
 		_, err := f.reconcile()
 
 		g.Expect(err).NotTo(HaveOccurred())
 		cp := f.controlPlane()
 		g.Expect(cp.Status.MasterUpdate).To(BeZero())
+		g.Expect(cp.Status.AvailableDistributionVersions).To(BeEmpty(), "IBM offers nothing above the minor the master reached")
 		upToDate, rolling := f.masterConditions()
 		g.Expect(upToDate.Status).To(Equal(metav1.ConditionTrue))
+		g.Expect(upToDate.Message).To(Equal("the master runs 1.37.1_1517, minor 1.37 as spec.distributionVersion asks; IBM " +
+			"applies master patches itself"))
 		g.Expect(rolling.Status).To(Equal(metav1.ConditionFalse))
 	})
 }
@@ -963,8 +1121,11 @@ func TestControlPlaneMasterVersionInputFailures(t *testing.T) {
 		upToDate, _ := f.masterConditions()
 		g.Expect(upToDate.Reason).To(Equal(controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDatePermissionDeniedReason))
 
-		// No ListWorkers and no UpdateMaster: the backoff row holds the request (gomock fails the test on a call).
-		result, err := f.reconcileAt(time.Minute, func() { gomock.InOrder(f.expectObserve(cpCluster("normal")), f.expectVersions()) })
+		// The next poll after the VersionsCache's hold of the failed listing lists the versions again. No ListWorkers and no
+		// UpdateMaster: the backoff row holds the request (gomock fails the test on a call).
+		result, err := f.reconcileAt(managedscope.VersionsFailureHold, func() {
+			gomock.InOrder(f.expectObserve(cpCluster("normal")), f.expectVersions())
+		})
 
 		g.Expect(err).NotTo(HaveOccurred())
 		expectRequeue(g, result, 5*time.Minute)
@@ -1014,6 +1175,32 @@ func TestControlPlaneMasterVersionInputFailures(t *testing.T) {
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(result.RequeueAfter).To(BeNumerically(">=", 3*time.Minute))
 		f.expectStaleUpToDate(g)
+	})
+
+	t.Run("a 429 on ListVersions is asked again at the requeue its Retry-After set", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newMasterFixture(t, "1.37", withStaleUpToDate)
+		gomock.InOrder(f.expectObserve(cpCluster("normal")),
+			f.kube.EXPECT().ListVersions(gomock.Any()).Return(nil, &kubernetesservice.APIError{Operation: kubernetesservice.OpListVersions,
+				StatusCode: http.StatusTooManyRequests}))
+
+		result, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		expectRequeue(g, result, kubernetesservice.MinRateLimitBackoff)
+		f.expectStaleUpToDate(g)
+
+		// The VersionsCache holds the 429 only until the Retry-After the requeue waits for, so the requeue lists the
+		// versions again and requests the raise; a longer hold would answer this requeue, and every one after it until
+		// the hold ends, with the same 429 and nothing but a GetCluster. The time is rounded up to a whole second,
+		// which status.masterUpdate keeps.
+		at := result.RequeueAfter.Truncate(time.Second) + time.Second
+		_, err = f.reconcileAt(at, func() {
+			f.expectVersions()
+			f.expectRequest(cpCluster("normal"), nil, "1.37", nil)
+		})
+		g.Expect(err).NotTo(HaveOccurred())
+		expectMasterUpdate(g, f.controlPlane().Status.MasterUpdate, masterRecorded("1.37", at, 1))
 	})
 }
 

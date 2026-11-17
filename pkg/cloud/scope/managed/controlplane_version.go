@@ -19,6 +19,7 @@ package managed
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,8 +39,13 @@ import (
 //
 //   - The inputs that cost a call are fetched only when the decision asks for them: IBM's offered versions through the
 //     VersionsCache, keyed by identity and region (NeedsOfferedVersions), and the workers through one ListWorkers
-//     (NeedsWorkers), each followed by a fresh decision. A reconcile that requests nothing therefore makes no call
-//     beyond the control plane's GetCluster.
+//     (NeedsWorkers), each followed by a fresh decision.
+//   - After the decision, the newer minors IBM offers go to status.availableDistributionVersions and into the True
+//     MasterVersionUpToDate message (reconcileAvailableVersions). They are informational and never make the master
+//     outdated. They need the offered versions on every run, which the VersionsCache answers: IBM is asked at most once
+//     an hour per identity and region, and a failed listing at most once per VersionsFailureHold, or after a 429 once
+//     IBM's Retry-After is over. A reconcile that requests nothing therefore makes GetCluster and, about once an hour,
+//     ListVersions.
 //   - A request first writes status.masterUpdate with MasterVersionUpToDate=False/UpgradePending and RollingOut=True in
 //     a direct status patch (PersistFunc). Only when that write succeeded is UpdateMaster sent, so that every request IBM
 //     may have received is on record and the grace and backoff rows hold the next one.
@@ -115,7 +121,8 @@ func (s *ControlPlaneScope) reconcileMasterVersion(ctx context.Context, c *kuber
 	s.masterStep = s.masterVersion(ctx, c)
 }
 
-// masterVersion decides the master update, writes the decision, and makes the request when it says so.
+// masterVersion decides the master update, reports the newer minors IBM offers (reconcileAvailableVersions), writes the
+// decision, and makes the request when it says so.
 //
 // Parameters:
 //   - ctx is the reconcile context.
@@ -125,6 +132,13 @@ func (s *ControlPlaneScope) masterVersion(ctx context.Context, c *kubernetesserv
 	action, failed, ok := s.decideMaster(ctx, &in)
 	if !ok {
 		return failed
+	}
+	if s.reconcileAvailableVersions(ctx, &in) && action.UpToDate.Status == metav1.ConditionTrue {
+		// The True message names the newer minors (MasterVersionInput.Available), which have just changed. The input is
+		// the one decided a moment ago, so the decision does not fail, and a True needs no input that costs a call.
+		if decided, err := DecideMasterAction(in); err == nil {
+			action = decided
+		}
 	}
 	if action.RequestUpdate {
 		return s.requestMasterUpdate(ctx, in, action)
@@ -149,8 +163,58 @@ func (s *ControlPlaneScope) masterInput(c *kubernetesservice.Cluster) MasterVers
 		MasterUpdate:    cp.Status.MasterUpdate,
 		CurrentUpToDate: masterConditionCopy(cp, controlplanev1.IBMCloudManagedControlPlaneMasterVersionUpToDateCondition),
 		Generation:      cp.Generation,
+		Available:       cp.Status.AvailableDistributionVersions,
 		Now:             s.now().Time,
 	}
+}
+
+// reconcileAvailableVersions sets status.availableDistributionVersions to the minors newer than the master's that IBM
+// offers for its distribution (newerOfferedMinors), sets in.Available to the same list for the True
+// MasterVersionUpToDate message, and reports whether the list changed; status is written only on a change. It runs
+// after the decision and uses the offered versions the decision fetched (in.Offered), or else lists them through the
+// VersionsCache (listOfferedVersions), so that a step lists at most once.
+//
+// The list never changes MasterVersionUpToDate. A listing that fails here is logged and changes nothing else: the list
+// keeps its last value, without the minors the master has reached since (keptNewerMinors), and the VersionsCache holds
+// the failure for VersionsFailureHold (a 429 for IBM's Retry-After), so that an IBM outage is not called on every
+// reconcile. A failed listing that the decision itself needs, after a raise of spec.distributionVersion, ends the step
+// before this runs (masterInputFailed), and the list keeps its value then too. Nothing is done when IBM's master
+// version does not parse: the decision reports that as Unknown, and the minors newer than an unknown one are unknown.
+//
+// Parameters:
+//   - ctx is the reconcile context.
+//   - in is the decided input; Available is set on it.
+func (s *ControlPlaneScope) reconcileAvailableVersions(ctx context.Context, in *MasterVersionInput) bool {
+	v, err := in.parse()
+	if err != nil || !v.masterParsed {
+		return false
+	}
+	status := &s.ControlPlane.Status
+	offered := in.Offered
+	if offered == nil {
+		versions, callErr, err := s.listOfferedVersions(ctx)
+		switch {
+		case err != nil:
+			ctrl.LoggerFrom(ctx).Info("CAPIBM cannot list the versions IBM Cloud offers, so status.availableDistributionVersions "+
+				"keeps its last value", "problem", err.Error())
+		case callErr != nil:
+			ctrl.LoggerFrom(ctx).Info("IBM Cloud did not list the versions it offers, so status.availableDistributionVersions "+
+				"keeps its last value", "call", callErr.action, "error", callErr.err.Error())
+		}
+		offered = versions
+	}
+	var available []string
+	if offered != nil {
+		available = newerOfferedMinors(in.Distribution, v.observed, offered)
+	} else {
+		available = keptNewerMinors(status.AvailableDistributionVersions, v.observed)
+	}
+	in.Available = available
+	if slices.Equal(status.AvailableDistributionVersions, available) {
+		return false
+	}
+	status.AvailableDistributionVersions = available
+	return true
 }
 
 // decideMaster runs DecideMasterAction and fetches the inputs it asks for, each followed by a fresh decision: the
@@ -206,17 +270,41 @@ func (s *ControlPlaneScope) decideMaster(ctx context.Context, in *MasterVersionI
 //   - ctx is the reconcile context.
 //   - in is the input of the decision that asked for the versions.
 func (s *ControlPlaneScope) masterOfferedVersions(ctx context.Context, in MasterVersionInput) (*kubernetesservice.Versions, masterVersionStep, bool) {
+	versions, callErr, err := s.listOfferedVersions(ctx)
+	switch {
+	case err != nil:
+		return nil, masterVersionStep{outcome: Transient(err)}, false
+	case callErr != nil:
+		return nil, masterVersionStep{outcome: s.masterInputFailed(ctx, in, callErr)}, false
+	default:
+		return versions, masterVersionStep{}, true
+	}
+}
+
+// listOfferedVersions lists IBM's offered versions through the VersionsCache of the identity and region. It returns
+// the versions, or the failed listing (callErr), or err when the IBM clients cannot be built.
+//
+// TODO: this lists what IBM offers for new clusters (/versions), and the master version step takes the master's next
+// minor in it as the only update. IBM is developing a per-cluster upgrade-path endpoint (GraphQL, currently
+// https://containers.cloud.ibm.com/unsafe/graphql), because after OpenShift 4.22 a master can move to 4.23 or to 5.0, so
+// the upgrades form a graph and the next version is no longer "the next minor in /versions". Once it is stable, list
+// the versions this cluster can move to there, for the update and for status.availableDistributionVersions; it is also
+// the way to see a master patch that IBM offers but has not applied (see the TODO on ibmversion.Minor.Next).
+//
+// Parameters:
+//   - ctx is the reconcile context.
+func (s *ControlPlaneScope) listOfferedVersions(ctx context.Context) (*kubernetesservice.Versions, *controlPlaneCallError, error) {
 	clients, err := s.ibm(ctx)
 	if err != nil {
-		return nil, masterVersionStep{outcome: Transient(err)}, false
+		return nil, nil, err
 	}
 	region := s.InfraCluster.Spec.Region
 	versions, err := s.params.VersionsCache.Get(ctx, clients.identity.Key, region, clients.kubernetes.ListVersions)
 	if err != nil {
-		return nil, masterVersionStep{outcome: s.masterInputFailed(ctx, in, &controlPlaneCallError{identity: clients.identity,
-			op: kubernetesservice.OpListVersions, action: "listing the versions IBM Cloud offers in region " + region, err: err})}, false
+		return nil, &controlPlaneCallError{identity: clients.identity, op: kubernetesservice.OpListVersions,
+			action: "listing the versions IBM Cloud offers in region " + region, err: err}, nil
 	}
-	return versions, masterVersionStep{}, true
+	return versions, nil, nil
 }
 
 // masterWorkers lists every worker of the cluster with one ListWorkers call, for the worker skew guard of

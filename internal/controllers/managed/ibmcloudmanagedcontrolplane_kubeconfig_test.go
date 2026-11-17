@@ -274,7 +274,21 @@ func alwaysPassing(gitVersion string) func(probedKubeconfig) (workloadprobe.Resu
 
 // newKubeconfigFixture returns the fixture of a bound IKS control plane whose endpoint is recorded, with the scripted
 // prober. setup changes the objects first; t is the test.
+//
+// Once the control plane is initialized, the master version step lists IBM's offered versions for
+// status.availableDistributionVersions, at most once an hour of the fake clock through the VersionsCache. The tests of
+// this fixture are not about that listing, so it is allowed at any time and answers cpOfferedVersions, which offers
+// nothing newer than the fixtures' masters: the list stays empty and no status changes for it.
 func newKubeconfigFixture(t *testing.T, setup func(objs *cpObjects)) (*cpFixture, *kubeconfigProber) {
+	t.Helper()
+	f, prober := newBoundFixture(t, setup)
+	f.kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil).AnyTimes()
+	return f, prober
+}
+
+// newBoundFixture is newKubeconfigFixture without the allowed version listing, for the tests that expect every IBM
+// call of the master version step themselves. setup changes the objects first; t is the test.
+func newBoundFixture(t *testing.T, setup func(objs *cpObjects)) (*cpFixture, *kubeconfigProber) {
 	t.Helper()
 	objs := newCPObjects()
 	objs.cp.Status.ClusterID = cpIKSClusterID
@@ -1359,6 +1373,9 @@ func TestControlPlaneEnvtestKubeconfigSecret(t *testing.T) {
 		kube.EXPECT().GetCACertificate(gomock.Any(), cpIKSClusterID).Return(&kubernetesservice.CACertificate{PEM: creds.ca.pem}, nil),
 		kube.EXPECT().GetCluster(gomock.Any(), cpIKSClusterID, "").Return(c, nil),
 	)
+	// The master version step of the control plane that the first reconcile initializes lists IBM's offered versions
+	// once (nothing newer than the master); the VersionsCache answers the second reconcile.
+	kube.EXPECT().ListVersions(gomock.Any()).Return(cpOfferedVersions(), nil)
 
 	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
 	g.Expect(err).NotTo(HaveOccurred())
