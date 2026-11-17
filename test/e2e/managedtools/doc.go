@@ -37,6 +37,8 @@ limitations under the License.
 //     PodDisruptionBudget probe and of the upgrade checks, so that the lanes only orchestrate.
 //   - The timeout limit (timeouts.go): it lowers every wait's timeout to the time left until the lane's hard timeout,
 //     because the CAPI framework helpers the lanes call poll without a context.
+//   - The zone check (zones.go): the Ready workers per zone that a drain through IBM's Ingress ALB budgets needs, so
+//     that a step whose topology cannot drain fails with the zone's name instead of timing out in DrainBlocked.
 //
 // Convention: credentials and configuration are explicit arguments. The IBM clients of this package take the service
 // URL, the core.Authenticator and the *http.Client from their caller (the lanes build the authenticator from the

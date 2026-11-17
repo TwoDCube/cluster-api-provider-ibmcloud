@@ -79,3 +79,24 @@ func TestManagedClusterWaitCoversIBMProvisioning(t *testing.T) {
 			spec, cluster, spec, controlPlane)
 	}
 }
+
+// TestIKSWorkerRolloutWaitCoversEveryReplacement guards the interval that the IKS lane's worker rollouts wait with. The
+// longest of them is the worker follow of the master upgrade: it runs while the lane has both of its pools, so that
+// every zone keeps a second worker during each drain, and it replaces all their workers (the initial pool scaled down
+// to 1 per zone plus the added pool's 1 per zone, scaledDownReplicas + extraPoolReplicas in managed_test.go), one at
+// a time per Cluster. A replacement takes about 8 to 10 minutes (the arithmetic is in the e2e config), so each gets
+// twice the upper estimate; a shorter wait would fail a rollout that is merely slow.
+func TestIKSWorkerRolloutWaitCoversEveryReplacement(t *testing.T) {
+	const (
+		// upgradeReplacements is the number of workers the IKS lane's upgrade replaces: 3 zones x 2 pools.
+		upgradeReplacements = 6
+		// replacementBudget is the share of the wait each replacement gets: twice the upper estimate of 10 minutes.
+		replacementBudget = 20 * time.Minute
+	)
+	g := NewWithT(t)
+	cfg := loadManagedE2EConfig(t)
+	rollout := cfg.timeout(t, "managed-iks", "wait-worker-rollout")
+	g.Expect(rollout).To(BeNumerically(">=", upgradeReplacements*replacementBudget),
+		"managed-iks/wait-worker-rollout (%s) must cover %d worker replacements of %s each: the upgrade replaces every "+
+			"worker of both pools, one at a time", rollout, upgradeReplacements, replacementBudget)
+}

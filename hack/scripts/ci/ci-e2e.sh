@@ -200,18 +200,14 @@ prerequisites_managed(){
         require_managed_variable COS_INSTANCE_CRN "export the CRN of the standard COS instance for the ROKS image registry"
     fi
     export EXP_MANAGED_KUBERNETES=true
-    # Only the managed specs run. The lanes stop their own steps at their hard timeouts (IKS 3 h, ROKS 4 h, counted
+    # Only the managed specs run. The lanes stop their own steps at their hard timeouts (4 h for each lane, counted
     # from the lane's set-up); Ginkgo's timeout adds 1 h 30 m for the management cluster set-up and the first
     # cleanups. It does not bound the cleanups: each runs within its own NodeTimeout (CAPI deletion 90 m, IBM backstop
     # 10 m, inventory diff 45 m), and Ginkgo v2 grants a cleanup that starts after the suite timeout its full
     # NodeTimeout, so the IBM backstop always runs and a run can last up to GINKGO_TIMEOUT plus 145 m. The Boskos
     # lease is held for all of it (heartbeat_managed_lease).
     export GINKGO_FOCUS="Managed Kubernetes"
-    if [[ "${E2E_FLAVOR}" == "managed-iks" ]]; then
-        export GINKGO_TIMEOUT=${GINKGO_TIMEOUT:-"4h30m"}
-    else
-        export GINKGO_TIMEOUT=${GINKGO_TIMEOUT:-"5h30m"}
-    fi
+    export GINKGO_TIMEOUT=${GINKGO_TIMEOUT:-"5h30m"}
 }
 
 main(){

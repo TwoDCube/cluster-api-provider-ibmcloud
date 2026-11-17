@@ -29,10 +29,11 @@ import (
 
 const (
 	// JanitorMinimumAge is the youngest a cluster may be for the janitor to delete it. It equals the hard timeout of
-	// the longest lane's steps (ROKS, 4 h), so a cluster this old has left the steps of its run. The age alone does not
-	// prove that the run has ended: the lane's cleanups may still hold the cluster for up to 145 m more (CAPI deletion,
-	// IBM backstop, inventory diff). That a run has ended rests on the Boskos lease: one managed run at a time per e2e
-	// account, with the lease held until the run returns (hack/scripts/ci/ci-e2e.sh heartbeat_managed_lease).
+	// the longest lane's steps (IKS and ROKS, 4 h each), so a cluster this old has left the steps of its run. The age
+	// alone does not prove that the run has ended: the lane's cleanups may still hold the cluster for up to 145 m more
+	// (CAPI deletion, IBM backstop, inventory diff). That a run has ended rests on the Boskos lease: one managed run at a
+	// time per e2e account, with the lease held until the run returns (hack/scripts/ci/ci-e2e.sh
+	// heartbeat_managed_lease).
 	JanitorMinimumAge = 4 * time.Hour
 
 	// RunCleanupClockSkew is how much earlier than the run's own start a cluster of the run may report its creation:

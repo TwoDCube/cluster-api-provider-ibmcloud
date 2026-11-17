@@ -1,0 +1,39 @@
+# Pinned probe pod of the managed IKS lane (test/e2e/managed_test.go): one Pod without a controller and without a
+# PodDisruptionBudget, kept on the workers of one IBM pool by its nodeSelector. The spread probe's pods are spread only
+# as a preference, so a step that drains every worker of a pool cannot count on finding one of them there; this pod is
+# always there. A drain evicts a pod without a controller like any other (it leaves only DaemonSet pods, mirror pods and
+# pods that the cluster.x-k8s.io/drain label exempts), so the step always sees at least this eviction. Nothing
+# recreates the pod after it.
+# The placeholders (a dollar sign and a name in braces) are filled by the suite (applyProbeManifest with
+# managedtools.ExpandPlaceholders), not by envsubst; pdb-probe.yaml describes the image.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pinned
+  namespace: ${PROBE_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: pinned
+    ${PROBE_LABEL}: "true"
+spec:
+  terminationGracePeriodSeconds: 60
+  nodeSelector:
+    ${WORKER_POOL_LABEL}: "${WORKER_POOL}"
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: probe
+      image: ${PROBE_IMAGE}
+      command: ["sh", "-c", "trap 'sleep 20; exit 0' TERM; while true; do sleep 1; done"]
+      resources:
+        requests:
+          cpu: 5m
+          memory: 16Mi
+        limits:
+          memory: 32Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]

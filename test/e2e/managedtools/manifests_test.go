@@ -25,6 +25,8 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	utilyaml "sigs.k8s.io/cluster-api/util/yaml"
 	"sigs.k8s.io/yaml"
 
@@ -67,15 +69,20 @@ var probeVars = map[string]string{
 	"PROBE_IMAGE":      "registry.k8s.io/e2e-test-images/busybox:1.36.1-1",
 	"PROBE_REPLICAS":   "6",
 	"BLOCKER_REPLICAS": "3",
+	// The pinned probe pod's nodeSelector: IBM's worker pool label on the Nodes, and the initial pool's name.
+	"WORKER_POOL_LABEL": "ibm-cloud.kubernetes.io/worker-pool-name",
+	"WORKER_POOL":       "default",
 }
 
 // TestProbeManifests renders the real probe manifests of test/e2e/data/managed with the lanes' values and checks the
 // properties the lanes rely on, offline: the spread budget allows one disruption, the blocker budget allows none,
-// every probe pod carries the probe label, and every pod stays terminating well beyond the 2-second poll.
+// every probe pod carries the probe label, and every pod stays terminating well beyond the 2-second poll. The pinned
+// pod must have no controller and no budget and stay on the named IBM pool, so that a drain of that pool always
+// evicts it at once and nothing puts it back.
 func TestProbeManifests(t *testing.T) {
 	g := NewWithT(t)
 	objects := map[string][]byte{}
-	for _, file := range []string{"pdb-probe.yaml", "pdb-blocker.yaml"} {
+	for _, file := range []string{"pdb-probe.yaml", "pdb-blocker.yaml", "pinned-probe.yaml"} {
 		raw, err := fs.ReadFile(os.DirFS(filepath.Join("..", "data", "managed")), file)
 		g.Expect(err).NotTo(HaveOccurred())
 		rendered, err := ExpandPlaceholders(string(raw), probeVars)
@@ -98,18 +105,52 @@ func TestProbeManifests(t *testing.T) {
 
 	for _, name := range []string{"spread", "blocker"} {
 		deployment := decodeDeployment(g, objects["Deployment/"+name])
-		g.Expect(deployment.Spec.Template.Labels).To(HaveKeyWithValue("capibm-e2e/probe", "true"), name)
-		g.Expect(deployment.Spec.Template.Spec.TerminationGracePeriodSeconds).To(HaveValue(BeNumerically(">", 20)), name)
-		g.Expect(deployment.Spec.Template.Spec.Containers).To(HaveLen(1), name)
-		container := deployment.Spec.Template.Spec.Containers[0]
-		g.Expect(container.Image).To(Equal(probeVars["PROBE_IMAGE"]), name)
-		g.Expect(container.Command).To(ContainElement(ContainSubstring("trap 'sleep 20; exit 0' TERM")), name)
-		g.Expect(deployment.Spec.Template.Spec.SecurityContext.RunAsNonRoot).To(HaveValue(BeTrue()), name)
+		expectProbePod(g, "Deployment/"+name, deployment.Spec.Template.Labels, &deployment.Spec.Template.Spec)
 	}
 	blocker := decodeDeployment(g, objects["Deployment/blocker"])
 	g.Expect(blocker.Spec.Replicas).To(HaveValue(Equal(int32(3))))
 	g.Expect(blocker.Spec.Template.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution).To(
 		ConsistOf(HaveField("TopologyKey", corev1.LabelHostname)), "one blocker pod per worker")
+
+	pinned := decodePod(g, objects["Pod/pinned"])
+	expectProbePod(g, "Pod/pinned", pinned.Labels, &pinned.Spec)
+	g.Expect(pinned.OwnerReferences).To(BeEmpty(), "the pinned pod has no controller, so nothing recreates it")
+	g.Expect(pinned.Spec.NodeSelector).To(Equal(map[string]string{
+		probeVars["WORKER_POOL_LABEL"]: probeVars["WORKER_POOL"],
+	}), "the pinned pod stays on the workers of one IBM pool")
+	for _, budget := range []*policyv1.PodDisruptionBudget{spreadBudget, blockerBudget} {
+		selector, err := metav1.LabelSelectorAsSelector(budget.Spec.Selector)
+		g.Expect(err).NotTo(HaveOccurred(), budget.Name)
+		g.Expect(selector.Matches(labels.Set(pinned.Labels))).To(BeFalse(), "PodDisruptionBudget %s selects the "+
+			"pinned pod, so a drain of its worker could wait for that budget instead of evicting it", budget.Name)
+	}
+}
+
+// expectProbePod checks the pod properties every probe workload needs: the probe label, by which the disruption probe
+// lists it, and a termination that outlasts the 2-second poll, so that an evicted pod is seen terminating.
+//
+// Parameters:
+//   - g is the test's Gomega.
+//   - name names the workload in the failure messages, for example "Deployment/spread".
+//   - podLabels are the pod's labels (a Deployment's template labels).
+//   - spec is the pod's spec (a Deployment's template spec).
+func expectProbePod(g Gomega, name string, podLabels map[string]string, spec *corev1.PodSpec) {
+	g.Expect(podLabels).To(HaveKeyWithValue("capibm-e2e/probe", "true"), name)
+	g.Expect(spec.TerminationGracePeriodSeconds).To(HaveValue(BeNumerically(">", 20)), name)
+	g.Expect(spec.Containers).To(HaveLen(1), name)
+	container := spec.Containers[0]
+	g.Expect(container.Image).To(Equal(probeVars["PROBE_IMAGE"]), name)
+	g.Expect(container.Command).To(ContainElement(ContainSubstring("trap 'sleep 20; exit 0' TERM")), name)
+	g.Expect(spec.SecurityContext).NotTo(BeNil(), name)
+	g.Expect(spec.SecurityContext.RunAsNonRoot).To(HaveValue(BeTrue()), name)
+}
+
+// decodePod unmarshals a rendered Pod.
+func decodePod(g Gomega, data []byte) *corev1.Pod {
+	g.Expect(data).NotTo(BeEmpty())
+	pod := &corev1.Pod{}
+	g.Expect(yaml.Unmarshal(data, pod)).To(Succeed())
+	return pod
 }
 
 // decodeBudget unmarshals a rendered PodDisruptionBudget.

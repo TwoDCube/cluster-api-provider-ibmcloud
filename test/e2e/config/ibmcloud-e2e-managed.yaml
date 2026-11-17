@@ -111,9 +111,11 @@ variables:
   IBMCLOUD_CONTAINERS_URL: "${IBMCLOUD_CONTAINERS_URL:-}"
   IBMCLOUD_VPC_URL: "${IBMCLOUD_VPC_URL:-}"
 
-# Each step's timeout is lowered to the time left until the lane's hard timeout (IKS 3 h, ROKS 4 h). The create step
-# takes wait-cluster, wait-control-plane and wait-worker-nodes at its start, so keep their sum below the hard timeout
-# (IKS 10 + 60 + 60 m, ROKS 10 + 120 + 90 m). The cleanups (wait-delete-cluster in the CAPI deletion,
+# Each step's timeout is lowered to the time left until the lane's hard timeout (4 h for each lane). The create step
+# takes wait-cluster, wait-control-plane and wait-worker-nodes at its start, so that step is bound to end by the hard
+# timeout only while their sum stays below it. IKS 60 + 60 + 60 m does; ROKS 120 + 120 + 90 m = 330 m does not, and a
+# ROKS create whose control plane becomes available later than 150 m into the lane can keep waiting for its workers up
+# to 90 m past the hard timeout (managed_test.go create). The cleanups (wait-delete-cluster in the CAPI deletion,
 # wait-inventory-clean) are not lowered: they run after the hard timeout, within their own node timeouts.
 intervals:
   default/wait-controllers: ["3m", "10s"]
@@ -131,7 +133,13 @@ intervals:
   managed-iks/wait-worker-nodes: ["60m", "30s"]
   managed-iks/wait-pool-change: ["60m", "30s"]
   managed-iks/wait-master-upgrade: ["90m", "30s"]
-  managed-iks/wait-worker-rollout: ["90m", "30s"]
+  # One worker replacement takes about 8 to 10 minutes: the drain (about 1 minute), IBM's replace until the new
+  # worker's Node is Ready (about 5.7 minutes, measured on IKS 1.36), IBM reporting the new worker normal (up to a
+  # minute later), and up to 2 minutes until the other pool, waiting for the disruption token, looks again. That is an
+  # estimate: no replacement that CAPIBM drained has been timed end to end yet. Each replacement gets twice the upper
+  # estimate, 20 minutes. The longest rollout is the worker follow of the upgrade, which replaces all 6 workers of the
+  # two pools one at a time per Cluster: 6 x 20 = 120 minutes (TestIKSWorkerRolloutWaitCoversEveryReplacement).
+  managed-iks/wait-worker-rollout: ["120m", "30s"]
   managed-iks/wait-drain-blocked: ["30m", "15s"]
   managed-roks/wait-cluster: ["120m", "30s"]
   managed-roks/wait-control-plane: ["120m", "30s"]

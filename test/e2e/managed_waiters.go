@@ -60,6 +60,17 @@ const (
 	probeNamespace = "capibm-e2e-probe"
 	// probeLabel marks every probe pod; the disruption probe lists pods by it.
 	probeLabel = "capibm-e2e/probe"
+	// probeNameLabel is the label each probe manifest selects its pods by; its value names the probe workload: the
+	// Deployment and PodDisruptionBudget "spread" or "blocker", or the Pod pinnedProbeName.
+	probeNameLabel = "app.kubernetes.io/name"
+	// pinnedProbeName is the name of the pinned probe Pod (test/e2e/data/managed/pinned-probe.yaml).
+	pinnedProbeName = "pinned"
+	// drainWorkersPerZone is the fewest Ready workers that every zone holding workers needs while an IKS lane step
+	// drains workers. IBM runs each zone's Ingress ALB with 2 replicas, at most one per worker, and a
+	// PodDisruptionBudget that keeps one of them available: in a zone with 1 worker only one replica runs, its eviction
+	// is refused, and CAPIBM keeps the drain in DrainBlocked for as long as the MachinePool sets no
+	// nodeDrainTimeoutSeconds (the lane sets none: it tests that a drain never forces).
+	drainWorkersPerZone = 2
 	// varProbeImage is the e2e config variable with the probe pods' image (test/e2e/config/ibmcloud-e2e-managed.yaml).
 	// It is declared here, not with the other variables in managed_test.go, because waitForProbeHealthy names it in
 	// its failure message and this non-test file must not depend on a _test.go file.
@@ -232,6 +243,29 @@ func waitForPoolGone(ctx context.Context, c client.Client, key client.ObjectKey,
 	}, intervals).Should(Succeed())
 }
 
+// waitForDrainableZones waits until every zone of the workload cluster that holds workers has at least
+// drainWorkersPerZone Ready workers, so that a step drains workers only while IBM's ALB PodDisruptionBudgets allow it.
+// A step that started its drain without them would wait in DrainBlocked until its own long timeout; this check fails
+// within the given interval instead and names the zone.
+//
+// Parameters:
+//   - ctx bounds the wait.
+//   - workload is a workload cluster client.
+//   - intervals are the Eventually timeout and polling interval.
+func waitForDrainableZones(ctx context.Context, workload client.Client, intervals ...interface{}) {
+	By(fmt.Sprintf("Checking that every zone with workers has at least %d Ready workers, as a drain through IBM's ALB "+
+		"PodDisruptionBudgets needs", drainWorkersPerZone))
+	eventually(ctx, func(g Gomega) {
+		nodes := &corev1.NodeList{}
+		g.Expect(workload.List(ctx, nodes)).To(Succeed())
+		g.Expect(nodes.Items).NotTo(BeEmpty(), "Nodes of the workload cluster")
+		short, err := managedtools.ZonesWithTooFewReadyNodes(nodes.Items, drainWorkersPerZone)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(short).To(BeEmpty(), "zones whose workers no drain could empty, because IBM's ALB "+
+			"PodDisruptionBudget there allows no eviction")
+	}, intervals).Should(Succeed())
+}
+
 // isNotFound reports whether err is a Kubernetes NotFound error.
 func isNotFound(err error) bool {
 	return client.IgnoreNotFound(err) == nil && err != nil
@@ -289,6 +323,35 @@ func waitForProbeHealthy(ctx context.Context, workload client.Client, name strin
 			"probe pods cannot pull their image because the workers have no public egress, set %s to a copy the "+
 			"workers reach over private endpoints)", name, varProbeImage)
 		g.Expect(budget.Status.ExpectedPods).To(Equal(replicas), "PodDisruptionBudget %s expected pods", name)
+	}, intervals).Should(Succeed())
+}
+
+// waitForProbePodOnPool waits until the probe Pod named name is Ready on a Node of the IBM pool poolName, so that a
+// drain of every worker of that pool must evict it. Ready, not only scheduled: a pod whose container has started keeps
+// terminating for about 20 seconds after the eviction (its SIGTERM handler), long enough for the disruption probe to
+// see it, while a pod that never started could be gone between two polls and be reported as vanished.
+//
+// Parameters:
+//   - ctx bounds the wait.
+//   - workload is a workload cluster client with managedScheme.
+//   - name is the Pod's name in probeNamespace.
+//   - poolName is the IBM pool name (spec.poolName) whose Nodes must hold the Pod.
+//   - intervals are the Eventually timeout and polling interval.
+func waitForProbePodOnPool(ctx context.Context, workload client.Client, name, poolName string, intervals ...interface{}) {
+	By(fmt.Sprintf("Waiting for probe pod %s to run on a worker of pool %s", name, poolName))
+	eventually(ctx, func(g Gomega) {
+		pod := &corev1.Pod{}
+		g.Expect(workload.Get(ctx, client.ObjectKey{Namespace: probeNamespace, Name: name}, pod)).To(Succeed())
+		g.Expect(pod.Spec.NodeName).NotTo(BeEmpty(), "Node of probe pod %s: not scheduled yet (conditions %v)", name,
+			pod.Status.Conditions)
+		node := &corev1.Node{}
+		g.Expect(workload.Get(ctx, client.ObjectKey{Name: pod.Spec.NodeName}, node)).To(Succeed())
+		g.Expect(node.Labels).To(HaveKeyWithValue(workerPoolNameLabel, poolName), "pool of Node %s, which holds probe "+
+			"pod %s", node.Name, name)
+		g.Expect(pod.Status.Conditions).To(ContainElement(And(HaveField("Type", corev1.PodReady),
+			HaveField("Status", corev1.ConditionTrue))), "probe pod %s on Node %s is not Ready (if it cannot pull its "+
+			"image because the workers have no public egress, set %s to a copy the workers reach over private "+
+			"endpoints)", name, node.Name, varProbeImage)
 	}, intervals).Should(Succeed())
 }
 
@@ -414,15 +477,25 @@ func relaxBlocker(ctx context.Context, workload client.Client, minAvailable int3
 	Expect(workload.Patch(ctx, budget, patch)).To(Succeed())
 }
 
-// deleteBlocker deletes the blocker Deployment and its PodDisruptionBudget.
+// deleteBlocker deletes the blocker Deployment and its PodDisruptionBudget and waits until no blocker pod is left. The
+// garbage collector deletes those pods without the Eviction API, and they carry the probe label, so a disruption probe
+// that a later step starts while one is still terminating would report it as removed without an eviction.
 //
 // Parameters:
-//   - ctx bounds the requests.
+//   - ctx bounds the requests and the wait.
 //   - workload is a workload cluster client with managedScheme.
-func deleteBlocker(ctx context.Context, workload client.Client) {
+//   - intervals are the Eventually timeout and polling interval of the wait for the pods.
+func deleteBlocker(ctx context.Context, workload client.Client, intervals ...interface{}) {
 	meta := metav1.ObjectMeta{Namespace: probeNamespace, Name: "blocker"}
 	Expect(client.IgnoreNotFound(workload.Delete(ctx, &appsv1.Deployment{ObjectMeta: meta}))).To(Succeed())
 	Expect(client.IgnoreNotFound(workload.Delete(ctx, &policyv1.PodDisruptionBudget{ObjectMeta: meta}))).To(Succeed())
+	By("Waiting for the blocker pods to be gone")
+	eventually(ctx, func(g Gomega) {
+		pods := &corev1.PodList{}
+		g.Expect(workload.List(ctx, pods, client.InNamespace(probeNamespace),
+			client.MatchingLabels{probeNameLabel: meta.Name})).To(Succeed())
+		g.Expect(pods.Items).To(BeEmpty(), "blocker pods left after the deletion of their Deployment")
+	}, intervals).Should(Succeed())
 }
 
 // ownershipFacts are the IBM facts that a clusterctl move must not change: CAPIBM re-adopts the same IBM cluster and
