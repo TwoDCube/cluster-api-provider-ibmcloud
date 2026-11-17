@@ -233,6 +233,46 @@ func TestAPIErrorError(t *testing.T) {
 	}
 }
 
+// TestCredentialsRejectedError covers the error of a request the IAM token service refused: its text, and that
+// errors.Is, errors.As and Classify see the sentinel, IAM's status and the authenticator's error through it.
+func TestCredentialsRejectedError(t *testing.T) {
+	authErr := errors.New("provided API key could not be found")
+	testCases := []struct {
+		name         string
+		err          *CredentialsRejectedError
+		expectedText string
+	}{
+		{
+			name: "with the authenticator's error",
+			err:  &CredentialsRejectedError{Operation: OpGetCluster, IAMStatus: http.StatusBadRequest, Err: authErr},
+			expectedText: "kubernetesservice: the IAM token service rejected the credentials, nothing was sent to IBM Cloud Kubernetes " +
+				"Service: GetCluster: the IAM token service answered HTTP 400: provided API key could not be found",
+		},
+		{
+			name: "without one",
+			err:  &CredentialsRejectedError{Operation: OpListVersions, IAMStatus: http.StatusForbidden},
+			expectedText: "kubernetesservice: the IAM token service rejected the credentials, nothing was sent to IBM Cloud Kubernetes " +
+				"Service: ListVersions: the IAM token service answered HTTP 403",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			wrapped := fmt.Errorf("getting IBM cluster dev: %w", tc.err)
+
+			g.Expect(tc.err.Error()).To(Equal(tc.expectedText))
+			g.Expect(errors.Is(wrapped, ErrCredentialsRejected)).To(BeTrue())
+			g.Expect(errors.Is(wrapped, authErr)).To(Equal(tc.err.Err != nil), "the authenticator's error stays reachable")
+			g.Expect(Classify(tc.err.Operation, wrapped)).To(Equal(ClassUnauthorized))
+			var rejected *CredentialsRejectedError
+			g.Expect(errors.As(wrapped, &rejected)).To(BeTrue())
+			g.Expect(rejected.IAMStatus).To(Equal(tc.err.IAMStatus))
+			var apiErr *APIError
+			g.Expect(errors.As(wrapped, &apiErr)).To(BeFalse(), "an IAM answer is never an APIError")
+		})
+	}
+}
+
 func TestNewAPIError(t *testing.T) {
 	const date = "Mon, 16 Nov 2026 03:00:00 GMT"
 	testCases := []struct {

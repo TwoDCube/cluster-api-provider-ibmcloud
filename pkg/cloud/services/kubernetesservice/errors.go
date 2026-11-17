@@ -169,6 +169,37 @@ var ErrInvalidRequest = errors.New("kubernetesservice: invalid request, nothing 
 // ClassUnauthorized, so the caller rebuilds that identity's authenticator.
 var ErrCredentialsRejected = errors.New("kubernetesservice: the IAM token service rejected the credentials, nothing was sent to IBM Cloud Kubernetes Service")
 
+// CredentialsRejectedError is an ErrCredentialsRejected that keeps the status the IAM token service answered, so that
+// a caller can name IAM's answer in a condition message without parsing the error text. The status tells an operator
+// which refusal it was (IAM answers 400 for a deleted or unknown API key), and it is not an answer of IBM Cloud
+// Kubernetes Service, so it is never an APIError. errors.Is matches both ErrCredentialsRejected and Err.
+type CredentialsRejectedError struct {
+	// Operation is the KubernetesService method whose request was not sent.
+	Operation Operation
+	// IAMStatus is the HTTP status of the IAM token service's answer: 400, 401 or 403.
+	IAMStatus int
+	// Err is the authenticator's error; nil when there is none.
+	Err error
+}
+
+// Error implements error. The message names the operation, IAM's status and the authenticator's error.
+func (e *CredentialsRejectedError) Error() string {
+	message := fmt.Sprintf("%v: %s: the IAM token service answered HTTP %d", ErrCredentialsRejected, e.Operation, e.IAMStatus)
+	if e.Err != nil {
+		message += ": " + e.Err.Error()
+	}
+	return message
+}
+
+// Unwrap returns ErrCredentialsRejected and the authenticator's error, so that errors.Is and errors.As see both: Classify
+// matches the first, and a caller can still reach go-sdk-core's *core.AuthenticationError through the second.
+func (e *CredentialsRejectedError) Unwrap() []error {
+	if e.Err == nil {
+		return []error{ErrCredentialsRejected}
+	}
+	return []error{ErrCredentialsRejected, e.Err}
+}
+
 // MinRateLimitBackoff is the shortest wait after a 429. IBM's 429 body and Retry-After are not yet verified against
 // IBM Cloud (a 429 is never provoked on purpose); 30 s keeps a rate-limited controller well below IBM's 200 requests
 // per 10 s per source IP. Fallback: change this value.
