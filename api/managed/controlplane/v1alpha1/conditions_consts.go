@@ -50,15 +50,29 @@ const (
 	// IBMCloudManagedControlPlaneAvailableCondition is True when the control plane is initialized, the last workload probe
 	// passed, the IBM cluster exists and the master health is not error or unavailable. Ingress health is never
 	// consulted: IBM Cloud was observed to report it as warning or critical on healthy clusters with fewer than two
-	// workers per zone or without a public gateway.
+	// workers per zone or without a public gateway. It is Unknown while CAPIBM cannot read the IBM cluster of an
+	// initialized control plane, or cannot use the master URL that IBM reports for it, because neither says whether
+	// that control plane is up.
 	IBMCloudManagedControlPlaneAvailableCondition = clusterv1.AvailableCondition
 
 	// IBMCloudManagedControlPlaneAvailableReason surfaces when the control plane is available.
 	IBMCloudManagedControlPlaneAvailableReason = clusterv1.AvailableReason
 
 	// IBMCloudManagedControlPlaneAvailableWaitingForIBMClusterReason surfaces while no IBM cluster exists yet or it is
-	// still provisioning.
+	// still provisioning. While the control plane is not initialized on this management cluster it also covers an IBM
+	// cluster that CAPIBM cannot read or whose master URL it cannot use, since such a control plane is not available by
+	// definition. That includes a control plane right after clusterctl move, whose status starts empty, until it is
+	// bound and initialized again, even when its IBM cluster runs. On any control plane it covers an IBM cluster that
+	// IBM reports failed, deleted or not found. IBMClusterProvisioned says which.
 	IBMCloudManagedControlPlaneAvailableWaitingForIBMClusterReason = "WaitingForIBMCluster"
+
+	// IBMCloudManagedControlPlaneAvailableIBMAPIErrorReason surfaces, with status Unknown, while CAPIBM cannot read the
+	// IBM cluster of a control plane it has initialized: IBM Cloud or its IAM token service refused or failed the call
+	// (for example HTTP 401, 403 or 400), or CAPIBM could not make it (for example because the credentials do not
+	// resolve). It also surfaces while IBM reports a master URL for that cluster that CAPIBM cannot use (for example one
+	// that is not https). The control plane may still be up, so Available is Unknown rather than False. The message
+	// names what failed and what to fix, and the condition is True or False again once CAPIBM can check the cluster.
+	IBMCloudManagedControlPlaneAvailableIBMAPIErrorReason = "IBMAPIError"
 
 	// IBMCloudManagedControlPlaneAvailableMasterNotReadyReason surfaces when IBM does not report the master ready, or
 	// reports its health as error or unavailable.

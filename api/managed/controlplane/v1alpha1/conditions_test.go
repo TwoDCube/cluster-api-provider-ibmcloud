@@ -84,6 +84,7 @@ func TestConditionCatalogueIsValid(t *testing.T) {
 			reasons: []string{
 				controlplanev1.IBMCloudManagedControlPlaneAvailableReason,
 				controlplanev1.IBMCloudManagedControlPlaneAvailableWaitingForIBMClusterReason,
+				controlplanev1.IBMCloudManagedControlPlaneAvailableIBMAPIErrorReason,
 				controlplanev1.IBMCloudManagedControlPlaneAvailableMasterNotReadyReason,
 				controlplanev1.IBMCloudManagedControlPlaneAvailableWorkloadAPIUnreachableReason,
 				controlplanev1.IBMCloudManagedControlPlaneAvailableDeletingReason,
