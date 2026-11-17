@@ -56,6 +56,8 @@ providers:
 variables:
   # The provider's ManagedKubernetes feature gate (config/manager/manager.yaml).
   EXP_MANAGED_KUBERNETES: "true"
+  # clusterctl init substitutes it into the CAPIBM manager; empty selects the production IBM Cloud endpoints.
+  IBMCLOUD_STAGING: "${IBMCLOUD_STAGING:-}"
   # suite_test.go requires a CNI file for every configuration; the managed lanes never apply it (IBM runs the
   # cluster network), and the managed flavors do not reference CNI_RESOURCES.
   CNI: "${PWD}/test/e2e/data/cni/calico/calico.yaml"
