@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/gomega"
@@ -34,6 +35,7 @@ import (
 	clusterctlv1 "sigs.k8s.io/cluster-api/cmd/clusterctl/api/v1alpha3"
 
 	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/ibmclustername"
 )
 
 // Messages of the control plane validator, kept in one place so a reworded message fails loudly in every case.
@@ -117,9 +119,9 @@ func TestValidateMinorStep(t *testing.T) {
 	}
 }
 
-// TestIBMCloudManagedControlPlaneValidateCreate covers the ibmCloudClusterName warning on the typed validator with a
-// strict reader, which also proves when the Clusters are listed: only when the control plane names no Cluster itself,
-// as one from a clusterctl template does.
+// TestIBMCloudManagedControlPlaneValidateCreate covers the IBM name check and the ibmCloudClusterName warning on the
+// typed validator with a strict reader, which also proves when the Clusters are listed: only when the control plane
+// omits ibmCloudClusterName and names no Cluster itself, as one from a clusterctl template does.
 func TestIBMCloudManagedControlPlaneValidateCreate(t *testing.T) {
 	// omitName is the template shape: no ibmCloudClusterName, no cluster-name label and no owner reference.
 	omitName := func(cp *controlplanev1.IBMCloudManagedControlPlane) {
@@ -133,6 +135,20 @@ func TestIBMCloudManagedControlPlaneValidateCreate(t *testing.T) {
 		return cluster
 	}
 	devCPRef := newCluster(unitNamespace, "dev").Spec.ControlPlaneRef
+	// labelledWith is the shape of a control plane that names its Cluster by the cluster-name label and omits
+	// ibmCloudClusterName, so that the Cluster's name becomes the IBM name.
+	labelledWith := func(clusterName string) func(cp *controlplanev1.IBMCloudManagedControlPlane) {
+		return func(cp *controlplanev1.IBMCloudManagedControlPlane) {
+			cp.Spec.IBMCloudClusterName = ""
+			cp.Labels[clusterv1.ClusterNameLabel] = clusterName
+		}
+	}
+	// named sets an explicit ibmCloudClusterName.
+	named := func(name string) func(cp *controlplanev1.IBMCloudManagedControlPlane) {
+		return func(cp *controlplanev1.IBMCloudManagedControlPlane) { cp.Spec.IBMCloudClusterName = name }
+	}
+	// name33 is one character longer than IBM allows.
+	name33 := "team-a-dev-" + strings.Repeat("x", 22)
 	testCases := []struct {
 		name   string
 		mutate func(cp *controlplanev1.IBMCloudManagedControlPlane)
@@ -142,7 +158,81 @@ func TestIBMCloudManagedControlPlaneValidateCreate(t *testing.T) {
 		errs        map[string]error
 		nilReader   bool
 		wantWarning string
+		// wantErr are parts of the expected Invalid error; the case then expects no warning.
+		wantErr []string
 	}{
+		{
+			name:   "explicit ibmCloudClusterName of 32 characters with underscore and dot: no warning and no read",
+			mutate: named("team_a.dev-" + strings.Repeat("x", 21)),
+		},
+		{
+			name:   "explicit ibmCloudClusterName of 33 characters rejected without a read",
+			mutate: named(name33),
+			wantErr: []string{fmt.Sprintf("spec.ibmCloudClusterName: Invalid value: %q", name33),
+				"IBM would refuse to create a cluster with this name: it has 33 characters, more than 32", ibmclustername.Rule},
+		},
+		{
+			name:    "explicit ibmCloudClusterName starting with a digit rejected",
+			mutate:  named("1dev"),
+			wantErr: []string{"it starts with '1' instead of a letter", ibmclustername.Rule},
+		},
+		{
+			name:    "explicit ibmCloudClusterName with a space rejected",
+			mutate:  named("dev cluster"),
+			wantErr: []string{"it contains ' ', which is not a letter, digit, '-', '_' or '.'"},
+		},
+		{
+			name:    "explicit ibmCloudClusterName with a unicode letter rejected",
+			mutate:  named("clüster"),
+			wantErr: []string{"it contains 'ü'"},
+		},
+		{
+			// The name of the live refusal (IBM HTTP 400, code E0125), found from the label without a read.
+			name:   "defaulted Cluster name of 33 characters from the label rejected without a read",
+			mutate: labelledWith("example-test-cluster-e01-mgmt-iks"),
+			wantErr: []string{"spec.ibmCloudClusterName: Required value",
+				`without it the IBM cluster would be named after Cluster "example-test-cluster-e01-mgmt-iks", and IBM ` +
+					"would refuse that name: it has 33 characters, more than 32", ibmclustername.Rule,
+				"set spec.ibmCloudClusterName to a name that follows this rule (it cannot be added after the control plane is created)"},
+		},
+		{
+			name:        "defaulted Cluster name of 32 characters from the label: warning only",
+			mutate:      labelledWith("example-test-cluster-e01-mgmt-ik"),
+			wantWarning: clusterNameWarning("example-test-cluster-e01-mgmt-ik"),
+		},
+		{
+			// A Cluster name is a DNS-1123 name, which may start with a digit; IBM's may not.
+			name:    "defaulted Cluster name starting with a digit from the label rejected",
+			mutate:  labelledWith("1dev"),
+			wantErr: []string{`would be named after Cluster "1dev"`, "it starts with '1' instead of a letter"},
+		},
+		{
+			name: "defaulted Cluster name from the owner reference rejected without a read",
+			mutate: func(cp *controlplanev1.IBMCloudManagedControlPlane) {
+				omitName(cp)
+				cp.OwnerReferences = []metav1.OwnerReference{
+					{APIVersion: clusterv1.GroupVersion.String(), Kind: "Cluster", Name: "9-lives", UID: "uid"},
+				}
+			},
+			wantErr: []string{`would be named after Cluster "9-lives"`},
+		},
+		{
+			name:    "defaulted Cluster name found through the controlPlaneRef of a template rejected",
+			mutate:  omitName,
+			objs:    []client.Object{clusterReferencing(unitNamespace, "a"+strings.Repeat("b", 32), devCPRef)},
+			allowed: []string{clusterList},
+			wantErr: []string{`would be named after Cluster "a` + strings.Repeat("b", 32) + `"`, "it has 33 characters"},
+		},
+		{
+			// The Cluster with the long name references another control plane, so the owner is not known: admission
+			// allows the object with the generic warning and leaves the name check to the controller.
+			name:   "unknown Cluster name is not checked: generic warning",
+			mutate: omitName,
+			objs: []client.Object{clusterReferencing(unitNamespace, "a"+strings.Repeat("b", 32),
+				newCluster(unitNamespace, "other").Spec.ControlPlaneRef)},
+			allowed:     []string{clusterList},
+			wantWarning: clusterNameWarning(unknownClusterTarget),
+		},
 		{
 			name:   "ibmCloudClusterName set: no warning and no read",
 			mutate: func(*controlplanev1.IBMCloudManagedControlPlane) {},
@@ -231,8 +321,16 @@ func TestIBMCloudManagedControlPlaneValidateCreate(t *testing.T) {
 
 			warnings, err := validator.ValidateCreate(context.Background(), cp)
 
-			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(reader.calls).To(Equal(tc.allowed))
+			if len(tc.wantErr) > 0 {
+				g.Expect(apierrors.IsInvalid(err)).To(BeTrue(), "want Invalid, got %v", err)
+				for _, part := range tc.wantErr {
+					g.Expect(err.Error()).To(ContainSubstring(part))
+				}
+				g.Expect(warnings).To(BeEmpty(), "a rejected create gets no warning")
+				return
+			}
+			g.Expect(err).NotTo(HaveOccurred())
 			if tc.wantWarning == "" {
 				g.Expect(warnings).To(BeEmpty())
 				return
@@ -527,6 +625,67 @@ func TestIBMCloudManagedControlPlaneWebhookCreate(t *testing.T) {
 		c, recorder := newWarningClient(g)
 
 		g.Expect(c.Create(ctx, newControlPlane(namespace, "named"))).To(Succeed())
+		g.Expect(recorder.warnings).To(BeEmpty())
+	})
+
+	// IBM's cluster name rule: 1 to 32 characters, a letter first, then letters, digits, '-', '_' and '.'.
+	const denial = webhookDenial + ` "vibmcloudmanagedcontrolplane.kb.io" denied the request`
+	t.Run("defaulted_Cluster_name_of_33_characters_of_a_template_control_plane_rejected", func(t *testing.T) {
+		g := NewWithT(t)
+		// The 33-character name IBM refused with HTTP 400, code E0125: a valid Cluster name, but not a valid IBM name.
+		const clusterName = "example-test-cluster-e01-mgmt-iks"
+		createCluster(t, namespace, clusterName, false)
+		cp := newControlPlane(namespace, clusterName)
+		cp.Spec.IBMCloudClusterName = ""
+		cp.Labels = nil
+
+		err := testEnv.Create(ctx, cp)
+
+		g.Expect(err).To(MatchError(And(
+			ContainSubstring(denial),
+			ContainSubstring("spec.ibmCloudClusterName: Required value"),
+			ContainSubstring(`would be named after Cluster "`+clusterName+`"`),
+			ContainSubstring("it has 33 characters, more than 32"),
+			ContainSubstring("set spec.ibmCloudClusterName to a name that follows this rule"))))
+		g.Expect(apierrors.IsNotFound(testEnv.GetAPIReader().Get(ctx, client.ObjectKeyFromObject(cp), cp))).To(BeTrue(),
+			"the rejected control plane was not stored")
+	})
+	t.Run("defaulted_Cluster_name_starting_with_a_digit_from_the_label_rejected", func(t *testing.T) {
+		g := NewWithT(t)
+		cp := newControlPlane(namespace, "1st-cluster")
+		cp.Spec.IBMCloudClusterName = ""
+
+		g.Expect(testEnv.Create(ctx, cp)).To(MatchError(And(
+			ContainSubstring(denial),
+			ContainSubstring(`would be named after Cluster "1st-cluster"`),
+			ContainSubstring("it starts with '1' instead of a letter"))))
+	})
+	t.Run("long_Cluster_name_with_a_valid_ibmCloudClusterName_allowed", func(t *testing.T) {
+		g := NewWithT(t)
+		c, recorder := newWarningClient(g)
+		const clusterName = "example-test-cluster-e02-mgmt-iks"
+		createCluster(t, namespace, clusterName, false)
+		cp := newControlPlane(namespace, clusterName)
+		cp.Spec.IBMCloudClusterName = "etc-e02-mgmt-iks"
+		cp.Labels = nil
+
+		g.Expect(c.Create(ctx, cp)).To(Succeed(), "setting ibmCloudClusterName is the fix the rejection names")
+		g.Expect(recorder.warnings).To(BeEmpty())
+	})
+	t.Run("explicit_ibmCloudClusterName_of_33_characters_rejected_by_the_schema", func(t *testing.T) {
+		g := NewWithT(t)
+		cp := newControlPlane(namespace, "too-long")
+		cp.Spec.IBMCloudClusterName = "a" + strings.Repeat("b", 32)
+
+		expectRejectedByCEL(g, testEnv.Create(ctx, cp), "spec.ibmCloudClusterName: Too long")
+	})
+	t.Run("explicit_ibmCloudClusterName_with_underscore_and_dot_allowed", func(t *testing.T) {
+		g := NewWithT(t)
+		c, recorder := newWarningClient(g)
+		cp := newControlPlane(namespace, "underscore")
+		cp.Spec.IBMCloudClusterName = "team_a.underscore"
+
+		g.Expect(c.Create(ctx, cp)).To(Succeed())
 		g.Expect(recorder.warnings).To(BeEmpty())
 	})
 }

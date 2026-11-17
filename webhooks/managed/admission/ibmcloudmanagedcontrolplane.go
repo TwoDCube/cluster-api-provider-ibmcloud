@@ -30,6 +30,7 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 
 	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/ibmclustername"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/util/ibmversion"
 )
 
@@ -38,17 +39,18 @@ var _ admission.Validator[*controlplanev1.IBMCloudManagedControlPlane] = &IBMClo
 
 //+kubebuilder:webhook:verbs=create;update;delete,path=/validate-controlplane-cluster-x-k8s-io-v1alpha1-ibmcloudmanagedcontrolplane,mutating=false,failurePolicy=fail,groups=controlplane.cluster.x-k8s.io,resources=ibmcloudmanagedcontrolplanes,versions=v1alpha1,name=vibmcloudmanagedcontrolplane.kb.io,sideEffects=None,admissionReviewVersions=v1;v1beta1
 
-// IBMCloudManagedControlPlane validates IBMCloudManagedControlPlane objects: the feature gate on create, the master
-// minor step on update, the ibmCloudClusterName warning on create and the delete guard. It never calls IBM Cloud.
+// IBMCloudManagedControlPlane validates IBMCloudManagedControlPlane objects: on create the feature gate and the IBM
+// cluster name (IBM's rule, and a warning when the name defaults to the Cluster's), on update the master minor step,
+// and on delete the delete guard. It never calls IBM Cloud.
 type IBMCloudManagedControlPlane struct {
 	// ManagedKubernetesEnabled is the value of the ManagedKubernetes feature gate. When false, CREATE is rejected and
 	// every other operation is allowed unchecked: no controller reconciles the object, and the controller repeats the
 	// minor-step check once the gate is on again.
 	ManagedKubernetesEnabled bool
 
-	// Reader reads the owning Cluster for the delete guard and lists the Clusters of the namespace to name the Cluster
-	// in the ibmCloudClusterName warning. It must be the manager's API reader (mgr.GetAPIReader()), see the package
-	// documentation; nil is a construction error.
+	// Reader reads the owning Cluster for the delete guard and, on create, lists the Clusters of the namespace to find
+	// the Cluster whose name becomes the IBM cluster name when spec.ibmCloudClusterName is omitted. It must be the
+	// manager's API reader (mgr.GetAPIReader()), see the package documentation; nil is a construction error.
 	Reader client.Reader
 }
 
@@ -65,20 +67,68 @@ func (r *IBMCloudManagedControlPlane) SetupWebhookWithManager(mgr ctrl.Manager) 
 		Complete()
 }
 
-// ValidateCreate rejects the create while the feature gate is off and otherwise allows it, with a warning when
-// spec.ibmCloudClusterName is omitted: the IBM name then comes from the Cluster's name, which is unique only per
-// namespace, while IBM names are unique per account.
+// ValidateCreate rejects the create while the feature gate is off. Otherwise it checks the IBM cluster name the
+// control plane will use against IBM's rule (ibmclustername.Problem), because IBM refuses createCluster for any other
+// name (HTTP 400, code E0125) and the name cannot be changed once the control plane exists:
+//   - spec.ibmCloudClusterName, when set, must follow the rule. The CRD schema checks the same rule before any
+//     validating webhook runs; this check uses the same validator and rule text as the controller
+//     (ibmclustername.Problem and Rule), so the webhook's answer stays right on its own if the schema is older.
+//   - When it is omitted, the IBM name is the Cluster's metadata.name. A Cluster name is a DNS name that IBM may refuse
+//     (longer than 32 characters, or a digit first), so when the Cluster is known the create is rejected with the
+//     advice to set spec.ibmCloudClusterName. A valid Cluster name is allowed with a warning, because it is unique
+//     only per namespace while IBM names are unique per account. When the Cluster is not known yet, the warning is
+//     generic and the controller checks the name before it calls IBM.
 //
-// ctx is the admission request's context, used only to find the Cluster that the warning names; cp is the control
-// plane being created.
+// ctx is the admission request's context, used only to find the Cluster that names the IBM cluster; cp is the
+// control plane being created.
 func (r *IBMCloudManagedControlPlane) ValidateCreate(ctx context.Context, cp *controlplanev1.IBMCloudManagedControlPlane) (admission.Warnings, error) {
 	if !r.ManagedKubernetesEnabled {
 		return nil, gateOffCreateError(controlPlaneResource, "IBMCloudManagedControlPlane", cp.Name)
 	}
-	if cp.Spec.IBMCloudClusterName == "" {
-		return admission.Warnings{ibmCloudClusterNameWarning(r.clusterNameForWarning(ctx, cp))}, nil
+	if cp.Spec.IBMCloudClusterName != "" {
+		if err := validateIBMCloudClusterName(cp.Spec.IBMCloudClusterName); err != nil {
+			return nil, apierrors.NewInvalid(controlPlaneGroupKind, cp.Name, field.ErrorList{err})
+		}
+		return nil, nil
 	}
-	return nil, nil
+	clusterName := r.owningClusterName(ctx, cp)
+	if err := validateDefaultedClusterName(clusterName); err != nil {
+		return nil, apierrors.NewInvalid(controlPlaneGroupKind, cp.Name, field.ErrorList{err})
+	}
+	return admission.Warnings{ibmCloudClusterNameWarning(clusterName)}, nil
+}
+
+// validateIBMCloudClusterName checks an explicit spec.ibmCloudClusterName against IBM's cluster name rule. It returns
+// nil when the name follows the rule.
+//
+// name is the non-empty spec.ibmCloudClusterName of the control plane being created.
+func validateIBMCloudClusterName(name string) *field.Error {
+	problem := ibmclustername.Problem(name)
+	if problem == "" {
+		return nil
+	}
+	return field.Invalid(field.NewPath("spec", "ibmCloudClusterName"), name, fmt.Sprintf(
+		"IBM would refuse to create a cluster with this name: it %s; %s", problem, ibmclustername.Rule))
+}
+
+// validateDefaultedClusterName checks the Cluster name that becomes the IBM cluster name when spec.ibmCloudClusterName
+// is omitted. It returns nil when the name follows IBM's rule or is not known. The error is a Required error on
+// spec.ibmCloudClusterName, because setting that field is the fix: the Cluster's name is immutable, and the field
+// cannot be added after the control plane is created.
+//
+// clusterName is the Cluster's metadata.name (owningClusterName); "" when the Cluster is not known yet.
+func validateDefaultedClusterName(clusterName string) *field.Error {
+	if clusterName == "" {
+		return nil
+	}
+	problem := ibmclustername.Problem(clusterName)
+	if problem == "" {
+		return nil
+	}
+	return field.Required(field.NewPath("spec", "ibmCloudClusterName"), fmt.Sprintf(
+		"without it the IBM cluster would be named after Cluster %q, and IBM would refuse that name: it %s; %s; set "+
+			"spec.ibmCloudClusterName to a name that follows this rule (it cannot be added after the control plane is "+
+			"created)", clusterName, problem, ibmclustername.Rule))
 }
 
 // ValidateUpdate checks the master minor step, and only when spec.distributionVersion changed: an unrelated
@@ -164,16 +214,17 @@ func validateMinorStep(observed, desired string) *field.Error {
 	return nil
 }
 
-// clusterNameForWarning returns the name of the Cluster that cp belongs to, for the ibmCloudClusterName warning, or ""
-// when it cannot be told. The cluster-name label or the Cluster owner reference answers without a read
-// (clusterNameOf). A control plane created from a clusterctl template has neither yet (the managed templates set only
-// a name, and CAPI adds the owner reference when its Cluster controller first reconciles), so the Clusters of the
-// namespace are listed and the one whose spec.controlPlaneRef names cp is taken; kubectl apply of a template creates
-// the Cluster first, because it is the first document. The lookup never fails the request, because a warning is
-// advice: a list error, no match, or more than one match (the owner is then not known) gives "" and the generic text.
+// owningClusterName returns the name of the Cluster that cp belongs to, whose metadata.name becomes the IBM cluster
+// name when spec.ibmCloudClusterName is omitted, or "" when it cannot be told. The cluster-name label or the Cluster
+// owner reference answers without a read (clusterNameOf). A control plane created from a clusterctl template has
+// neither yet (the template sets only a name, and CAPI adds the owner reference when its Cluster controller first
+// reconciles), so the Clusters of the namespace are listed and the one whose spec.controlPlaneRef names cp is taken;
+// kubectl apply of a template creates the Cluster first, because it is the first document. The lookup itself never
+// fails the request: a list error, no match, or more than one match (the owner is then not known) gives "", which
+// leaves the name check to the controller and makes the warning generic.
 //
 // ctx is the admission request's context, used for the list and its logger; cp is the control plane being created.
-func (r *IBMCloudManagedControlPlane) clusterNameForWarning(ctx context.Context, cp *controlplanev1.IBMCloudManagedControlPlane) string {
+func (r *IBMCloudManagedControlPlane) owningClusterName(ctx context.Context, cp *controlplanev1.IBMCloudManagedControlPlane) string {
 	if name := clusterNameOf(cp); name != "" {
 		return name
 	}
@@ -184,8 +235,9 @@ func (r *IBMCloudManagedControlPlane) clusterNameForWarning(ctx context.Context,
 	}
 	clusters := &clusterv1.ClusterList{}
 	if err := r.Reader.List(ctx, clusters, client.InNamespace(cp.Namespace)); err != nil {
-		ctrl.LoggerFrom(ctx).V(4).Info("Cannot list Clusters to name the Cluster in the ibmCloudClusterName warning; "+
-			"the warning uses the generic text", "namespace", cp.Namespace, "error", err.Error())
+		ctrl.LoggerFrom(ctx).V(4).Info("Cannot list Clusters to find the Cluster that names the IBM cluster; the "+
+			"controller checks the name, and the ibmCloudClusterName warning uses the generic text",
+			"namespace", cp.Namespace, "error", err.Error())
 		return ""
 	}
 	name := ""
@@ -206,7 +258,7 @@ func (r *IBMCloudManagedControlPlane) clusterNameForWarning(ctx context.Context,
 // account, so other namespaces or management clusters using the same name will conflict"); the prefix names the
 // omitted field and the suffix tells the user how to choose a name.
 //
-// clusterName is the name of the Cluster that the control plane belongs to (clusterNameForWarning); when it is empty,
+// clusterName is the name of the Cluster that the control plane belongs to (owningClusterName); when it is empty,
 // the text says that the name comes from the Cluster instead of naming it.
 func ibmCloudClusterNameWarning(clusterName string) string {
 	target := clusterName
