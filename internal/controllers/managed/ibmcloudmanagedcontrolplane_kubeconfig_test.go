@@ -399,8 +399,62 @@ func TestControlPlaneKubeconfigEndpoint(t *testing.T) {
 			controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason)
 		g.Expect(condition.Message).To(ContainSubstring(`"http://c111.us-south.containers.cloud.ibm.com:30101"`))
 		g.Expect(condition.Message).To(ContainSubstring("only over https"))
+		// The control plane was never initialized, so it is not available whatever the master URL.
+		expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionFalse,
+			controlplanev1.IBMCloudManagedControlPlaneAvailableWaitingForIBMClusterReason)
 		g.Expect(f.kubeconfigSecret()).To(BeNil())
 		g.Expect(prober.calls()).To(BeEmpty())
+	})
+
+	// IBM reports the master of an initialized control plane ready, but at a URL CAPIBM cannot use. CAPIBM cannot tell
+	// whether the control plane is up then: the stored kubeconfig is not probed, so Available is Unknown, not False,
+	// and Cluster API does not report a control plane that may be running as down. The endpoint, the Secret and
+	// initialization stay; once IBM reports a usable URL again, the probe decides Available again.
+	t.Run("http_master_url_of_an_initialized_control_plane_makes_available_unknown", func(t *testing.T) {
+		g := NewWithT(t)
+		creds := newKubeconfigCredentials(t, time.Hour)
+		f, prober := newKubeconfigFixture(t, nil)
+		prober.setAnswer(alwaysPassing("v1.36.5+IKS"))
+		gomock.InOrder(f.expectObserve(cpCluster("normal")),
+			f.kube.EXPECT().GetAdminKubeconfig(gomock.Any(), cpIKSClusterID).Return(adminAnswer(creds, true), nil),
+			f.kube.EXPECT().GetCACertificate(gomock.Any(), cpIKSClusterID).Return(&kubernetesservice.CACertificate{PEM: creds.ca.pem}, nil))
+		_, err := f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+		expectCondition(g, f.controlPlane(), controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionTrue,
+			controlplanev1.IBMCloudManagedControlPlaneAvailableReason)
+		secretBefore := f.kubeconfigSecret()
+		probesBefore := len(prober.calls())
+
+		f.clock.SetTime(cpTestStart.Add(time.Minute))
+		unusable := cpCluster("normal")
+		unusable.MasterURL = "http://c111.us-south.containers.cloud.ibm.com:30101"
+		f.expectObserve(unusable)
+		result, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		expectRequeue(g, result, 15*time.Minute)
+		cp := f.controlPlane()
+		provisioned := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, metav1.ConditionFalse,
+			controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason)
+		g.Expect(provisioned.Message).To(ContainSubstring("only over https"))
+		available := expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionUnknown,
+			controlplanev1.IBMCloudManagedControlPlaneAvailableIBMAPIErrorReason)
+		g.Expect(available.Message).To(Equal("CAPIBM cannot tell whether the control plane of IBM cluster iksclusterid00000001 " +
+			"is available: " + provisioned.Message))
+		g.Expect(cp.Spec.ControlPlaneEndpoint).To(Equal(cpTestEndpoint), "the recorded endpoint stays")
+		g.Expect(cp.Status.Initialization.ControlPlaneInitialized).To(Equal(ptr.To(true)), "initialization is kept")
+		g.Expect(f.kubeconfigSecret().Data).To(Equal(secretBefore.Data), "the Secret is not touched")
+		g.Expect(prober.calls()).To(HaveLen(probesBefore), "nothing is probed with a URL CAPIBM cannot use")
+
+		f.clock.SetTime(cpTestStart.Add(2 * time.Minute))
+		f.expectObserve(cpCluster("normal"))
+		_, err = f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+		cp = f.controlPlane()
+		expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, metav1.ConditionTrue,
+			controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedReason)
+		expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionTrue,
+			controlplanev1.IBMCloudManagedControlPlaneAvailableReason)
 	})
 }
 
@@ -502,6 +556,46 @@ func TestControlPlaneKubeconfigInitialization(t *testing.T) {
 			controlplanev1.IBMCloudManagedControlPlaneAvailableWaitingForIBMClusterReason)
 		g.Expect(f.kubeconfigSecret()).To(BeNil())
 		g.Expect(prober.calls()).To(BeEmpty())
+	})
+
+	// Available of an initialized control plane whose IBM cluster CAPIBM cannot read is Unknown only while that lasts:
+	// the next lookup that succeeds lets IBM's report and the stored kubeconfig's probe decide it again.
+	t.Run("available_is_unknown_while_the_cluster_cannot_be_read_and_true_again_after", func(t *testing.T) {
+		g := NewWithT(t)
+		creds := newKubeconfigCredentials(t, time.Hour)
+		f, prober := newKubeconfigFixture(t, nil)
+		prober.setAnswer(alwaysPassing("v1.36.5+IKS"))
+		gomock.InOrder(f.expectObserve(cpCluster("normal")),
+			f.kube.EXPECT().GetAdminKubeconfig(gomock.Any(), cpIKSClusterID).Return(adminAnswer(creds, true), nil),
+			f.kube.EXPECT().GetCACertificate(gomock.Any(), cpIKSClusterID).Return(&kubernetesservice.CACertificate{PEM: creds.ca.pem}, nil))
+		_, err := f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+		expectCondition(g, f.controlPlane(), controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionTrue,
+			controlplanev1.IBMCloudManagedControlPlaneAvailableReason)
+
+		// The API key is deleted: the IAM token service refuses it before the lookup is sent.
+		f.clock.SetTime(cpTestStart.Add(time.Minute))
+		f.kube.EXPECT().GetCluster(gomock.Any(), cpIKSClusterID, "").Return(nil, iamRejectedError(kubernetesservice.OpGetCluster))
+		_, err = f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+		cp := f.controlPlane()
+		expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionUnknown,
+			controlplanev1.IBMCloudManagedControlPlaneAvailableIBMAPIErrorReason)
+		expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneKubeconfigReadyCondition, metav1.ConditionTrue,
+			controlplanev1.IBMCloudManagedControlPlaneKubeconfigReadyReason)
+		g.Expect(cp.Status.Initialization.ControlPlaneInitialized).To(Equal(ptr.To(true)))
+
+		// A valid key is back: the lookup succeeds, and the stored kubeconfig still passes its probe.
+		f.clock.SetTime(cpTestStart.Add(2 * time.Minute))
+		f.expectObserve(cpCluster("normal"))
+		_, err = f.reconcile()
+		g.Expect(err).NotTo(HaveOccurred())
+		cp = f.controlPlane()
+		expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedCondition, metav1.ConditionTrue,
+			controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedReason)
+		expectCondition(g, cp, controlplanev1.IBMCloudManagedControlPlaneAvailableCondition, metav1.ConditionTrue,
+			controlplanev1.IBMCloudManagedControlPlaneAvailableReason)
+		g.Expect(conditions.IsTrue(cp, controlplanev1.IBMCloudManagedControlPlaneReadyCondition)).To(BeTrue())
 	})
 }
 

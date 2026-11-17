@@ -197,9 +197,13 @@ func (s *ControlPlaneScope) reconcileAccess(ctx context.Context, c *kubernetesse
 	}
 	server, err := ManagementServerURL(s.ControlPlane.Spec.Distribution, c)
 	if err != nil {
-		// A master URL CAPIBM cannot use (for example one that is not https) writes neither the endpoint nor a kubeconfig.
-		return s.notProvisioned(controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason,
-			fmt.Sprintf("CAPIBM cannot use the master URL that IBM reports: %v; it writes no endpoint and no kubeconfig", err))
+		// A master URL CAPIBM cannot use (for example one that is not https) writes neither the endpoint nor a kubeconfig,
+		// and the probe of the stored kubeconfig does not run. It goes through report, not notProvisioned: IBM reports
+		// the master ready, so the URL says nothing about whether an initialized control plane is up, and Available is
+		// Unknown then (setAvailableForFailure), as when CAPIBM cannot read the cluster.
+		reason := controlplanev1.IBMCloudManagedControlPlaneIBMClusterProvisionedIBMAPIErrorReason
+		message := fmt.Sprintf("CAPIBM cannot use the master URL that IBM reports: %v; it writes no endpoint and no kubeconfig", err)
+		return s.report(ctx, cpProblem{reason: reason, message: message, outcome: Terminal(reason, message)})
 	}
 	if s.endpointAsRead == (controlplanev1.APIEndpoint{}) {
 		return s.recordEndpoint(c, server)
