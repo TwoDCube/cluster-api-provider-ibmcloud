@@ -617,6 +617,36 @@ func TestControlPlaneMasterVersionCallBudget(t *testing.T) {
 		expectMasterUpdate(g, f.controlPlane().Status.MasterUpdate, masterRecorded("1.37", 10*time.Minute, 1))
 	})
 
+	t.Run("a 429 of the step waits for Retry-After although the kubeconfig re-checks a CA near expiry every minute", func(t *testing.T) {
+		g := NewWithT(t)
+		// The Secret is CAPIBM's own and its CA expires in 6 h, so the kubeconfig step fetches the CA again and asks to
+		// look at it again after MinRequeue (1 m). The master version step runs after it in the same reconcile, and IBM
+		// answers its ListVersions with 429 and a Retry-After of 10 m.
+		ca := newTestClusterCA(t, cpTestStart.Add(6*time.Hour))
+		creds := kubeconfigCredentials{ca: ca, admin: ca.issueAdmin(t, cpTestAdminCN, cpTestStart.Add(-time.Hour), cpTestStart.Add(5*time.Hour))}
+		value := buildTestKubeconfig(t, cpTestServer, managedkubeconfig.ClusterCA, creds)
+		f, prober := newBoundFixture(t, func(objs *cpObjects) {
+			objs.cp.Generation = masterTestGeneration
+			objs.cp.Status.Initialization.ControlPlaneInitialized = ptr.To(true)
+			objs.cp.Spec.DistributionVersion = "1.37"
+			objs.extra = append(objs.extra, ownedKubeconfigSecret(t, value, cpTestStart.Add(-time.Hour), map[string]string{
+				managedscope.KubeconfigRefreshCheckedAtAnnotation: "2026-11-16T03:00:00Z"}))
+		})
+		prober.setAnswer(alwaysPassing("v1.36.5+IKS"))
+		gomock.InOrder(f.expectObserve(cpCluster("normal")),
+			f.kube.EXPECT().GetCACertificate(gomock.Any(), cpIKSClusterID).Return(&kubernetesservice.CACertificate{PEM: ca.pem}, nil),
+			f.kube.EXPECT().ListVersions(gomock.Any()).Return(nil, &kubernetesservice.APIError{Operation: kubernetesservice.OpListVersions,
+				StatusCode: http.StatusTooManyRequests, RetryAfter: 10 * time.Minute}))
+
+		result, err := f.reconcile()
+
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(f.controlPlane().Status.MasterUpdate).To(BeZero(), "no UpdateMaster without the offered versions")
+		// The next reconcile starts with GetCluster, a call of the same identity, so the CA re-check waits too.
+		g.Expect(result.RequeueAfter).To(BeNumerically(">=", 10*time.Minute), "never before Retry-After, not even for the CA re-check")
+		g.Expect(result.RequeueAfter).To(BeNumerically("<", 11*time.Minute))
+	})
+
 	t.Run("an IBM master patch is RollingOut with no request", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newMasterFixture(t, "1.36", nil)
@@ -1250,21 +1280,27 @@ func TestControlPlaneMasterVersionUnparsable(t *testing.T) {
 	expectMasterUpdate(g, f.controlPlane().Status.MasterUpdate, masterRecorded("1.37", 10*time.Minute, 1))
 }
 
+// TestResultWithMasterVersion checks the composition of the control plane's requeue: the flow's outcome, the master
+// version step's outcome, its recheck time and the kubeconfig deadline, where an error wins and IBM's Retry-After is a
+// lower bound that no deadline shortens.
 func TestResultWithMasterVersion(t *testing.T) {
 	transient := managedscope.Transient(errors.New("boom"))
+	upgradePending := managedscope.NotDone(managedscope.IntervalMasterUpdate, "UpgradePending")
 	testCases := []struct {
 		name    string
 		flow    managedscope.Outcome
 		master  managedscope.Outcome
 		recheck time.Duration
-		wantErr bool
+		// kubeconfig is the kubeconfig deadline (ControlPlaneScope.KubeconfigRequeueAfter); 0 when Decide did not run.
+		kubeconfig time.Duration
+		wantErr    bool
 		// wantMin and wantMax bound the requeue.
 		wantMin, wantMax time.Duration
 	}{
 		{name: "the recheck time brings a terminal recheck forward", flow: managedscope.Done(),
 			master: managedscope.Terminal("PermissionDenied", "m"), recheck: 90 * time.Second, wantMin: 90 * time.Second, wantMax: 99 * time.Second},
 		{name: "a later recheck time changes nothing", flow: managedscope.Done(),
-			master: managedscope.NotDone(managedscope.IntervalMasterUpdate, "UpgradePending"), recheck: 5 * time.Minute,
+			master: upgradePending, recheck: 5 * time.Minute,
 			wantMin: 100 * time.Second, wantMax: 140 * time.Second},
 		{name: "the recheck time never shortens a rate limit", flow: managedscope.Done(),
 			master: managedscope.RateLimited(10 * time.Minute), recheck: time.Minute, wantMin: 10 * time.Minute, wantMax: 11 * time.Minute},
@@ -1273,24 +1309,54 @@ func TestResultWithMasterVersion(t *testing.T) {
 		{name: "a Done step never shortens a terminal recheck", flow: managedscope.Terminal("PermissionDenied", "m"), master: managedscope.Done(),
 			wantMin: 13 * time.Minute, wantMax: 17 * time.Minute},
 		{name: "the master update poll is earlier than the steady poll", flow: managedscope.Done(),
-			master: managedscope.NotDone(managedscope.IntervalMasterUpdate, "UpgradePending"), wantMin: 100 * time.Second, wantMax: 140 * time.Second},
+			master: upgradePending, wantMin: 100 * time.Second, wantMax: 140 * time.Second},
 		{name: "the flow's earlier poll stays", flow: managedscope.NotDone(managedscope.IntervalClusterProvisioning, "MasterNotReady"),
-			master: managedscope.NotDone(managedscope.IntervalMasterUpdate, "UpgradePending"), wantMin: 50 * time.Second, wantMax: 70 * time.Second},
+			master: upgradePending, wantMin: 50 * time.Second, wantMax: 70 * time.Second},
 		{name: "a terminal step is rechecked no later than the steady poll", flow: managedscope.Done(),
 			master: managedscope.Terminal("VersionNotAvailable", "m"), wantMin: 4 * time.Minute, wantMax: 6 * time.Minute},
 		{name: "the flow's rate limit is never shortened", flow: managedscope.RateLimited(10 * time.Minute),
-			master: managedscope.NotDone(managedscope.IntervalMasterUpdate, "UpgradePending"), wantMin: 10 * time.Minute, wantMax: 11 * time.Minute},
+			master: upgradePending, wantMin: 10 * time.Minute, wantMax: 11 * time.Minute},
 		{name: "the step's rate limit replaces the flow's poll", flow: managedscope.Done(),
 			master: managedscope.RateLimited(10 * time.Minute), wantMin: 10 * time.Minute, wantMax: 11 * time.Minute},
-		{name: "the flow's error wins", flow: transient, master: managedscope.NotDone(managedscope.IntervalMasterUpdate, "x"), wantErr: true},
+		{name: "the flow's error wins", flow: transient, master: upgradePending, wantErr: true},
 		{name: "the step's error wins", flow: managedscope.Done(), master: transient, wantErr: true},
+
+		// The kubeconfig deadline of the same reconcile.
+		{name: "the kubeconfig deadline never shortens the step's rate limit", flow: managedscope.Done(),
+			master: managedscope.RateLimited(10 * time.Minute), kubeconfig: time.Minute, wantMin: 10 * time.Minute, wantMax: 11 * time.Minute},
+		{name: "the kubeconfig deadline and the recheck time never shorten the step's rate limit", flow: managedscope.Done(),
+			master: managedscope.RateLimited(10 * time.Minute), recheck: time.Minute, kubeconfig: time.Minute,
+			wantMin: 10 * time.Minute, wantMax: 11 * time.Minute},
+		{name: "the kubeconfig deadline never shortens the flow's rate limit", flow: managedscope.RateLimited(10 * time.Minute),
+			kubeconfig: time.Minute, wantMin: 10 * time.Minute, wantMax: 11 * time.Minute},
+		{name: "the kubeconfig deadline never shortens the flow's rate limit whatever the step reports",
+			flow: managedscope.RateLimited(10 * time.Minute), master: upgradePending, kubeconfig: time.Minute,
+			wantMin: 10 * time.Minute, wantMax: 11 * time.Minute},
+		{name: "the kubeconfig deadline brings the steady poll forward when the step did not run", flow: managedscope.Done(),
+			kubeconfig: time.Minute, wantMin: time.Minute, wantMax: time.Minute * 11 / 10},
+		{name: "the kubeconfig deadline brings the steady poll forward after a Done step", flow: managedscope.Done(),
+			master: managedscope.Done(), kubeconfig: time.Minute, wantMin: time.Minute, wantMax: time.Minute * 11 / 10},
+		{name: "the kubeconfig deadline brings the master update poll forward", flow: managedscope.Done(),
+			master: upgradePending, kubeconfig: time.Minute, wantMin: time.Minute, wantMax: time.Minute * 11 / 10},
+		{name: "a later kubeconfig deadline changes nothing", flow: managedscope.Done(),
+			master: upgradePending, kubeconfig: 12 * time.Hour, wantMin: 100 * time.Second, wantMax: 140 * time.Second},
+		{name: "the kubeconfig deadline wins over a later recheck time", flow: managedscope.Done(),
+			master: managedscope.Terminal("PermissionDenied", "m"), recheck: 90 * time.Second, kubeconfig: time.Minute,
+			wantMin: time.Minute, wantMax: time.Minute * 11 / 10},
+		{name: "the recheck time wins over a later kubeconfig deadline", flow: managedscope.Done(),
+			master: managedscope.Terminal("PermissionDenied", "m"), recheck: time.Minute, kubeconfig: 90 * time.Second,
+			wantMin: time.Minute, wantMax: time.Minute * 11 / 10},
+		{name: "the step's error ignores the kubeconfig deadline", flow: managedscope.Done(), master: transient,
+			kubeconfig: time.Minute, wantErr: true},
+		{name: "the flow's error ignores the kubeconfig deadline", flow: transient, kubeconfig: time.Minute, wantErr: true},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
-			result, err := resultWithMasterVersion(ctx, tc.flow, tc.master, tc.recheck)
+			result, err := resultWithMasterVersion(ctx, tc.flow, tc.master, tc.recheck, tc.kubeconfig)
 			if tc.wantErr {
 				g.Expect(err).To(MatchError("boom"))
+				g.Expect(result.RequeueAfter).To(BeZero(), "controller-runtime ignores RequeueAfter next to an error")
 				return
 			}
 			g.Expect(err).NotTo(HaveOccurred())

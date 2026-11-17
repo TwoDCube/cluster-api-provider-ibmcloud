@@ -467,7 +467,8 @@ func (s *ControlPlaneScope) setKubeconfigReady(status metav1.ConditionStatus, re
 
 // KubeconfigRequeueAfter returns when the kubeconfig must be looked at again, as managedkubeconfig.Decide answered in
 // this reconcile (a 401 backoff, a CA rotation poll, a certificate or CA deadline); 0 when Decide did not run. The
-// controller requeues at the earlier of this and the step's interval.
+// controller requeues at the earlier of this and the step's interval, unless IBM rate limited a call of this
+// reconcile: IBM's Retry-After is a lower bound for every call of the identity, and Decide does not know of it.
 func (s *ControlPlaneScope) KubeconfigRequeueAfter() time.Duration {
 	return s.kubeconfigRequeue
 }

@@ -156,13 +156,14 @@ func (r *IBMCloudManagedControlPlaneReconciler) Reconcile(ctx context.Context, r
 
 // reconcileNormal binds the control plane to its IBM cluster, reports the cluster, keeps its kubeconfig verified and
 // its master on spec.distributionVersion, then requeues at the interval the scope chose, or at steadyStatePoll when
-// nothing is in progress, merged with the master version step's (resultWithMasterVersion) and no later than the
-// kubeconfig deadline (requeueAtKubeconfigDeadline). scope is this reconcile's scope.
+// nothing is in progress, merged with the master version step's and no later than the kubeconfig deadline, unless IBM
+// rate limited a call: resultWithMasterVersion composes all of it, so that no deadline brings the next reconcile
+// before IBM's Retry-After. scope is this reconcile's scope.
 func (r *IBMCloudManagedControlPlaneReconciler) reconcileNormal(ctx context.Context, scope *managedscope.ControlPlaneScope) (ctrl.Result, error) {
 	outcome := scope.ReconcileNormal(ctx)
 	logControlPlaneTerminal(ctx, outcome)
-	result, err := resultWithMasterVersion(ctx, outcome, scope.MasterVersionOutcome(), scope.MasterVersionRequeueAfter())
-	return requeueAtKubeconfigDeadline(result, err, scope.KubeconfigRequeueAfter())
+	return resultWithMasterVersion(ctx, outcome, scope.MasterVersionOutcome(), scope.MasterVersionRequeueAfter(),
+		scope.KubeconfigRequeueAfter())
 }
 
 // scopeParams returns the reconciler's dependencies as the scope's parameters.

@@ -34,31 +34,39 @@ import (
 // interval later than the time the condition promises. With it, a role granted after a 403 takes effect at the retry
 // time the message names (up to 24 h away after repeated refusals), with no spec change and no manual trigger.
 
-// resultWithMasterVersion maps the outcome of ReconcileNormal to a ctrl.Result (resultFor) and merges the master
-// version step into it. The rules, in order:
+// resultWithMasterVersion maps the outcome of ReconcileNormal to a ctrl.Result (resultFor), merges the master version
+// step into it and requeues no later than the kubeconfig deadline. It is the one place that composes the requeue of
+// the normal flow, so that the rate-limit rule below holds for every deadline. The rules, in order:
 //
 //   - An error of either wins, so that controller-runtime retries with backoff (Transient).
-//   - A rate limit of the flow is kept as it is: IBM's Retry-After is a lower bound for every call of the identity, so
-//     neither the step nor its recheck time may bring the next reconcile forward. The scope already skips the step
-//     after a rate limit of the access steps (ControlPlaneScope.reconcileMasterVersion); this rule keeps the requeue
-//     right whatever the step reports.
-//   - A rate limit of the step replaces the flow's requeue for the same reason.
-//   - A step that is Done, or did not run, changes nothing: the flow's requeue already covers it (the steady poll, or a
-//     longer wait the flow chose itself, such as terminalRecheck for a condition that needs a human).
-//   - Otherwise the earlier of the two requeues, and no later than recheck, so that a held request is sent again at the
-//     retry time its message names.
+//   - A rate limit of the flow is kept as it is: IBM's Retry-After is a lower bound for every call of the identity, and
+//     the next reconcile starts with GetCluster, so neither the step, its recheck time nor the kubeconfig deadline may
+//     bring the next reconcile forward. The scope already skips the step after a rate limit of the access steps
+//     (ControlPlaneScope.reconcileMasterVersion); this rule keeps the requeue right whatever the step reports.
+//   - A rate limit of the step replaces the flow's requeue for the same reason, and no deadline shortens it: the
+//     kubeconfig step ran before the master version step in the same reconcile, so its deadline (the re-check of a CA
+//     near expiry every minute, a 401 backoff of 1 to 10 minutes) knows nothing of IBM's later 429.
+//   - A step that is Done, or did not run, leaves the flow's requeue (the steady poll, or a longer wait the flow chose
+//     itself, such as terminalRecheck for a condition that needs a human), no later than the kubeconfig deadline.
+//   - Otherwise the earlier of the two requeues, no later than the earlier of recheck and the kubeconfig deadline, so
+//     that a held request is sent again at the retry time its message names.
 //
-// A Terminal outcome of the step is logged like the flow's own.
+// Both deadlines get upward jitter only (requeueAtKubeconfigDeadline): requeued earlier, the decision they belong to
+// would find nothing due yet. A Terminal outcome of the step is logged like the flow's own.
 //
 // Parameters:
 //   - ctx carries the reconcile's logger.
 //   - outcome is ReconcileNormal's outcome.
 //   - master is the master version step's outcome (ControlPlaneScope.MasterVersionOutcome); Kind "" when it did not run.
 //   - recheck is ControlPlaneScope.MasterVersionRequeueAfter; 0 when the decision names no recheck time.
-func resultWithMasterVersion(ctx context.Context, outcome, master managedscope.Outcome, recheck time.Duration) (ctrl.Result, error) {
+//   - kubeconfigDeadline is ControlPlaneScope.KubeconfigRequeueAfter; 0 when managedkubeconfig.Decide did not run.
+func resultWithMasterVersion(ctx context.Context, outcome, master managedscope.Outcome, recheck, kubeconfigDeadline time.Duration) (ctrl.Result, error) {
 	result, err := resultFor(outcome, managedscope.IntervalSteadyState)
-	if err != nil || outcome.Kind == managedscope.OutcomeRateLimited || master.Kind == "" || master.Kind == managedscope.OutcomeDone {
+	if err != nil || outcome.Kind == managedscope.OutcomeRateLimited {
 		return result, err
+	}
+	if master.Kind == "" || master.Kind == managedscope.OutcomeDone {
+		return requeueAtKubeconfigDeadline(result, nil, kubeconfigDeadline)
 	}
 	logControlPlaneTerminal(ctx, master)
 	masterResult, masterErr := resultFor(master, managedscope.IntervalSteadyState)
@@ -68,7 +76,9 @@ func resultWithMasterVersion(ctx context.Context, outcome, master managedscope.O
 	if masterResult.RequeueAfter > 0 && masterResult.RequeueAfter < result.RequeueAfter {
 		result = masterResult
 	}
-	// The recheck time is a deadline like the kubeconfig's refresh deadline (requeueAtKubeconfigDeadline): requeued
-	// earlier, the decision would find nothing due yet, so it gets upward jitter only.
-	return requeueAtKubeconfigDeadline(result, nil, recheck)
+	deadline := kubeconfigDeadline
+	if recheck > 0 && (deadline <= 0 || recheck < deadline) {
+		deadline = recheck
+	}
+	return requeueAtKubeconfigDeadline(result, nil, deadline)
 }

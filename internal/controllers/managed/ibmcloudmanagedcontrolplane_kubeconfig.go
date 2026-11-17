@@ -23,18 +23,22 @@ import (
 )
 
 // This file is the control plane's requeue rule: requeue = min(state interval, kubeconfig deadline, caRotationPoll
-// while rotating). The scope step's outcome names the state interval (resultFor); the kubeconfig deadline is
-// managedkubeconfig.Decide's RequeueAfter of the same reconcile (a 401 backoff, a CA rotation poll, a certificate or
-// CA re-check), a duration that no named interval expresses, so the controller applies it here.
+// while rotating), never before IBM's Retry-After. The scope step's outcome names the state interval (resultFor); the
+// kubeconfig deadline is managedkubeconfig.Decide's RequeueAfter of the same reconcile (a 401 backoff, a CA rotation
+// poll, a certificate or CA re-check), a duration that no named interval expresses, so the controller applies it
+// (resultWithMasterVersion), after the rate-limit rules: Decide runs before the master version step of the same
+// reconcile and cannot know of a 429 that step gets.
 
 // requeueAtKubeconfigDeadline returns result, requeued no later than deadline. An error is returned unchanged:
 // controller-runtime then retries with backoff and ignores RequeueAfter. A deadline of 0 (Decide did not run) changes
 // nothing. The deadline gets upward jitter only (jitterUp): requeued earlier, Decide would find nothing due yet and
-// schedule the same deadline again.
+// schedule the same deadline again. It does not look at the outcome kind, so a caller must not pass the result of a
+// rate limit (resultWithMasterVersion keeps those as they are).
 //
 // Parameters:
 //   - result and err are what resultFor returned for the step's outcome.
-//   - deadline is ControlPlaneScope.KubeconfigRequeueAfter.
+//   - deadline is ControlPlaneScope.KubeconfigRequeueAfter, or the earlier of it and the master version step's
+//     recheck time.
 func requeueAtKubeconfigDeadline(result ctrl.Result, err error, deadline time.Duration) (ctrl.Result, error) {
 	if err != nil || deadline <= 0 {
 		return result, err
