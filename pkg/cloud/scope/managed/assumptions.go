@@ -281,9 +281,9 @@ func KubeconfigPolicy() managedkubeconfig.Policy {
 }
 
 // defaultMasterPort is the port of a master URL that names none. Observed on IBM Cloud: masterURL is https with an
-// explicit port. IBM shows the port-443 control plane hostnames of ROKS 4.22 without a port
-// (https://cloud.ibm.com/docs/openshift?topic=openshift-notice-cp-port-443); whether masterURL then names one is not
-// yet verified against IBM Cloud.
+// explicit port, on ROKS 4.22 too. ROKS 4.22 adds port-443 control plane hostnames next to the NodePort
+// (https://cloud.ibm.com/docs/openshift?topic=openshift-notice-cp-port-443), and IBM shows those without a port, but
+// masterURL still names the NodePort. A masterURL without a port has not been seen; 443 is what https implies then.
 const defaultMasterPort = "443"
 
 // ManagementServerURL returns the API server URL CAPIBM uses for a cluster: IBM's masterURL, which is also the server
