@@ -305,11 +305,15 @@ func TestIBMCloudManagedMachinePoolCreationMarker(t *testing.T) {
 func TestIBMCloudManagedMachinePoolStatusValidation(t *testing.T) {
 	namespace := newTestNamespace(t, "ibmcmmp-status")
 	now := metav1.Now()
+	// The API server stores times with second precision, so a time compared after the round trip has none finer.
+	volumeDetachStart := metav1.NewTime(now.Add(time.Minute).Truncate(time.Second))
 
 	testCases := []struct {
 		name    string
 		status  infrav1.IBMCloudManagedMachinePoolStatus
 		wantErr string
+		// stored checks the status as the API server answered an accepted update; nil checks nothing more.
+		stored func(g *WithT, stored infrav1.IBMCloudManagedMachinePoolStatus)
 	}{
 		{
 			name: "contract_and_cache_fields_accepted",
@@ -340,6 +344,29 @@ func TestIBMCloudManagedMachinePoolStatusValidation(t *testing.T) {
 					DrainStartTime: now,
 				},
 				LastDisruptionTime: now,
+			},
+			stored: func(g *WithT, stored infrav1.IBMCloudManagedMachinePoolStatus) {
+				// Zero counts survive the round trip as set pointers: the contract publishes replicas 0.
+				g.Expect(stored.Replicas).To(HaveValue(BeZero()))
+				g.Expect(stored.WorkersWithUpdateAvailable).To(HaveValue(BeZero()))
+				g.Expect(stored.Ready).To(HaveValue(BeTrue()))
+			},
+		},
+		{
+			name: "disruption_volume_detach_start_time_accepted",
+			status: infrav1.IBMCloudManagedMachinePoolStatus{
+				Disruption: infrav1.WorkerDisruptionStatus{
+					Operation:             infrav1.WorkerDisruptionOperationScaleDown,
+					Phase:                 infrav1.WorkerDisruptionPhaseWaitingForVolumeDetach,
+					WorkerIDs:             []string{"kube-worker-1"},
+					DrainStartTime:        now,
+					VolumeDetachStartTime: volumeDetachStart,
+				},
+			},
+			stored: func(g *WithT, stored infrav1.IBMCloudManagedMachinePoolStatus) {
+				// A field missing from the CRD schema would be pruned without an error, and the detach time limit would
+				// then restart on every reconcile.
+				g.Expect(stored.Disruption.VolumeDetachStartTime.Time).To(BeTemporally("==", volumeDetachStart.Time))
 			},
 		},
 		{
@@ -386,11 +413,8 @@ func TestIBMCloudManagedMachinePoolStatusValidation(t *testing.T) {
 			g.Expect(testEnv.Create(ctx, obj)).To(Succeed())
 			obj.Status = tc.status
 			expectAPIResult(g, testEnv.Status().Update(ctx, obj), tc.wantErr)
-			if tc.wantErr == "" {
-				// Zero counts survive the round trip as set pointers: the contract publishes replicas 0.
-				g.Expect(obj.Status.Replicas).To(HaveValue(BeZero()))
-				g.Expect(obj.Status.WorkersWithUpdateAvailable).To(HaveValue(BeZero()))
-				g.Expect(obj.Status.Ready).To(HaveValue(BeTrue()))
+			if tc.wantErr == "" && tc.stored != nil {
+				tc.stored(g, obj.Status)
 			}
 		})
 	}

@@ -490,6 +490,7 @@ func (in *WorkerDisruptionStatus) DeepCopyInto(out *WorkerDisruptionStatus) {
 		copy(*out, *in)
 	}
 	in.DrainStartTime.DeepCopyInto(&out.DrainStartTime)
+	in.VolumeDetachStartTime.DeepCopyInto(&out.VolumeDetachStartTime)
 	in.IBMRequestTime.DeepCopyInto(&out.IBMRequestTime)
 }
 

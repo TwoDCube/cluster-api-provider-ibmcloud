@@ -356,6 +356,14 @@ type WorkerDisruptionStatus struct {
 	// +optional
 	DrainStartTime metav1.Time `json:"drainStartTime,omitempty,omitzero"`
 
+	// volumeDetachStartTime is when CAPIBM began to wait for the volumes of the drained Nodes to detach: the first time
+	// it recorded phase WaitingForVolumeDetach for this operation. MachinePool
+	// spec.template.spec.deletion.nodeVolumeDetachTimeoutSeconds counts from it, as Cluster API counts it from a
+	// Machine's status.deletion.waitForNodeVolumeDetachStartTime, so a long drain never uses up the detach wait. A pod
+	// that comes back sends the operation to Draining again and keeps this time, as Cluster API keeps its own.
+	// +optional
+	VolumeDetachStartTime metav1.Time `json:"volumeDetachStartTime,omitempty,omitzero"`
+
 	// ibmRequestTime is when CAPIBM sent the IBM call (replaceWorker, resizeWorkerPool or removeWorkerPool).
 	// +optional
 	IBMRequestTime metav1.Time `json:"ibmRequestTime,omitempty,omitzero"`
