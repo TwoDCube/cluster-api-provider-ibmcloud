@@ -428,11 +428,13 @@ const (
 	// StepHandOver means that the pool is being deleted while a replace or scale-down is wanted or in flight: the pool
 	// deletion takes it over. Keep every cordon and the token. With Phase Draining (a removal in flight, in any phase),
 	// record status.disruption as operation DeletePool, phase Draining and every worker of the pool as workerIDs,
-	// keeping drainStartTime and ibmRequestTime: the pool deletion then cordons and drains every Node of the pool, its
-	// pre-call gate (rule 1 of CheckDisruption) waits until IBM has settled a replace or resize it is still carrying
-	// out, and its own IBM call keeps DisruptionSettleDelay from the earlier one. Restarting at Draining from every
-	// phase means that the pool deletion never waits for a pool removal nobody requested, or for a replacement worker
-	// of a pool that is going away. With Phase "" (nothing cordoned yet), decide again with operation DeletePool.
+	// keeping drainStartTime and ibmRequestTime and clearing volumeDetachStartTime (the added Nodes are not drained
+	// yet, so the detach wait of the whole pool begins anew): the pool deletion then cordons and drains every Node of
+	// the pool, its pre-call gate (rule 1 of CheckDisruption) waits until IBM has settled a replace or resize it is
+	// still carrying out, and its own IBM call keeps DisruptionSettleDelay from the earlier one. Restarting at Draining
+	// from every phase means that the pool deletion never waits for a pool removal nobody requested, or for a
+	// replacement worker of a pool that is going away. With Phase "" (nothing cordoned yet), decide again with
+	// operation DeletePool.
 	StepHandOver DisruptionStep = "HandOver"
 	// StepCorrectVictims (scale-down only) means that IBM's resize removes other workers than the predicted victims
 	// (resizeWorkerPool cannot name its victims, and whether it follows IBM's documented order is not yet verified
@@ -567,10 +569,13 @@ type DrainProgress struct {
 	// DetachExcluded is true when the exclude-wait-for-node-volume-detach annotation is set.
 	DetachExcluded bool
 
-	// DetachTimedOut is true when nodeVolumeDetachTimeoutSeconds has passed.
+	// DetachTimedOut is true when nodeVolumeDetachTimeoutSeconds has passed since the volume detach wait began
+	// (status.disruption.volumeDetachStartTime), not since the drain started: the drain's own time never uses up the
+	// detach wait, as in Cluster API.
 	DetachTimedOut bool
 
-	// VolumesDetached is true when drain.Helper.VolumesDetached holds for every victim Node.
+	// VolumesDetached is true when drain.Helper.VolumesDetached holds for every victim Node. It is false until the
+	// volume detach wait began: the step into WaitingForVolumeDetach does not read it.
 	VolumesDetached bool
 }
 
@@ -611,8 +616,9 @@ type DisruptionDecision struct {
 	Step DisruptionStep
 
 	// Phase is the status.disruption.phase to record; "" means no status.disruption (before the first cordon, or
-	// cleared). The caller keeps the other fields of status.disruption (drainStartTime, ibmRequestTime) when it records
-	// a phase.
+	// cleared). The caller keeps the other fields of status.disruption (drainStartTime, volumeDetachStartTime,
+	// ibmRequestTime) when it records a phase, and sets volumeDetachStartTime when it first records
+	// WaitingForVolumeDetach.
 	Phase infrav1.WorkerDisruptionPhase
 
 	// Reason is the reason for the flow's condition (WorkersUpToDate, WorkerPoolReady or Deleting); "" when the step
