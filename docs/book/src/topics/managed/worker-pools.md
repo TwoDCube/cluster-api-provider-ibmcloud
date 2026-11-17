@@ -137,8 +137,10 @@ Scale-down, pool removal and worker replacement remove workers. Before each, CAP
 
 and it must hold the Cluster's **disruption token**: a `coordination.k8s.io` Lease named
 `<cluster>-ibm-worker-disruption` in the Cluster's namespace, so that two pools never disrupt at the same time
-(`WaitingForDisruptionToken`). An operation that removes no ready worker (for example stopping a stalled scale-up by
-scaling back down) skips checks 1 and 2.
+(`WaitingForDisruptionToken`). A pool gives the token back when its operation ends, and also when it is idle with
+the token still held and the workload cluster shows none of its Nodes still drained (for example when its first cordon
+failed and the operation was then no longer wanted). An operation that removes no ready worker (for example stopping a
+stalled scale-up by scaling back down) skips checks 1 and 2.
 
 ## How CAPIBM drains
 
@@ -189,10 +191,16 @@ IBM call, because it has to see the new Node become `Ready`.
 
 CAPIBM records the drain on each Node with annotations (prefix
 `ibmcloudmanagedmachinepool.infrastructure.cluster.x-k8s.io/`): `drain-start-time` (time limits never restart),
-`drain-owner` (`<namespace>/<pool>`; a second pool waits for it), and `cordoned` and `excluded-from-lb`, which record
-what CAPIBM changed. After a controller restart or `clusterctl move`, the drain resumes from these markers and IBM's
-worker states. An aborted operation reverts only CAPIBM's own changes: a Node a person cordoned stays cordoned. A paused
-Cluster stops evictions, uncordons and IBM calls.
+`drain-owner` (`<namespace>/<pool>`; a second pool waits for it while that pool object exists), and `cordoned` and
+`excluded-from-lb`, which record what CAPIBM changed. After a controller restart or `clusterctl move`, the drain
+resumes from these markers and IBM's worker states. An aborted operation reverts only CAPIBM's own changes: a Node a
+person cordoned stays cordoned. A `drain-owner` that names a pool object that no longer exists (for example after its
+finalizer was removed by hand mid-drain) holds no other pool: a pool whose operation drains that Node reverts what the
+markers record and cordons the Node as its own, so its drain time limit counts from then. On a Node that no operation
+drains, the markers stay, with the cordon and the load-balancer exclusion they record, until you remove the annotations
+and revert what they record: uncordon the Node if `cordoned` is `true`, and remove the label
+`node.kubernetes.io/exclude-from-external-load-balancers` if `excluded-from-lb` is `true`. A paused Cluster stops
+evictions, uncordons and IBM calls.
 
 Events: `DrainStarted`, `DrainCompleted`, `NodeUncordoned`, `WorkerReplaceRequested` (Normal); `DrainBlocked`,
 `DrainTimeoutExceeded`, `UnexpectedScaleDownVictim` (Warning).

@@ -118,13 +118,14 @@ The `IBMCloudManagedCluster` has no finalizer and no events; a stand-alone delet
 | | False | `WaitingForDisruptionToken` | another pool of the Cluster holds the disruption token |
 | | False | `WaitingForWorkloadCluster` | the workload cluster is not connected; checked before anything is cordoned |
 | | False | `DrainingNode` | a scale-down drains the predicted workers |
-| | False | `IBMAPIError` | IBM answered a call for the pool with a 401, a 403 for a missing role, a 400 or a 404, or CAPIBM cannot resolve its IBM credentials; the message names the call and IBM's code only. For a scale-down's resize call the report stays, with the Nodes cordoned and the disruption token held, and the call is repeated at most once every 3 minutes |
+| | False | `IBMAPIError` | IBM answered a call for the pool with a 401, a 403 for a missing role, a 400 or a 404, or CAPIBM cannot resolve its IBM credentials; the message names the call and IBM's code only. For a scale-down's resize call the report stays, with the Nodes cordoned and the disruption token held, and the call is repeated at most once every 3 minutes. A growth IBM refuses with a 400 or a 403 while a worker replacement runs is asked again 15 minutes later, at the time the message ends with ("...; while a worker of the pool is replaced, CAPIBM asks IBM again for 3 workers per zone at <time>"), or at once when the MachinePool's `replicas` or the pool object's spec changes |
 | `WorkersUpToDate` | True | `UpToDate` | no worker is due for replacement and none has an update available |
 | | False | `PatchUpdateAvailable` | policy `Manual` and no due `spec.rollout.after`: "3 of 6 workers can move to IBM fix pack 1.36.5_1545; set spec.rollout.after to roll them, or set spec.workerUpdates.policy: Automatic" |
 | | False | `RollingOut` | a rollout is in progress between workers ("replaced 2 of 6; ...") |
 | | False | `DrainingNode` | the worker to replace is drained |
 | | False | `ReplacingWorker` | IBM replaces the worker |
 | | False | `WaitingForReplacement` | the replacement is not yet deployed, healthy and `Ready` for `minReadySeconds` |
+| | False | `WorkersNotReady` | a replacement waits to start because another worker of the pool is not deployed, healthy and `Ready` for `minReadySeconds`; the message names it. A replacement completes only once every worker of the pool is, so a worker that stays broken holds only this pool's rollout, never the disruption token. Repair or replace it (`ibmcloud ks worker replace`) |
 | | False | `WaitingForControlPlaneUpgrade` | the master is updating (a requested minor or an IBM patch) |
 | | False | `WaitingForCapacity` | "...; scale MachinePool <name> to <n> to allow a rolling replacement" (`<n>` adds whole workers per zone until the cluster minimum holds during the replacement) |
 | | False | `WaitingForClusterMinimum` | IBM refused the replacement with `E1437`; the Node stays cordoned |
@@ -136,7 +137,7 @@ The `IBMCloudManagedCluster` has no finalizer and no events; a stand-alone delet
 | | False | `WorkerOperationStuck` | a worker has been changing for more than 60 minutes |
 | | any | message `VersionIgnored` | `MachinePool.spec.template.spec.version` is set; the message ends with "...; VersionIgnored: MachinePool spec.template.spec.version is ignored: workers follow the control plane minor; fix packs follow spec.workerUpdates" |
 | `Draining` (activity) | True | `DrainingNode` | Nodes are cordoned and their pods evicted |
-| | True | `DrainBlocked` | a PodDisruptionBudget refuses an eviction; the message lists pods and budgets (at most 3 pods per category plus "and N more") |
+| | True | `DrainBlocked` | a PodDisruptionBudget refuses an eviction; the message lists pods and budgets (at most 3 pods per category plus "and N more", for the first 3 Nodes plus "and N more Nodes are not drained yet") |
 | | True | `WaitingForVolumeDetach` | drained Nodes still have attached volumes |
 | | True | `WaitingForWorkloadCluster` | the workload cluster became unreachable during a drain |
 | | False | `NotDraining` | no drain in progress |
@@ -148,9 +149,10 @@ The `IBMCloudManagedCluster` has no finalizer and no events; a stand-alone delet
 | | True | `ExternallyAutoscaled` | IBM refused removing an autoscaled pool; retried at most every 3 minutes |
 | | True | `WaitingForSettledCluster` | another worker of the Cluster is changing |
 | | True | `WaitingForDisruptionToken` | another pool holds the disruption token |
-| | True | `WaitingForWorkloadCluster` | the workload cluster was never reached for this removal ([escape hatch](./troubleshooting.md#a-pool-removal-or-scale-down-waits-in-waitingforworkloadcluster)) |
+| | True | `WaitingForWorkloadCluster` | the workload cluster was never reached for this removal ([escape hatch](./troubleshooting.md#a-pool-removal-or-scale-down-waits-in-waitingforworkloadcluster)); or the deletion leaves the IBM pool alone (another object claims it, or it has another flavor) and must first revert the cordons of this pool's unfinished scale-down or replacement, which it does once the workload cluster is connected (both exclusion annotations let the finalizer go without it) |
 | | True | `DrainingNodes` | every Node of the pool is drained |
 | | True | `RemovingWorkerPool` | `removeWorkerPool` was sent; waiting until IBM no longer lists the pool |
+| | True | `WaitingForWorkerRemoval` | the deletion leaves the IBM pool alone (another object claims it, or it has another flavor), and this pool's unfinished scale-down or replacement already asked IBM to remove workers: their Nodes stay cordoned until IBM has removed them or 60 minutes have passed since the call; then CAPIBM reverts the cordons and the finalizer goes |
 | | True | `IBMAPIError` | IBM answered a call of the removal with a 401, a 403 for a missing role, a 400 or a 404; the message names the call and IBM's code only; for `removeWorkerPool` the Nodes stay cordoned and the call is repeated at most once every 3 minutes |
 | `Paused` | | | `util/paused` |
 

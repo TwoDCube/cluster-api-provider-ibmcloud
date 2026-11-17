@@ -198,8 +198,14 @@ or `RollingOut` between workers, with a message such as "replaced 2 of 6; ...". 
 `WaitingForDisruptionToken`, `WaitingForClusterState`, `WaitingForWorkloadCluster`), and reports `AutoRebalanceDisabled`
 (IBM auto-rebalance is off in the worker's zone, so IBM would create no replacement; fix: `ibmcloud ks worker-pool
 rebalance`), `ReplacementNotCreated` (no new worker 30 minutes after the old one was deleted) and
-`WorkerOperationStuck`. If a rollout is no longer wanted before CAPIBM's IBM call (policy set back to `Manual`, for
-example), CAPIBM uncordons the Node and stops.
+`WorkerOperationStuck`. A replacement also waits to start, with `WorkersNotReady` naming the worker, while another
+worker of the pool is not deployed, healthy and `Ready` for `minReadySeconds`, for example one IBM failed to provision:
+a replacement completes only once every worker of the pool is, so it never starts next to a worker it would wait for
+indefinitely, and such a worker holds this pool's rollout without holding the disruption token of the other pools.
+Repair or replace that worker (`ibmcloud ks worker replace`). If a rollout is no longer wanted before CAPIBM's IBM call
+(policy set back to `Manual`, for example), CAPIBM uncordons the Node and stops. A replacement already in progress
+runs on while the pool grows, also when IBM refuses the growth or the cluster state forbids it; a growth IBM refuses is
+asked again 15 minutes later, at the time `WorkerPoolReady` names, not with every step of the replacement.
 
 ## Versions at a glance
 

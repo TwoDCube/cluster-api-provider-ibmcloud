@@ -118,7 +118,12 @@ Cloud yourself if it is yours.
 
 Likewise, deleting a pool object leaves the IBM pool alone, with the Warning event `WorkerPoolNotRemoved`, when another
 `IBMCloudManagedMachinePool` of the Cluster still claims the same `poolName`, or when the IBM pool has another flavor
-and so is not this object's pool (`PoolConflict`).
+and so is not this object's pool (`PoolConflict`). A scale-down or replacement this object left unfinished ends with
+it: CAPIBM reverts its cordons on the Nodes (the event says how many) and releases the disruption token before the
+finalizer goes. When that operation already asked IBM to remove workers, the deletion first waits in
+`WaitingForWorkerRemoval` (`Deleting`) until IBM has removed them or 60 minutes have passed; while the workload cluster
+is not connected it waits in `WaitingForWorkloadCluster`, unless both
+[exclusion annotations](./worker-pools.md#drain-settings) are set.
 
 ## Keep the gate on until the deletion is done
 

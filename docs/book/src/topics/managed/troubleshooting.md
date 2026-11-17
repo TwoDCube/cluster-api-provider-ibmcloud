@@ -241,6 +241,10 @@ per zone ([Topology](./topology.md#smaller-topologies-are-not-ha)). CAPIBM ignor
 * **`WaitingForSettledCluster`**: another worker of the Cluster is changing; a worker stuck for more than 60 minutes is
   named with `WorkerOperationStuck` and no longer blocks. Check it in IBM Cloud.
 * **`WaitingForDisruptionToken`**: another pool of the Cluster is disrupting; it continues when that one is done.
+* **`WorkersNotReady`** (`WorkersUpToDate`): a worker replacement waits to start because another worker of the pool
+  is not deployed, healthy and `Ready` for `minReadySeconds`; the message names it. A Node that only soaks for
+  `minReadySeconds` passes by itself; a worker IBM failed to provision needs
+  `ibmcloud ks worker replace --cluster <cluster> --worker <worker>`.
 * **`WaitingForClusterState`**: IBM's cluster state blocks pool changes (for example `unsupported`: upgrade the master
   first).
 * **`WaitingForClusterMinimum`**: the change would go below IBM's minimum (1 worker on IKS, 2 on ROKS); add workers or
