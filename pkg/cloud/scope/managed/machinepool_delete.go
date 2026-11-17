@@ -51,7 +51,9 @@ const EventPoolNotRemoved = "WorkerPoolNotRemoved"
 
 // ReconcileDelete runs the pool deletion once. It returns the outcome and whether the controller may remove the
 // finalizer. Every skip path decides from management-cluster objects only: no IBM and no workload-cluster call, no
-// credential resolution. ctx is the reconcile context.
+// credential resolution. A deletion that leaves the IBM pool to another object that still claims it makes no IBM call
+// and no credential resolution either, but reads the workload cluster's Nodes to revert this pool's own unfinished
+// drain (releaseOwnDrain). ctx is the reconcile context.
 func (s *MachinePoolScope) ReconcileDelete(ctx context.Context) (Outcome, bool) {
 	if err := s.loadOwners(ctx); err != nil {
 		return Transient(err), false
@@ -61,8 +63,12 @@ func (s *MachinePoolScope) ReconcileDelete(ctx context.Context) (Outcome, bool) 
 		return Done(), true
 	}
 	if others := s.liveClaimants(); len(others) > 0 {
+		reverted, outcome, released := s.releaseOwnDrain(ctx)
+		if !released {
+			return outcome, false
+		}
 		s.params.Recorder.Eventf(s.Pool, corev1.EventTypeWarning, EventPoolNotRemoved, "IBM worker pool %s stays: "+
-			"IBMCloudManagedMachinePool %s still claims it", s.Pool.Spec.PoolName, boundedList(others))
+			"IBMCloudManagedMachinePool %s still claims it%s", s.Pool.Spec.PoolName, boundedList(others), revertedNote(reverted))
 		return Done(), true
 	}
 	if s.ControlPlane.Status.ClusterID == "" {
@@ -171,7 +177,8 @@ func (s *MachinePoolScope) observeClusterForDelete(ctx context.Context, clients 
 
 // poolToRemove finds the IBM pool to remove. When IBM no longer lists it, or lists it as deleted, the deletion is
 // complete: the token is released (it is held only by a removal of this pool) and the finalizer may go. A pool of
-// another flavor is not this object's: it stays, with a Warning event.
+// another flavor is not this object's: it stays, with a Warning event, once this pool's own unfinished drain is
+// reverted (releaseOwnDrain).
 //
 // Parameters:
 //   - ctx is the reconcile context.
@@ -192,11 +199,109 @@ func (s *MachinePoolScope) poolToRemove(ctx context.Context, clients *poolClient
 		return nil, Done(), true
 	}
 	if pool.Flavor != s.Pool.Spec.Flavor {
+		reverted, outcome, released := s.releaseOwnDrain(ctx)
+		if !released {
+			return nil, outcome, true
+		}
 		s.params.Recorder.Eventf(s.Pool, corev1.EventTypeWarning, EventPoolNotRemoved, "IBM worker pool %s stays: it has "+
-			"flavor %s, not this object's %s, so it is not this object's pool", pool.Name, pool.Flavor, s.Pool.Spec.Flavor)
+			"flavor %s, not this object's %s, so it is not this object's pool%s", pool.Name, pool.Flavor, s.Pool.Spec.Flavor,
+			revertedNote(reverted))
 		return nil, Done(), true
 	}
 	return pool, Outcome{}, false
+}
+
+// releaseOwnDrain ends this pool's worker removal when its deletion leaves the IBM pool alone (another object still
+// claims it, or it has another flavor): once the finalizer is gone, nothing carries that removal on. It reverts
+// CAPIBM's cordon of every Node that carries this pool's drain-owner marker (drain.Helper.Uncordon reverts only CAPIBM's
+// own changes, so a cordon a human set stays), clears status.disruption and releases the disruption token. Left behind,
+// the markers would keep those Nodes cordoned and out of the load balancers for good, and the object that keeps the IBM
+// pool could never drain them (drain.ErrDrainOwnerConflict). It returns how many Nodes it reverted and true when the
+// finalizer may go; otherwise the outcome to return.
+//
+// A removal whose IBM call went out less than WorkerStuckAfter ago is waited out first, as DecideDisruptionStep waits out
+// a removal whose reason went away after its call: IBM may still remove those workers, and their Nodes must stay
+// drained until it has. The wait ends early once no Node carries the marker (IBM removed the workers, and their Nodes
+// with them). While the workload cluster is not connected the markers cannot be read: a removal that status.disruption
+// records waits for the connection, unless both exclusion annotations say that the pool needs nothing from the workload
+// cluster; without a recorded removal nothing is known to revert, and the finalizer goes.
+//
+// Parameters:
+//   - ctx is the reconcile context.
+func (s *MachinePoolScope) releaseOwnDrain(ctx context.Context) (int, Outcome, bool) {
+	disruption := s.Pool.Status.Disruption
+	workload, err := s.params.ClusterCache.GetClient(ctx, client.ObjectKeyFromObject(s.Cluster))
+	switch {
+	case errors.Is(err, clustercache.ErrClusterNotConnected):
+		knobs := DrainKnobsFor(s.MachinePool, s.Pool)
+		if disruption.Operation == "" || (knobs.ExcludeDraining && knobs.ExcludeVolumeDetachWait) {
+			return s.dropOwnDrain(ctx, 0)
+		}
+		reason := string(ReasonWaitingForWorkloadCluster)
+		s.report(reason, fmt.Sprintf("IBM worker pool %s stays, and the %s removal of this pool is unfinished; CAPIBM "+
+			"reverts its cordons once the workload cluster is connected, and then removes the finalizer", s.Pool.Spec.PoolName,
+			disruption.Operation))
+		return 0, NotDone(IntervalGuarded, reason), false
+	case err != nil:
+		return 0, Transient(fmt.Errorf("getting the workload cluster client of Cluster %s: %w", s.Cluster.Name, err)), false
+	}
+	nodes := &corev1.NodeList{}
+	if err := workload.List(ctx, nodes); err != nil {
+		return 0, Transient(fmt.Errorf("listing the Nodes of Cluster %s: %w", s.Cluster.Name, err)), false
+	}
+	var marked []corev1.Node
+	for i := range nodes.Items {
+		if hasDrainOwner(&nodes.Items[i], s.Pool) {
+			marked = append(marked, nodes.Items[i])
+		}
+	}
+	if len(marked) == 0 {
+		return s.dropOwnDrain(ctx, 0)
+	}
+	if sent := disruption.IBMRequestTime.Time; !sent.IsZero() && s.params.Clock.Now().Before(sent.Add(WorkerStuckAfter)) {
+		// Deleting's own reason: the removal's reason (Resizing, ReplacingWorker) belongs to WorkerPoolReady and
+		// WorkersUpToDate, and would say that the pool is resized or a worker replaced while the deletion only waits.
+		reason := infrav1.IBMCloudManagedMachinePoolDeletingWaitingForWorkerRemovalReason
+		s.report(reason, fmt.Sprintf("IBM worker pool %s stays, and the %s removal of this pool asked IBM at %s to remove "+
+			"workers; their %d Nodes stay cordoned until IBM has removed them or %s passes, then CAPIBM reverts the cordons "+
+			"and removes the finalizer", s.Pool.Spec.PoolName, disruption.Operation, sent.UTC().Format(time.RFC3339), len(marked),
+			sent.Add(WorkerStuckAfter).UTC().Format(time.RFC3339)))
+		return 0, NotDone(IntervalPoolTransition, reason), false
+	}
+	helper := &drain.Helper{Client: workload, Clock: s.params.Clock, EvictionBudget: EvictionBudgetPerReconcile,
+		AnnotationPrefix: infrav1.NodeAnnotationPrefix}
+	for i := range marked {
+		if err := helper.Uncordon(ctx, &marked[i]); err != nil {
+			return 0, Transient(err), false
+		}
+	}
+	return s.dropOwnDrain(ctx, len(marked))
+}
+
+// dropOwnDrain releases the disruption token when this pool holds it and clears status.disruption: the last step of
+// releaseOwnDrain, which then lets the finalizer go.
+//
+// Parameters:
+//   - ctx is the reconcile context.
+//   - reverted is how many Nodes releaseOwnDrain reverted, passed through.
+func (s *MachinePoolScope) dropOwnDrain(ctx context.Context, reverted int) (int, Outcome, bool) {
+	if err := s.releaseToken(ctx); err != nil {
+		return 0, Transient(err), false
+	}
+	s.Pool.Status.Disruption = infrav1.WorkerDisruptionStatus{}
+	return reverted, Done(), true
+}
+
+// revertedNote is the part of the WorkerPoolNotRemoved event that says how many Nodes releaseOwnDrain reverted; "" for
+// none.
+//
+// Parameters:
+//   - reverted is that number.
+func revertedNote(reverted int) string {
+	if reverted == 0 {
+		return ""
+	}
+	return fmt.Sprintf("; CAPIBM reverted its cordon of %d Nodes of this pool's unfinished removal", reverted)
 }
 
 // disruptionToken returns the handle of the Cluster's disruption token for this pool.
@@ -359,6 +464,12 @@ func (r *poolRemoval) observation(ctx context.Context) (DisruptionObservation, e
 	if err != nil {
 		return DisruptionObservation{}, err
 	}
+	// The drain-owner markers of a pool that no longer exists hold no drain: they are left out of the gate, and the drain
+	// step takes them over on a Node of this pool.
+	owners, err := r.runner.drainingPools(ctx, r.token, r.allNodes)
+	if err != nil {
+		return DisruptionObservation{}, err
+	}
 	gate, err := r.check(false)
 	if err != nil {
 		return DisruptionObservation{}, err
@@ -386,7 +497,7 @@ func (r *poolRemoval) observation(ctx context.Context) (DisruptionObservation, e
 		Gates: DisruptionGates{
 			ClusterStateAllows: r.runner.clusterStateCheck().Allowed,
 			Disruption:         gate,
-			OtherDrainOwners:   OtherDrainOwners(r.allNodes, DrainOwner(r.s.Pool)),
+			OtherDrainOwners:   owners,
 		},
 		PreCallGate: preCall,
 		IBM:         RemovalProgress{Removing: slices.Contains(PoolNameReleasedStates(), r.pool.ActualState)},

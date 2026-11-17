@@ -27,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/cluster-api/util/conditions"
@@ -123,7 +124,7 @@ func (rec refusalRecord) read(pool *infrav1.IBMCloudManagedMachinePool) (Disrupt
 // this file). Create it with newRemovalRunner. The flow keeps its observation, its decision loop and the steps only it
 // has (the hand-over of a pool deletion; the victim correction and the abort of a scale-down). For the shared steps it
 // calls record, runDrain, disconnectedProgress, callIBM, sendCall, refusalHold and wait, and it builds the gates of its
-// DisruptionObservation with clusterStateCheck and preCallGate.
+// DisruptionObservation with clusterStateCheck, preCallGate and drainingPools.
 type removalRunner struct {
 	// s is the pool's scope.
 	s *MachinePoolScope
@@ -165,6 +166,10 @@ type removalRunner struct {
 	// (a clusterctl move or a lost status patch): the drain started before and is not announced again. The flow sets it
 	// once it knows.
 	resumed bool
+	// goneOwners are the drain-owner markers, found on Nodes of the workload cluster, that name a pool that no longer
+	// exists; drainingPools sets them in the flow's observation, and runDrain takes such a marker over on a victim Node
+	// (adoptGoneMarkers).
+	goneOwners []string
 	// drainResult is the drain observed in this reconcile; evicted tells whether it came from Evict.
 	drainResult *DrainStepResult
 	evicted     bool
@@ -349,9 +354,71 @@ func (r *removalRunner) disconnectedProgress() DrainProgress {
 	}
 }
 
+// drainingPools returns the other pools that still drain Nodes of the workload cluster (DisruptionToken.DrainingPools),
+// for the gate of the flow's observation, and keeps the drain-owner markers of the pools that no longer exist for the
+// drain step (goneOwners, adoptGoneMarkers). The gate passes over such a marker; the drain step must then not fail on
+// it either.
+//
+// Parameters:
+//   - ctx is the reconcile context; one read per other pool's marker.
+//   - token is the flow's handle of the Cluster's disruption token; it knows this pool and reads the other pools.
+//   - nodes are every Node of the workload cluster.
+//
+// It returns DrainingPools' error; the caller requeues.
+func (r *removalRunner) drainingPools(ctx context.Context, token *DisruptionToken, nodes []corev1.Node) ([]string, error) {
+	draining, err := token.DrainingPools(ctx, nodes)
+	if err != nil {
+		return nil, err
+	}
+	r.goneOwners = slices.DeleteFunc(OtherDrainOwners(nodes, DrainOwner(r.s.Pool)), func(owner string) bool {
+		return slices.Contains(draining, owner)
+	})
+	return draining, nil
+}
+
+// adoptGoneMarkers reverts, on every victim Node whose drain-owner marker names a pool that no longer exists
+// (goneOwners), what that pool recorded there: drain.Helper.Uncordon reverts only CAPIBM's own cordon and load-balancer
+// exclusion and removes the markers, so a cordon a human set stays. The drain step can then cordon the Node for this
+// pool; drain.Helper.Cordon refuses a Node another pool's marker is on (drain.ErrDrainOwnerConflict), which protects a
+// drain in flight, but a marker that outlived its pool protects nothing (a finalizer removed by hand, a status lost while
+// the workload cluster was not connected). Without this the removal would hold the Cluster's disruption token and fail
+// at its first cordon on every reconcile, without recording anything, and every other pool of the Cluster would wait
+// for the token. The Node's drain time limit then counts from this pool's cordon, since the old drain was never this
+// pool's. A drain that is excluded cordons nothing, so nothing is taken over.
+//
+// Parameters:
+//   - ctx is the reconcile context.
+//
+// It returns the error of an Uncordon; the caller requeues.
+func (r *removalRunner) adoptGoneMarkers(ctx context.Context) error {
+	if len(r.goneOwners) == 0 || r.knobs.ExcludeDraining {
+		return nil
+	}
+	helper := &drain.Helper{Client: r.workload, Clock: r.s.params.Clock, EvictionBudget: EvictionBudgetPerReconcile,
+		AnnotationPrefix: infrav1.NodeAnnotationPrefix}
+	key := infrav1.NodeAnnotationPrefix + drain.MarkerDrainOwner
+	for i := range r.victimNodes {
+		node := &r.victimNodes[i]
+		gone := node.Annotations[key]
+		if !slices.Contains(r.goneOwners, gone) {
+			continue
+		}
+		// Uncordon updates node on success, so the drain step patches the Node with its new resourceVersion.
+		if err := helper.Uncordon(ctx, node); err != nil {
+			return fmt.Errorf("taking over Node %s, whose drain-owner marker names IBMCloudManagedMachinePool %s, which no "+
+				"longer exists: %w", node.Name, gone, err)
+		}
+		ctrl.LoggerFrom(ctx).Info("Took over a Node whose drain-owner marker names a pool that no longer exists",
+			"Node", node.Name, "previousOwner", gone, "owner", DrainOwner(r.s.Pool))
+	}
+	return nil
+}
+
 // runDrain runs Evict (evict true) or Check on the victim Nodes and keeps the result. Without the drain step (a
 // workload cluster that is not connected, which only a removal that needs nothing from it gets this far without), it
-// touches nothing and keeps disconnectedProgress.
+// touches nothing and keeps disconnectedProgress. Every caller holds the Cluster's disruption token, so a victim Node
+// that carries the marker of a pool that no longer exists is taken over first (adoptGoneMarkers), also before a Check:
+// that pool's drain start must not decide this pool's drain time limit.
 //
 // Parameters:
 //   - ctx is the reconcile context.
@@ -360,6 +427,9 @@ func (r *removalRunner) runDrain(ctx context.Context, evict bool) error {
 	if r.drain == nil {
 		r.drainResult, r.evicted = &DrainStepResult{Progress: r.disconnectedProgress()}, r.evicted || evict
 		return nil
+	}
+	if err := r.adoptGoneMarkers(ctx); err != nil {
+		return err
 	}
 	var result DrainStepResult
 	var err error

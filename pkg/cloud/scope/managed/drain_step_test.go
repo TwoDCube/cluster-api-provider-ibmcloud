@@ -18,10 +18,13 @@ package managed
 
 import (
 	"context"
+	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -425,6 +428,88 @@ func TestDrainStepCheck(t *testing.T) {
 		g.Expect(f.calls.count("list pods")).To(BeZero(), "no RemainingPods once the step moved on")
 		g.Expect(f.events()).To(BeEmpty(), "the Warning was emitted in the Draining phase")
 	})
+}
+
+// TestDrainStepMessageIsBounded drains many victim Nodes at once, as the deletion of a large pool does: the Draining
+// message names the first Nodes in name order, counts the others and stays far below the CRD's limit of 32768
+// characters on a condition message. One block per Node passes that limit with the 130 Nodes here, whose evictions a
+// PodDisruptionBudget refuses, and the API server would then reject every status patch of the pool.
+func TestDrainStepMessageIsBounded(t *testing.T) {
+	victims := func(n int, withPods bool) ([]client.Object, map[string]error) {
+		objs := make([]client.Object, 0, 3*n)
+		refusals := map[string]error{}
+		for i := range n {
+			name := fmt.Sprintf("node-%03d", i)
+			objs = append(objs, victimNode(name, fmt.Sprintf("w%03d", i)))
+			if !withPods {
+				objs = append(objs, attachedVolume(name))
+				continue
+			}
+			for _, pod := range []string{"web-a-" + name, "web-b-" + name} {
+				objs = append(objs, workloadPod(pod, name))
+				refusals[pod] = pdbRefusal()
+			}
+		}
+		return objs, refusals
+	}
+	sortedNodes := func(t *testing.T, c client.Client) []corev1.Node {
+		t.Helper()
+		nodes := readNodes(t, c)
+		slices.SortFunc(nodes, func(a, b corev1.Node) int { return strings.Compare(a.Name, b.Name) })
+		return nodes
+	}
+	t.Run("130_Nodes_blocked_by_a_PodDisruptionBudget", func(t *testing.T) {
+		g := NewWithT(t)
+		objs, refusals := victims(130, true)
+		f := newDrainStepFixture(t, refusals, objs...)
+		result, err := f.step(t, DrainKnobs{}).Evict(context.Background(), sortedNodes(t, f.workload))
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(result.Progress).To(Equal(DrainProgress{Blocked: true}))
+		g.Expect(len(result.Message)).To(BeNumerically("<=", maxDrainMessageLength))
+		for _, named := range []string{"node-000", "node-001", "node-002"} {
+			g.Expect(result.Message).To(ContainSubstring("Node " + named + ": Drain not completed yet"))
+		}
+		g.Expect(result.Message).NotTo(ContainSubstring("node-003"))
+		g.Expect(result.Message).To(HaveSuffix("\nand 127 more Nodes are not drained yet"))
+		g.Expect(f.events()).To(ConsistOf(And(HavePrefix("Warning DrainBlocked"), HaveSuffix("and 127 more Nodes are not drained yet"))),
+			"the Warning carries the same bounded text")
+	})
+	t.Run("Nodes_with_attached_volumes", func(t *testing.T) {
+		g := NewWithT(t)
+		objs, _ := victims(5, false)
+		f := newDrainStepFixture(t, nil, objs...)
+		result, err := f.step(t, DrainKnobs{}).Check(context.Background(), sortedNodes(t, f.workload))
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(result.Progress).To(Equal(DrainProgress{Done: true}))
+		g.Expect(strings.Count(result.Message, "Waiting for Node volumes to be detached")).To(Equal(3))
+		g.Expect(result.Message).To(HavePrefix("Node node-000: "))
+		g.Expect(result.Message).NotTo(ContainSubstring("node-003"))
+		g.Expect(result.Message).To(HaveSuffix("\nand 2 more Nodes still have attached volumes"))
+	})
+	t.Run("as_many_Nodes_as_named_are_not_counted", func(t *testing.T) {
+		g := NewWithT(t)
+		lines := []string{"Node a: x", "Node b: y", "Node c: z"}
+		g.Expect(nodeLinesMessage(lines, "are not drained yet")).To(Equal("Node a: x\nNode b: y\nNode c: z"))
+		g.Expect(nodeLinesMessage(nil, "are not drained yet")).To(BeEmpty())
+	})
+}
+
+func TestTruncateMessage(t *testing.T) {
+	const marker = "\n... (cut to stay within the condition message limit)"
+	g := NewWithT(t)
+	g.Expect(truncateMessage("short", 100)).To(Equal("short"))
+	long := strings.Repeat("a", 200)
+	got := truncateMessage(long, 100)
+	g.Expect(got).To(HaveLen(100))
+	g.Expect(got).To(Equal(strings.Repeat("a", 100-len(marker)) + marker))
+	g.Expect(truncateMessage(long, 100)).To(Equal(got), "the same text is cut the same way")
+
+	// A multi-byte character across the cut is left out whole, so the message stays valid UTF-8.
+	multi := strings.Repeat("a", 100-len(marker)-1) + strings.Repeat("ü", 50)
+	got = truncateMessage(multi, 100)
+	g.Expect(utf8.ValidString(got)).To(BeTrue())
+	g.Expect(len(got)).To(BeNumerically("<=", 100))
+	g.Expect(got).To(Equal(strings.Repeat("a", 100-len(marker)-1) + marker))
 }
 
 func TestDrainBlockedEventDue(t *testing.T) {

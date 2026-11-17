@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/record"
@@ -62,6 +63,19 @@ const (
 // drainMessagePodsPerList is how many pods each line of a drain message names before "and N more": at most 3 pods per
 // category, so that the Draining message is deterministic and bounded.
 const drainMessagePodsPerList = 3
+
+// drainMessageNodes is how many Nodes the Draining message describes, in Node name order, before it counts the rest
+// ("and N more Nodes ..."). Every Node adds a block of several lines, and a pool deletion drains every Node of the pool
+// (the API allows 500 workers): without a bound across Nodes the message would outgrow the CRD's limit of 32768
+// characters on a condition message, the API server would reject every status patch of the pool, and DrainBlocked,
+// the signal an operator needs, would never reach status. The first Nodes are enough to see what blocks the drain.
+const drainMessageNodes = 3
+
+// maxDrainMessageLength bounds the Draining message in bytes, well below the CRD's limit of 32768 characters on a
+// condition message. drainMessageNodes, drainMessagePodsPerList and the drain library's limit on refusal reasons bound
+// the message's shape, but a refusal reason is the API server's text and a pod name may have 253 characters, so the
+// message is also cut at this length as a last resort (truncateMessage).
+const maxDrainMessageLength = 8192
 
 // DrainKnobs are the drain settings of a pool: the Cluster API fields of the owning MachinePool's machine template,
 // and the two exclusion annotations, which are honoured on the MachinePool template (steady setting) and on the
@@ -136,8 +150,8 @@ type DrainStepResult struct {
 	// Progress is the drain progress of the victims, for DisruptionObservation.Drain.
 	Progress DrainProgress
 	// Message is the Draining condition message: one line block per Node that still has pods or attached volumes, in
-	// Node name order; deterministic, so a repeated reconcile writes nothing new. "" when nothing is
-	// left.
+	// Node name order, for at most drainMessageNodes Nodes and then a count of the others, cut at
+	// maxDrainMessageLength; deterministic, so a repeated reconcile writes nothing new. "" when nothing is left.
 	Message string
 	// StartTime is the earliest drain-start-time marker of the victims (when the drain started); zero when none is
 	// recorded yet.
@@ -274,7 +288,7 @@ func (d *DrainStep) drainNodes(ctx context.Context, nodes []corev1.Node, evict b
 	}
 	result.Progress.Done = pending == 0 && timedOut == 0
 	result.Progress.TimedOut = pending == 0 && timedOut > 0
-	result.Message = strings.Join(lines, "\n")
+	result.Message = nodeLinesMessage(lines, "are not drained yet")
 	if evict && result.Progress.Blocked {
 		d.reportBlocked(result)
 	}
@@ -388,8 +402,42 @@ func (d *DrainStep) checkDetach(ctx context.Context, nodes []corev1.Node, result
 		}
 	}
 	result.Progress.VolumesDetached = len(lines) == 0
-	result.Message = strings.Join(lines, "\n")
+	result.Message = nodeLinesMessage(lines, "still have attached volumes")
 	return result, nil
+}
+
+// nodeLinesMessage joins the per-Node blocks of a drain message: the first drainMessageNodes blocks, then one line that
+// counts the other Nodes, so that the message stays the same size however many Nodes a removal drains, and the whole
+// text cut at maxDrainMessageLength. The blocks come in Node name order, so the same Nodes are named on every reconcile.
+//
+// Parameters:
+//   - lines are the blocks, one per Node that is not done, in Node name order.
+//   - pending says what the counted Nodes still have, for example "are not drained yet".
+func nodeLinesMessage(lines []string, pending string) string {
+	if len(lines) > drainMessageNodes {
+		more := len(lines) - drainMessageNodes
+		lines = append(slices.Clip(lines[:drainMessageNodes]), fmt.Sprintf("and %d more Nodes %s", more, pending))
+	}
+	return truncateMessage(strings.Join(lines, "\n"), maxDrainMessageLength)
+}
+
+// truncateMessage returns message when it has at most limit bytes, and otherwise its longest prefix that ends on a
+// character boundary and leaves room for a marker that says the rest was cut, followed by that marker. The result is
+// never longer than limit and depends only on message, so a repeated reconcile writes the same text.
+//
+// Parameters:
+//   - message is the text.
+//   - limit is the maximum length in bytes; it must exceed the marker's length.
+func truncateMessage(message string, limit int) string {
+	const marker = "\n... (cut to stay within the condition message limit)"
+	if len(message) <= limit {
+		return message
+	}
+	cut := limit - len(marker)
+	for cut > 0 && !utf8.RuneStart(message[cut]) {
+		cut--
+	}
+	return message[:cut] + marker
 }
 
 // RecordDrainPhaseChange emits the Normal events of a drain phase change: DrainStarted when a removal enters Draining

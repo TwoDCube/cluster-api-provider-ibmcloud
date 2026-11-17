@@ -723,6 +723,152 @@ func (f *runnerFixture) cordonAt(start time.Time, workerIDs ...string) {
 	f.calls.all()
 }
 
+// gonePoolDrainStart is when the drain of a pool that no longer exists started (cordonForGonePool), two hours before
+// poolTestNow, so that a drain time limit counted from it would have run out.
+var gonePoolDrainStart = poolTestNow.Add(-2 * time.Hour)
+
+// cordonForGonePool cordons Node name of workload and excludes it from load balancers as the drain of the pool named by
+// owner did at gonePoolDrainStart, with every marker of that drain: what a pool leaves on a Node when it goes mid-drain.
+//
+// Parameters:
+//   - t is the test.
+//   - workload is the workload cluster.
+//   - name is the Node.
+//   - owner is the drain-owner marker, "<namespace>/<pool>".
+func cordonForGonePool(t *testing.T, workload client.Client, name, owner string) {
+	t.Helper()
+	g := NewWithT(t)
+	node := &corev1.Node{}
+	g.Expect(workload.Get(context.Background(), client.ObjectKey{Name: name}, node)).To(Succeed())
+	helper := &drain.Helper{Client: workload, Clock: clocktesting.NewFakeClock(gonePoolDrainStart), EvictionBudget: time.Second,
+		AnnotationPrefix: infrav1.NodeAnnotationPrefix}
+	g.Expect(helper.Cordon(context.Background(), node, drain.CordonOptions{Owner: owner, ExcludeFromLoadBalancers: true})).To(Succeed())
+}
+
+// expectTakenOver checks that Node name of workload is cordoned and excluded from load balancers for pool's drain, which
+// started at start: every marker names pool's drain, none the drain of the pool that was there before.
+//
+// Parameters:
+//   - t is the test.
+//   - workload is the workload cluster.
+//   - name is the Node.
+//   - pool is the pool that drains the Node now.
+//   - start is when its drain of the Node started.
+func expectTakenOver(t *testing.T, workload client.Client, name string, pool *infrav1.IBMCloudManagedMachinePool, start time.Time) {
+	t.Helper()
+	g := NewWithT(t)
+	node := &corev1.Node{}
+	g.Expect(workload.Get(context.Background(), client.ObjectKey{Name: name}, node)).To(Succeed())
+	g.Expect(node.Spec.Unschedulable).To(BeTrue(), "Node %s stays cordoned", name)
+	g.Expect(node.Labels).To(HaveKeyWithValue(corev1.LabelNodeExcludeBalancers, "true"))
+	g.Expect(node.Annotations).To(Equal(map[string]string{
+		infrav1.NodeAnnotationPrefix + drain.MarkerDrainOwner:     DrainOwner(pool),
+		infrav1.NodeAnnotationPrefix + drain.MarkerDrainStartTime: start.UTC().Format(time.RFC3339),
+		infrav1.NodeAnnotationPrefix + drain.MarkerCordoned:       "true",
+		infrav1.NodeAnnotationPrefix + drain.MarkerExcludedFromLB: "true",
+	}), "the markers of Node %s are this pool's", name)
+}
+
+// TestRemovalRunnerAdoptsGoneMarkers checks how the drain step treats the drain-owner markers of other pools on its
+// victim Nodes: the marker of a pool that no longer exists is taken over, with that pool's cordon reverted first so that
+// the drain time limit counts from this pool's cordon; the marker of a pool that still exists is never touched, and
+// Cordon refuses that Node.
+func TestRemovalRunnerAdoptsGoneMarkers(t *testing.T) {
+	gone, live := poolTestNamespace+"/gone", poolTestNamespace+"/other"
+	// newRunner returns the fixture with pool "other" and the runner of the pool deletion of victims, whose Nodes it
+	// reads after prepare marked them.
+	newRunner := func(t *testing.T, victims []string, prepare func(f *runnerFixture)) (*runnerFixture, *removalRunner) {
+		t.Helper()
+		f := newRunnerFixture(t)
+		f.others = append(f.others, poolObject("other", "other"))
+		prepare(f)
+		r := f.runner(func(in *removalRunnerInput) {
+			in.victims = victims
+			in.victimNodes = VictimNodes(readNodes(t, f.workload), poolTestAccount, poolTestClusterID, victims)
+		})
+		return f, r
+	}
+	// observe runs the flow's part, the gate's read of the other pools' markers on every Node, and returns the pools that
+	// still drain.
+	observe := func(t *testing.T, f *runnerFixture, r *removalRunner) []string {
+		t.Helper()
+		token, err := f.scope().disruptionToken()
+		NewWithT(t).Expect(err).NotTo(HaveOccurred())
+		draining, err := r.drainingPools(context.Background(), token, readNodes(t, f.workload))
+		NewWithT(t).Expect(err).NotTo(HaveOccurred())
+		return draining
+	}
+	t.Run("the_marker_of_a_pool_that_no_longer_exists_is_taken_over_before_the_cordon", func(t *testing.T) {
+		g := NewWithT(t)
+		f, r := newRunner(t, []string{"w0", "w1"}, func(f *runnerFixture) { cordonForGonePool(t, f.workload, "10.0.0.1", gone) })
+		g.Expect(observe(t, f, r)).To(BeEmpty(), "the gate passes over it")
+		g.Expect(r.goneOwners).To(Equal([]string{gone}))
+		g.Expect(r.runDrain(context.Background(), true)).To(Succeed())
+		expectTakenOver(t, f.workload, "10.0.0.1", f.pool, poolTestNow)
+		expectTakenOver(t, f.workload, "10.0.0.2", f.pool, poolTestNow)
+		g.Expect(r.drainResult.StartTime).To(BeTemporally("==", poolTestNow), "the drain starts with this pool's cordon")
+		g.Expect(f.calls.count("evict")).To(Equal(2))
+	})
+	t.Run("a_Check_takes_it_over_too_so_that_the_old_drain_start_decides_nothing", func(t *testing.T) {
+		g := NewWithT(t)
+		f, r := newRunner(t, []string{"w0", "w1"}, func(f *runnerFixture) {
+			f.machinePool.Spec.Template.Spec.Deletion.NodeDrainTimeoutSeconds = ptr.To[int32](3600)
+			cordonForGonePool(t, f.workload, "10.0.0.1", gone)
+		})
+		observe(t, f, r)
+		g.Expect(r.runDrain(context.Background(), false)).To(Succeed())
+		g.Expect(r.drainResult.Progress.TimedOut).To(BeFalse(), "the gone pool's drain started two hours ago")
+		node := &corev1.Node{}
+		g.Expect(f.workload.Get(context.Background(), client.ObjectKey{Name: "10.0.0.1"}, node)).To(Succeed())
+		g.Expect(node.Spec.Unschedulable).To(BeFalse(), "the gone pool's cordon is reverted")
+		g.Expect(node.Annotations).To(BeEmpty())
+		g.Expect(node.Labels).NotTo(HaveKey(corev1.LabelNodeExcludeBalancers))
+		g.Expect(f.calls.count("evict")).To(BeZero())
+	})
+	t.Run("the_marker_of_a_pool_that_exists_is_left_and_Cordon_refuses_the_Node", func(t *testing.T) {
+		g := NewWithT(t)
+		f, r := newRunner(t, []string{"w0", "w1"}, func(f *runnerFixture) { cordonForGonePool(t, f.workload, "10.0.0.1", live) })
+		g.Expect(observe(t, f, r)).To(Equal([]string{live}))
+		g.Expect(r.goneOwners).To(BeEmpty())
+		g.Expect(r.runDrain(context.Background(), true)).To(MatchError(drain.ErrDrainOwnerConflict))
+		node := &corev1.Node{}
+		g.Expect(f.workload.Get(context.Background(), client.ObjectKey{Name: "10.0.0.1"}, node)).To(Succeed())
+		g.Expect(node.Annotations).To(HaveKeyWithValue(infrav1.NodeAnnotationPrefix+drain.MarkerDrainOwner, live))
+	})
+	t.Run("a_Node_that_is_no_victim_keeps_the_marker", func(t *testing.T) {
+		g := NewWithT(t)
+		f, r := newRunner(t, []string{"w0"}, func(f *runnerFixture) { cordonForGonePool(t, f.workload, "10.0.0.2", gone) })
+		observe(t, f, r)
+		g.Expect(r.runDrain(context.Background(), true)).To(Succeed())
+		node := &corev1.Node{}
+		g.Expect(f.workload.Get(context.Background(), client.ObjectKey{Name: "10.0.0.2"}, node)).To(Succeed())
+		g.Expect(node.Annotations).To(HaveKeyWithValue(infrav1.NodeAnnotationPrefix+drain.MarkerDrainOwner, gone))
+	})
+	t.Run("an_excluded_drain_cordons_nothing_and_takes_nothing_over", func(t *testing.T) {
+		g := NewWithT(t)
+		f, r := newRunner(t, []string{"w0", "w1"}, func(f *runnerFixture) {
+			f.machinePool.Spec.Template.Annotations = map[string]string{clusterv1.ExcludeNodeDrainingAnnotation: ""}
+			cordonForGonePool(t, f.workload, "10.0.0.1", gone)
+		})
+		observe(t, f, r)
+		f.calls.all()
+		g.Expect(r.runDrain(context.Background(), true)).To(Succeed())
+		g.Expect(f.calls.count("cordon")).To(BeZero())
+	})
+	t.Run("a_failed_revert_is_returned_and_names_the_Node_and_the_gone_pool", func(t *testing.T) {
+		g := NewWithT(t)
+		f, r := newRunner(t, []string{"w0", "w1"}, func(f *runnerFixture) { cordonForGonePool(t, f.workload, "10.0.0.1", gone) })
+		observe(t, f, r)
+		// The Node changed after this reconcile read it, so the revert's optimistic lock fails.
+		node := &corev1.Node{}
+		g.Expect(f.workload.Get(context.Background(), client.ObjectKey{Name: "10.0.0.1"}, node)).To(Succeed())
+		node.Labels["topology.kubernetes.io/zone"] = "us-south-1"
+		g.Expect(f.workload.Update(context.Background(), node)).To(Succeed())
+		g.Expect(r.runDrain(context.Background(), true)).To(MatchError(ContainSubstring("taking over Node 10.0.0.1, whose " +
+			"drain-owner marker names IBMCloudManagedMachinePool " + gone + ", which no longer exists")))
+	})
+}
+
 // TestRemovalRunnerCheckDrain checks the drain observation of a removal that can still be given up (the scale-down and
 // the replace): it never evicts, reads the Nodes only while this pool holds the token in a phase before the IBM call,
 // and falls back to the exclusions and the recorded drain start without the workload cluster.

@@ -26,6 +26,7 @@ import (
 	"go.uber.org/mock/gomock"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
@@ -228,6 +229,157 @@ func TestMachinePoolScopeDeleteOwners(t *testing.T) {
 	})
 }
 
+// leftDrain records a scale-down of w0 and w1 in phase that this pool started before another object claimed its IBM pool:
+// the Nodes of w0 and w1 carry this pool's cordon and drain-owner marker, and the pool holds the disruption token. A
+// zero sentAt records no IBM call.
+//
+// Parameters:
+//   - phase is the phase of the scale-down.
+//   - sentAt is when the scale-down's IBM call went out; zero for none.
+func (f *deleteFixture) leftDrain(phase infrav1.WorkerDisruptionPhase, sentAt time.Time) {
+	f.t.Helper()
+	f.others = append(f.others, heldLease(DisruptionTokenHolder(f.pool)))
+	f.pool.Status.Disruption = infrav1.WorkerDisruptionStatus{Operation: infrav1.WorkerDisruptionOperationScaleDown, Phase: phase,
+		WorkerIDs: []string{"w0", "w1"}, DrainStartTime: metav1.NewTime(poolTestNow.Add(-10 * time.Minute)),
+		IBMRequestTime: metav1.NewTime(sentAt)}
+	helper := &drain.Helper{Client: f.workload, Clock: f.clock, EvictionBudget: time.Second, AnnotationPrefix: infrav1.NodeAnnotationPrefix}
+	nodes := VictimNodes(readNodes(f.t, f.workload), poolTestAccount, poolTestClusterID, []string{"w0", "w1"})
+	for i := range nodes {
+		NewWithT(f.t).Expect(helper.Cordon(context.Background(), &nodes[i], drain.CordonOptions{Owner: DrainOwner(f.pool),
+			ExcludeFromLoadBalancers: true})).To(Succeed())
+	}
+	f.calls.all()
+}
+
+// TestMachinePoolScopeDeleteRevertsItsDrainForAClaimant deletes a pool that has a scale-down in flight while another
+// object claims the same IBM pool: the IBM pool stays with that object, so nothing would carry the scale-down on once
+// the finalizer is gone. Its cordons, load-balancer exclusions and drain-owner markers would otherwise stay on the Nodes
+// for good, and the marker would hold every worker removal of the Cluster. No IBM call and no credential resolution are
+// made (gomock fails on any IBM call).
+func TestMachinePoolScopeDeleteRevertsItsDrainForAClaimant(t *testing.T) {
+	newFixture := func(t *testing.T) *deleteFixture {
+		t.Helper()
+		f := newDeleteFixture(t, nil)
+		f.others = []client.Object{poolObject("workers-copy", "workers")}
+		return f
+	}
+	reverted := func(g Gomega, f *deleteFixture) {
+		g.Expect(f.cordoned()).To(BeEmpty())
+		for _, node := range readNodes(f.t, f.workload) {
+			g.Expect(node.Annotations).NotTo(HaveKey(infrav1.NodeAnnotationPrefix+drain.MarkerDrainOwner), node.Name)
+			g.Expect(node.Labels).NotTo(HaveKey(corev1.LabelNodeExcludeBalancers), node.Name)
+		}
+		g.Expect(f.lease()).To(BeNil(), "the token is released")
+		g.Expect(f.pool.Status.Disruption).To(Equal(infrav1.WorkerDisruptionStatus{}))
+		g.Expect(f.resolver.holders).To(BeEmpty())
+	}
+	t.Run("a_drain_before_the_IBM_call_is_reverted_at_once", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newFixture(t)
+		f.leftDrain(infrav1.WorkerDisruptionPhaseDraining, time.Time{})
+		outcome, remove := f.scope().ReconcileDelete(context.Background())
+		g.Expect(outcome).To(Equal(Done()))
+		g.Expect(remove).To(BeTrue())
+		reverted(g, f)
+		g.Expect(f.events()).To(ConsistOf("Warning WorkerPoolNotRemoved IBM worker pool workers stays: IBMCloudManagedMachinePool " +
+			"workers-copy still claims it; CAPIBM reverted its cordon of 2 Nodes of this pool's unfinished removal"))
+	})
+	t.Run("a_call_IBM_may_still_carry_out_is_waited_out", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newFixture(t)
+		sent := poolTestNow.Add(-5 * time.Minute)
+		f.leftDrain(infrav1.WorkerDisruptionPhaseWaitingForRemoval, sent)
+		outcome, remove := f.scope().ReconcileDelete(context.Background())
+		g.Expect(remove).To(BeFalse())
+		g.Expect(outcome).To(Equal(NotDone(IntervalPoolTransition,
+			infrav1.IBMCloudManagedMachinePoolDeletingWaitingForWorkerRemovalReason)))
+		g.Expect(f.cordoned()).To(Equal([]string{"10.0.0.1", "10.0.0.2"}), "IBM may still remove these workers")
+		g.Expect(f.lease()).NotTo(BeNil())
+		g.Expect(f.deleting().Status).To(Equal(metav1.ConditionTrue))
+		g.Expect(f.deleting().Reason).To(Equal(infrav1.IBMCloudManagedMachinePoolDeletingWaitingForWorkerRemovalReason),
+			"Deleting's own reason, not the scale-down's Resizing")
+		g.Expect(f.deleting().Message).To(Equal("IBM worker pool workers stays, and the ScaleDown removal of this pool asked IBM " +
+			"at 2026-11-16T11:55:00Z to remove workers; their 2 Nodes stay cordoned until IBM has removed them or " +
+			"2026-11-16T12:55:00Z passes, then CAPIBM reverts the cordons and removes the finalizer"))
+		g.Expect(f.events()).To(BeEmpty())
+
+		f.clock.SetTime(sent.Add(WorkerStuckAfter))
+		outcome, remove = f.scope().ReconcileDelete(context.Background())
+		g.Expect(outcome).To(Equal(Done()))
+		g.Expect(remove).To(BeTrue())
+		reverted(g, f)
+	})
+	t.Run("a_replace_IBM_may_still_carry_out_is_waited_out_with_the_same_reason", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newFixture(t)
+		f.leftDrain(infrav1.WorkerDisruptionPhaseWaitingForRemoval, poolTestNow.Add(-5*time.Minute))
+		f.pool.Status.Disruption.Operation = infrav1.WorkerDisruptionOperationReplace
+		outcome, remove := f.scope().ReconcileDelete(context.Background())
+		g.Expect(remove).To(BeFalse())
+		g.Expect(outcome).To(Equal(NotDone(IntervalPoolTransition,
+			infrav1.IBMCloudManagedMachinePoolDeletingWaitingForWorkerRemovalReason)))
+		g.Expect(f.deleting().Reason).To(Equal(infrav1.IBMCloudManagedMachinePoolDeletingWaitingForWorkerRemovalReason),
+			"Deleting's own reason, not the replace's ReplacingWorker")
+		g.Expect(f.deleting().Message).To(HavePrefix("IBM worker pool workers stays, and the Replace removal of this pool asked IBM"))
+	})
+	t.Run("the_wait_ends_once_IBM_removed_the_workers_and_their_Nodes", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newFixture(t)
+		f.leftDrain(infrav1.WorkerDisruptionPhaseWaitingForRemoval, poolTestNow.Add(-5*time.Minute))
+		for _, name := range []string{"10.0.0.1", "10.0.0.2"} {
+			g.Expect(f.workload.Delete(context.Background(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}})).To(Succeed())
+		}
+		outcome, remove := f.scope().ReconcileDelete(context.Background())
+		g.Expect(outcome).To(Equal(Done()))
+		g.Expect(remove).To(BeTrue())
+		reverted(g, f)
+		g.Expect(f.events()).To(ConsistOf("Warning WorkerPoolNotRemoved IBM worker pool workers stays: IBMCloudManagedMachinePool " +
+			"workers-copy still claims it"))
+	})
+	t.Run("without_the_workload_cluster_a_recorded_removal_waits", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newFixture(t)
+		f.leftDrain(infrav1.WorkerDisruptionPhaseDraining, time.Time{})
+		f.clusterCache = clustercache.NewFakeEmptyClusterCache()
+		outcome, remove := f.scope().ReconcileDelete(context.Background())
+		g.Expect(remove).To(BeFalse())
+		g.Expect(outcome).To(Equal(NotDone(IntervalGuarded, string(ReasonWaitingForWorkloadCluster))))
+		g.Expect(f.deleting().Message).To(Equal("IBM worker pool workers stays, and the ScaleDown removal of this pool is " +
+			"unfinished; CAPIBM reverts its cordons once the workload cluster is connected, and then removes the finalizer"))
+		g.Expect(f.lease()).NotTo(BeNil())
+	})
+	t.Run("without_the_workload_cluster_and_both_exclusions_the_finalizer_goes", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newFixture(t)
+		f.leftDrain(infrav1.WorkerDisruptionPhaseDraining, time.Time{})
+		f.clusterCache = clustercache.NewFakeEmptyClusterCache()
+		f.pool.Annotations = map[string]string{clusterv1.ExcludeNodeDrainingAnnotation: "", clusterv1.ExcludeWaitForNodeVolumeDetachAnnotation: ""}
+		outcome, remove := f.scope().ReconcileDelete(context.Background())
+		g.Expect(outcome).To(Equal(Done()))
+		g.Expect(remove).To(BeTrue())
+		g.Expect(f.lease()).To(BeNil())
+	})
+	t.Run("without_the_workload_cluster_and_no_recorded_removal_the_finalizer_goes", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newFixture(t)
+		f.clusterCache = clustercache.NewFakeEmptyClusterCache()
+		outcome, remove := f.scope().ReconcileDelete(context.Background())
+		g.Expect(outcome).To(Equal(Done()))
+		g.Expect(remove).To(BeTrue())
+	})
+	t.Run("a_Node_another_pool_cordoned_is_left_alone", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newFixture(t)
+		helper := &drain.Helper{Client: f.workload, Clock: f.clock, EvictionBudget: time.Second, AnnotationPrefix: infrav1.NodeAnnotationPrefix}
+		nodes := VictimNodes(readNodes(t, f.workload), poolTestAccount, poolTestClusterID, []string{"o0"})
+		g.Expect(helper.Cordon(context.Background(), &nodes[0], drain.CordonOptions{Owner: poolTestNamespace + "/other"})).To(Succeed())
+		outcome, remove := f.scope().ReconcileDelete(context.Background())
+		g.Expect(outcome).To(Equal(Done()))
+		g.Expect(remove).To(BeTrue())
+		g.Expect(f.cordoned()).To(Equal([]string{"10.0.1.1"}))
+	})
+}
+
 func TestMachinePoolScopeDeleteEnds(t *testing.T) {
 	t.Run("the IBM cluster is gone", func(t *testing.T) {
 		g := NewWithT(t)
@@ -285,7 +437,23 @@ func TestMachinePoolScopeDeleteEnds(t *testing.T) {
 		_, remove := f.scope().ReconcileDelete(context.Background())
 		g.Expect(remove).To(BeTrue())
 		g.Expect(f.events()).To(ConsistOf(ContainSubstring("Warning WorkerPoolNotRemoved IBM worker pool workers stays: it has flavor cx2.2x4")))
-		g.Expect(f.calls.all()).To(BeEmpty())
+		g.Expect(f.calls.all()).To(Equal([]string{"list nodes"}), "only this pool's own drain markers are looked for")
+	})
+	t.Run("a_pool_of_another_flavor_is_left_alone_after_this_pool's_drain_is_reverted", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newDeleteFixture(t, nil)
+		f.leftDrain(infrav1.WorkerDisruptionPhaseDraining, time.Time{})
+		foreign := ourPool("")
+		foreign.Flavor = "cx2.2x4"
+		f.ibm.EXPECT().GetCluster(gomock.Any(), poolTestClusterID, testResourceGroupID).Return(&kubernetesservice.Cluster{State: "normal"}, nil)
+		f.ibm.EXPECT().ListWorkerPools(gomock.Any(), poolTestClusterID).Return([]kubernetesservice.WorkerPool{foreign}, nil)
+		outcome, remove := f.scope().ReconcileDelete(context.Background())
+		g.Expect(outcome).To(Equal(Done()))
+		g.Expect(remove).To(BeTrue())
+		g.Expect(f.cordoned()).To(BeEmpty())
+		g.Expect(f.lease()).To(BeNil())
+		g.Expect(f.events()).To(ConsistOf(HaveSuffix("so it is not this object's pool; CAPIBM reverted its cordon of 2 Nodes of this " +
+			"pool's unfinished removal")))
 	})
 	t.Run("a failed listing is classified", func(t *testing.T) {
 		g := NewWithT(t)
@@ -415,6 +583,59 @@ func TestMachinePoolScopeDeleteGates(t *testing.T) {
 			g.Expect(f.cordoned()).To(BeEmpty())
 		})
 	}
+}
+
+// TestMachinePoolScopeDeleteDrainOwnerMarkers checks the pool deletion's gate on other pools' drain-owner markers: a
+// marker whose pool exists holds the deletion, as a drain half done before a clusterctl move must; the marker of a pool
+// that no longer exists holds nothing, or one deleted mid-drain would hold every removal of the Cluster for good.
+func TestMachinePoolScopeDeleteDrainOwnerMarkers(t *testing.T) {
+	markOtherNode := func(f *deleteFixture, owner string) {
+		f.t.Helper()
+		helper := &drain.Helper{Client: f.workload, Clock: f.clock, EvictionBudget: time.Second, AnnotationPrefix: infrav1.NodeAnnotationPrefix}
+		nodes := VictimNodes(readNodes(f.t, f.workload), poolTestAccount, poolTestClusterID, []string{"o0"})
+		NewWithT(f.t).Expect(helper.Cordon(context.Background(), &nodes[0], drain.CordonOptions{Owner: owner})).To(Succeed())
+		f.calls.all()
+	}
+	t.Run("the_marker_of_a_live_pool_defers", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newDeleteFixture(t, nil)
+		f.others = []client.Object{poolObject("other", "other")}
+		markOtherNode(f, poolTestNamespace+"/other")
+		f.expectIBM(ourPool(""))
+		outcome, remove := f.scope().ReconcileDelete(context.Background())
+		g.Expect(remove).To(BeFalse())
+		g.Expect(outcome).To(Equal(NotDone(IntervalGuarded, string(ReasonWaitingForDisruptionToken))))
+		g.Expect(f.deleting().Message).To(Equal("Nodes are still drained by IBMCloudManagedMachinePool capi-managed/other; " +
+			"one worker removal runs at a time"))
+		g.Expect(f.cordoned()).To(Equal([]string{"10.0.1.1"}))
+	})
+	t.Run("the_marker_of_a_pool_that_is_gone_holds_nothing", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newDeleteFixture(t, nil)
+		markOtherNode(f, poolTestNamespace+"/gone")
+		f.expectIBM(ourPool(""))
+		outcome, remove := f.scope().ReconcileDelete(context.Background())
+		g.Expect(remove).To(BeFalse())
+		g.Expect(outcome).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNodes))))
+		g.Expect(f.cordoned()).To(Equal([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.1.1"}))
+	})
+	// A pool that claimed the same IBM pool went mid-drain without reverting its cordons (its finalizer removed by hand):
+	// its marker on a Node of this pool holds nothing, and the deletion drains that Node as its own.
+	t.Run("a_Node_of_this_pool_marked_by_a_pool_that_is_gone_is_drained_for_this_pool", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newDeleteFixture(t, nil)
+		f.machinePool.Spec.Template.Spec.Deletion.NodeDrainTimeoutSeconds = ptr.To[int32](3600)
+		cordonForGonePool(t, f.workload, "10.0.0.1", poolTestNamespace+"/gone")
+		f.expectIBM(ourPool(""))
+		outcome, remove := f.scope().ReconcileDelete(context.Background())
+		g.Expect(remove).To(BeFalse())
+		g.Expect(outcome).To(Equal(NotDone(IntervalDrainRetry, string(ReasonDrainingNodes))))
+		expectTakenOver(t, f.workload, "10.0.0.1", f.pool, poolTestNow)
+		g.Expect(f.lease().Spec.HolderIdentity).To(Equal(ptr.To(DisruptionTokenHolder(f.pool))))
+		g.Expect(f.pool.Status.Disruption.Phase).To(Equal(infrav1.WorkerDisruptionPhaseDraining))
+		g.Expect(f.pool.Status.Disruption.DrainStartTime.Time).To(BeTemporally("==", poolTestNow))
+		g.Expect(f.deleting().Reason).To(Equal(string(ReasonDrainingNodes)))
+	})
 }
 
 // expectIBMIn expects the IBM reads of one delete reconcile, like expectIBM, with the IBM cluster in state.
