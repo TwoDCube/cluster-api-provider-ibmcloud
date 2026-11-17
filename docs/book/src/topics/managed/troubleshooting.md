@@ -269,6 +269,15 @@ replacement then waits in `WaitingForReplacement` until the workload cluster is 
 workload cluster (network, CBR rules, a valid kubeconfig Secret), or, if the pool can go, remove the whole pool with
 the annotations above.
 
+## A deletion is rejected
+
+* "delete Cluster <name> instead; ...": the control plane or the `IBMCloudManagedCluster` was deleted on its own while
+  its `Cluster` lives. Delete the `Cluster` instead ([Deleting a cluster](./deleting.md)).
+* "leave this deletion to Cluster API: ...": the `Cluster` is being deleted, and its control plane still needs the
+  `IBMCloudManagedCluster` to delete the IBM cluster. Nothing needs to be done: Cluster API deletes the
+  `IBMCloudManagedCluster` once the control plane is gone. `kubectl delete -f` and GitOps prunes, which delete every
+  object at once, report this for that one object.
+
 ## Pool objects stuck in Terminating
 
 * The last pool: `WaitingForClusterMinimum`; add another pool or delete the Cluster

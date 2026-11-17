@@ -20,16 +20,28 @@ Cluster API deletes the `MachinePool`s first, then the control plane, then the `
 3. **`IBMCloudManagedCluster`**: nothing to do in IBM Cloud; it never created anything.
 
 Do **not** delete the `IBMCloudManagedControlPlane` or the `IBMCloudManagedCluster` on their own. The validating webhooks
-reject that while their `Cluster` exists and is not being deleted:
+reject that while their `Cluster` exists and is not being deleted, whether the `ManagedKubernetes` feature gate is on or
+off, because a deletion cannot be taken back: a control plane keeps its finalizer and CAPIBM carries out its deletion
+once the gate is on again, while the `IBMCloudManagedCluster`, which has no finalizer, goes at once and leaves the
+control plane unable to manage or delete its IBM cluster. The rejections read:
 
 * control plane: "delete Cluster <name> instead; deleting the control plane alone would delete the IBM cluster";
 * `IBMCloudManagedCluster`: "delete Cluster <name> instead; IBMCloudManagedControlPlane/<cp> still needs this
   IBMCloudManagedCluster to manage and delete its IBM cluster".
 
-Both are allowed when the `Cluster` is being deleted or is gone, during `clusterctl move`, and while no IBM cluster can
-exist yet; the `IBMCloudManagedCluster` also when the `Cluster` no longer references it. If a control plane is deleted
-alone anyway (the webhook does not guard deletes while the feature gate is off), CAPIBM waits until all `MachinePool`s
-of its Cluster are gone (`WaitingForWorkersDeletion`) and deletes nothing before that.
+The control plane's deletion is allowed when the `Cluster` is being deleted or is gone, during `clusterctl move`, and
+while no IBM cluster can exist yet. The `IBMCloudManagedCluster`'s deletion is allowed during `clusterctl move`, when the
+`Cluster` is gone or no longer references it, and when its control plane is gone or cannot have an IBM cluster yet.
+
+While the `Cluster` is being deleted, the `IBMCloudManagedCluster` stays until its control plane is gone, because the
+control plane needs its resource group to prove which IBM cluster to delete; Cluster API itself deletes it only after
+the control plane. A tool that deletes every object at once, such as `kubectl delete -f` on the cluster's manifest or a
+GitOps prune, gets "leave this deletion to Cluster API: Cluster <name> is being deleted, and
+IBMCloudManagedControlPlane/<cp> still needs this IBMCloudManagedCluster to delete IBM cluster <id>; ..." for that one
+object. Nothing needs to be done: the rest of the deletion goes on, and the `IBMCloudManagedCluster` goes last.
+
+If a control plane is deleted without its `Cluster` anyway, CAPIBM waits until all `MachinePool`s of its Cluster are
+gone (`WaitingForWorkersDeletion`) and deletes nothing before that.
 
 Pool deletions are never rejected; see [Worker pools](./worker-pools.md#removing-a-pool).
 

@@ -7,7 +7,9 @@
 Managed Kubernetes support is **experimental**. Its API is `v1alpha1` and can change between releases, and it runs
 only when the `ManagedKubernetes` feature gate is on (Alpha, off by default; see
 [Prerequisites](./prerequisites.md#enable-the-feature-gate)). Clusters with a private-only master endpoint are
-**not verified** yet.
+verified for IKS with the management cluster inside the cluster's VPC; private-only OpenShift clusters, and private
+connectivity from outside the VPC, are **not verified** yet
+([Private-only clusters](./creating-a-cluster.md#private-only-clusters)).
 
 </aside>
 

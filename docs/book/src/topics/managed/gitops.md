@@ -120,8 +120,10 @@ example one created with the IBM Cloud CLI:
 Remove the cluster's objects from Git, or delete the `Cluster`. The validating webhooks reject a deletion of the
 `IBMCloudManagedControlPlane` or of the `IBMCloudManagedCluster` **alone** while their `Cluster` exists and is not
 being deleted ("delete Cluster <name> instead; ..."), because deleting the control plane deletes the IBM cluster. When a
-tool prunes everything at once, these two rejections last only until the `Cluster`'s deletion has started; the next
-sync succeeds. See [Deleting a cluster](./deleting.md).
+tool prunes everything at once, the control plane's rejection lasts only until the `Cluster`'s deletion has started.
+The `IBMCloudManagedCluster`'s lasts until the control plane has deleted the IBM cluster and is gone ("leave this
+deletion to Cluster API: ..."), because the control plane needs it for that. Cluster API then deletes it by itself, so
+a later sync finds nothing left to prune. See [Deleting a cluster](./deleting.md).
 
 ## Unsafe sync settings
 

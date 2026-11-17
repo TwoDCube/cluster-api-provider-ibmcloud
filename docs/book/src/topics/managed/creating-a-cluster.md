@@ -182,9 +182,15 @@ Custom ranges cannot be shared between clusters, so a fixed range in a template 
 
 ## Private-only clusters
 
-`spec.endpoints.publicServiceEndpoint: Disabled` creates a cluster without a public master endpoint. This is **not
-verified** yet. The management cluster must then reach the private master URL. The setting is immutable: IBM cannot
-switch a cluster between public and private-only.
+`spec.endpoints.publicServiceEndpoint: Disabled` creates a cluster without a public master endpoint. The management
+cluster must then reach the private master URL (VPN, Direct Link, Transit Gateway, or running inside IBM Cloud;
+[Prerequisites](./prerequisites.md#network)). The setting is immutable: IBM cannot switch a cluster between public and
+private-only.
+
+Verified on IBM Cloud: a private-only IKS cluster created, managed and deleted by CAPIBM running on an IKS management
+cluster in another zone and subnet of the same VPC. IBM's `masterURL` named the private service endpoint with its port,
+and the management cluster reached it without any security group rule added for it. Private-only OpenShift clusters,
+and management clusters that reach the private URL from outside the VPC, are **not verified** yet.
 
 ## ROKS specifics
 

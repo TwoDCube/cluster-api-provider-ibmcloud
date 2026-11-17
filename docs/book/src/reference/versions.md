@@ -212,7 +212,8 @@ The kinds `IBMCloudManagedControlPlane` (`controlplane.cluster.x-k8s.io`), `IBMC
   **Cluster API v1.14.1 or later** (CAPIBM's ClusterCache for managed clusters relies on a fix released in v1.14.1).
 - Cluster API's `MachinePool` feature must be enabled (Beta, on by default).
 - The workload cluster versions are IBM's: the IKS Kubernetes minors and the OpenShift minors that IBM Cloud offers.
-  Clusters with a private-only master endpoint are not verified yet.
+  Clusters with a private-only master endpoint are verified for IKS with the management cluster inside the cluster's
+  VPC; private-only OpenShift clusters, and private connectivity from outside the VPC, are not verified yet.
 - `v1alpha1` stays until IBM Cloud confirms the behaviours that `pkg/cloud/scope/managed/assumptions.go` marks as not
   yet verified, the end-to-end tests have passed for IKS and ROKS for four consecutive weeks, one release has collected
   user feedback, CAPIBM requires a Cluster API release that reads `status.initialization.provisioned` of machine pools,

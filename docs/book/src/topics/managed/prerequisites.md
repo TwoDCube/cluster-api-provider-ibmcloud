@@ -27,9 +27,12 @@ The manifest passes the variable to the manager as `--feature-gates=ManagedKuber
 `clusterctl init` also installs the kubeadm bootstrap and control plane providers by default; managed clusters do not
 use them and they stay idle.
 
-With the gate off, the CRDs are still installed and the managed webhooks still run, but they reject only **create**
-requests, with a message that names `EXP_MANAGED_KUBERNETES`; existing objects stay updatable and deletable. No managed
-controller runs.
+With the gate off, the CRDs are still installed and the managed webhooks still run. For the gate they reject only
+**create** requests, with a message that names `EXP_MANAGED_KUBERNETES`; existing objects stay updatable, and their
+deletions pass the same checks as with the gate on, because a deletion cannot be taken back: a control plane keeps its
+finalizer and CAPIBM carries out its deletion once the gate is on again, while the `IBMCloudManagedCluster`, which has
+no finalizer, goes at once and leaves the control plane unable to manage or delete its IBM cluster
+([Deleting a cluster](./deleting.md)). No managed controller runs.
 
 <aside class="note warning">
 
