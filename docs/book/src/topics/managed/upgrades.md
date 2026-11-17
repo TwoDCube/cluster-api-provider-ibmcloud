@@ -181,6 +181,15 @@ The HA flavors (3 zones × 2 workers) need no extra worker. Expect a pool of N w
 time + 6 minutes); the next worker starts only after the replacement is deployed, healthy and its Node has been `Ready`
 for `minReadySeconds`.
 
+On IKS, a worker also drains only while its zone holds at least **2 workers** of any pool. Each zone's Ingress ALB
+runs 2 replicas, at most one per worker ([Topology](./topology.md#ibms-ha-topology-3-zones--2-workers-per-zone)), and
+IBM's PodDisruptionBudget for it keeps one available: in a zone with 1 worker only one replica runs, its eviction is
+refused, and the drain stays `DrainBlocked` ("... the disruption budget public-cr<cluster ID>-alb1 needs 1 healthy
+pods and has 1 currently") until you set `nodeDrainTimeoutSeconds` in the `MachinePool`'s `spec.template.spec.deletion`
+([drain settings](./worker-pools.md#drain-settings)). After that time CAPIBM continues without the eviction, and the
+zone has no running ALB replica until the replacement is up. To roll a pool of 1 worker per zone without that, first
+add a second pool with a worker in each of its zones.
+
 ## Progress and blockers
 
 While a rollout runs, `WorkersUpToDate` carries the step (`DrainingNode`, `ReplacingWorker`, `WaitingForReplacement`)
