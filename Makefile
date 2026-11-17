@@ -214,9 +214,8 @@ generate-templates: $(KUSTOMIZE) ## Generate cluster templates
 generate-e2e-templates: $(KUSTOMIZE) ## Generate E2E cluster templates
 	$(KUSTOMIZE) build $(E2E_TEMPLATES)/cluster-template-powervs-md-remediation --load-restrictor LoadRestrictionsNone > $(E2E_TEMPLATES)/cluster-template-powervs-md-remediation.yaml
 	$(KUSTOMIZE) build $(E2E_TEMPLATES)/cluster-template-vpc --load-restrictor LoadRestrictionsNone > $(E2E_TEMPLATES)/cluster-template-vpc.yaml
-# The managed (IKS and ROKS) e2e templates are copies of the rendered flavor templates, never kustomize builds:
-# kustomize build drops the YAML comments and the quotes they need (templates/README.md); without its quotes a
-# distributionVersion such as 1.36 becomes a YAML float that the CRD rejects.
+# The managed (IKS and ROKS) e2e templates are plain copies of the hand-written flavor templates, so the e2e tests
+# create exactly what users get; a kustomize build would drop the quotes they need (templates/README.md).
 	cp $(TEMPLATES_DIR)/cluster-template-managed-iks.yaml $(E2E_TEMPLATES)/cluster-template-managed-iks.yaml
 	cp $(TEMPLATES_DIR)/cluster-template-managed-roks-single-zone.yaml $(E2E_TEMPLATES)/cluster-template-managed-roks-single-zone.yaml
 

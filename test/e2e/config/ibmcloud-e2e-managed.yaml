@@ -46,9 +46,8 @@ providers:
         files:
           - sourcePath: "${PWD}/metadata.yaml"
             targetName: "metadata.yaml"
-          # Copies of the rendered flavor templates (make generate-e2e-templates), never kustomize builds: kustomize
-          # drops the comments and the quotes these templates need (an unquoted distributionVersion such as 1.36 becomes
-          # a YAML float that the CRD rejects).
+          # Plain copies of the hand-written flavor templates in templates/ (make generate-e2e-templates), so the
+          # tests create exactly what users get; a kustomize build would drop the quotes these templates need.
           - sourcePath: "${PWD}/test/e2e/data/templates/cluster-template-managed-iks.yaml"
             targetName: "cluster-template-managed-iks.yaml"
           - sourcePath: "${PWD}/test/e2e/data/templates/cluster-template-managed-roks-single-zone.yaml"
