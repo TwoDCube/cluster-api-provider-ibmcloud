@@ -98,6 +98,14 @@ func (m Minor) Compare(other Minor) int {
 // Next returns the following minor of the same major ("1.36" → "1.37", "4.21" → "4.22"), the only step IBM allows for
 // a master update. It never moves to a new major: a new major is a new product line that IBM announces on its own
 // terms, and the controllers must not guess its first minor.
+//
+// TODO: Next assumes that the version after a minor is the next minor of IBM's /versions list. That stops holding with
+// OpenShift 5.0: from OpenShift 4.22 a cluster can move to 4.23 or to 5.0, so the upgrades form a graph per cluster.
+// IBM is developing a per-cluster upgrade-path endpoint (GraphQL, currently
+// https://containers.cloud.ibm.com/unsafe/graphql) that lists the versions a given cluster can move to. Once it is
+// stable, the master version step, its skip rule and messages, and the admission webhook should ask it for the
+// allowed next versions instead of calling Next, and the version listing should move to it as well. The same endpoint
+// is also the way to see a master patch that IBM offers but has not applied, which /versions cannot show.
 func (m Minor) Next() Minor {
 	return Minor{Major: m.Major, Minor: m.Minor + 1}
 }
