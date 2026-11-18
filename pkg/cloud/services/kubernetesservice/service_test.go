@@ -663,8 +663,8 @@ func TestDeleteCluster(t *testing.T) {
 			service, limiter := newTestService(t, fake)
 			err := service.DeleteCluster(context.Background(), testIKSClusterID, testResourceGroupID, storage)
 			g.Expect(err).To(MatchError(ErrInvalidRequest))
-			g.Expect(err.Error()).To(ContainSubstring(fmt.Sprintf(`DeleteCluster: the persistent storage choice %q is neither `+
-				`"Retain" nor "Delete"; pass the IBMCloudManagedControlPlane's spec.deletion.persistentStorage`, storage)))
+			g.Expect(err.Error()).To(ContainSubstring(`DeleteCluster: the persistent storage choice "` + string(storage) +
+				`" is neither "Retain" nor "Delete"; pass the IBMCloudManagedControlPlane's spec.deletion.persistentStorage`))
 			g.Expect(fake.received()).To(BeEmpty())
 			g.Expect(limiter.count()).To(BeZero())
 		})
