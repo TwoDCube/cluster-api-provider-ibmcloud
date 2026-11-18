@@ -265,6 +265,43 @@ func TestControlPlaneClassifyCall(t *testing.T) {
 	}
 }
 
+// TestCredentialsRejection checks the start of every message about a call of class ClassUnauthorized: it tells IBM
+// Cloud Kubernetes Service's 401 apart from the IAM token service's refusal and names IAM's status, also when the
+// refusal is wrapped, and only when kubernetesservice kept it.
+func TestCredentialsRejection(t *testing.T) {
+	const identity, action = "the CAPIBM controller identity", "listing the workers of IBM cluster dev"
+	testCases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "IBM Cloud Kubernetes Service answered 401",
+			err:  &kubernetesservice.APIError{Operation: kubernetesservice.OpListWorkers, StatusCode: http.StatusUnauthorized},
+			want: "IBM Cloud rejected the credentials of the CAPIBM controller identity with HTTP 401 while listing the workers of IBM cluster dev"},
+		{name: "IAM refused a deleted API key with 400", err: iamRejected(kubernetesservice.OpListWorkers),
+			want: "The IAM token service of IBM Cloud rejected the credentials of the CAPIBM controller identity with HTTP 400 " +
+				"while listing the workers of IBM cluster dev, so the request was not sent"},
+		{name: "IAM refused with 403",
+			err: &kubernetesservice.CredentialsRejectedError{Operation: kubernetesservice.OpListWorkers, IAMStatus: http.StatusForbidden},
+			want: "The IAM token service of IBM Cloud rejected the credentials of the CAPIBM controller identity with HTTP 403 " +
+				"while listing the workers of IBM cluster dev, so the request was not sent"},
+		{name: "a wrapped IAM refusal keeps its status",
+			err: fmt.Errorf("listing the workers: %w", iamRejected(kubernetesservice.OpListWorkers)),
+			want: "The IAM token service of IBM Cloud rejected the credentials of the CAPIBM controller identity with HTTP 400 " +
+				"while listing the workers of IBM cluster dev, so the request was not sent"},
+		{name: "an IAM refusal without its status", err: fmt.Errorf("%w: ListWorkers", kubernetesservice.ErrCredentialsRejected),
+			want: "The IAM token service of IBM Cloud rejected the credentials of the CAPIBM controller identity while listing " +
+				"the workers of IBM cluster dev, so the request was not sent"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(kubernetesservice.Classify(kubernetesservice.OpListWorkers, tc.err)).To(Equal(kubernetesservice.ClassUnauthorized))
+			g.Expect(credentialsRejection(identity, action, tc.err)).To(Equal(tc.want))
+		})
+	}
+}
+
 // iamRejected returns the error of a call of op that the IAM token service refused before it was sent, as
 // kubernetesservice returns it: IAM answers 400 for a deleted API key. op is the operation.
 func iamRejected(op kubernetesservice.Operation) error {
