@@ -171,9 +171,11 @@ func TestClusterServiceDeleteCluster(t *testing.T) {
 		storage   kubernetesservice.PersistentStorage
 		wantQuery string
 	}{
-		// The janitor asks IBM to keep the persistent storage of stale clusters; the inventory diff reports what IBM leaves.
+		// No e2e deletion keeps the storage, but the client maps both choices of IBM's API, so that Retain never falls
+		// through to IBM's default.
 		{name: "Retain asks IBM to keep the storage", storage: kubernetesservice.RetainPersistentStorage, wantQuery: "deleteResources=false"},
-		// The backstop asks IBM to delete the storage of the run's own clusters, so that a run leaves no volumes behind.
+		// The janitor and the backstop ask IBM to delete the storage of every e2e cluster they delete, so that no run
+		// leaves billed volumes behind.
 		{name: "Delete asks IBM to delete the storage", storage: kubernetesservice.DeletePersistentStorage, wantQuery: "deleteResources=true"},
 	}
 	for _, tc := range testCases {

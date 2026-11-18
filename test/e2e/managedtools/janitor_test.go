@@ -68,11 +68,13 @@ func TestRunJanitorDeletesOnlyStalePrefixedClustersByID(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	// Exactly the two stale prefixed clusters, each addressed by its ID.
 	g.Expect(fake.deletes()).To(ConsistOf("/global/v1/clusters/c0stale1aaaaaaaaaaaa", "/global/v1/clusters/c0stale2aaaaaaaaaaaa"))
-	// The janitor asks IBM to keep the persistent storage: its selection by prefix and age proves less than the
-	// backstop's.
-	g.Expect(fake.deleteQueries()).To(Equal([]string{"deleteResources=false", "deleteResources=false"}))
-	g.Expect(report.PersistentStorage).To(Equal(kubernetesservice.RetainPersistentStorage))
-	g.Expect(report.String()).NotTo(ContainSubstring("persistent storage"))
+	// The janitor asks IBM to delete the persistent storage of the stale clusters too, like the backstop for the run's
+	// own clusters, and its report says that it asked, not that IBM deleted it.
+	g.Expect(fake.deleteQueries()).To(Equal([]string{"deleteResources=true", "deleteResources=true"}))
+	g.Expect(report.PersistentStorage).To(Equal(kubernetesservice.DeletePersistentStorage))
+	for _, deleted := range []string{`capibm-e2e-old111-iks \(ID c0stale1aaaaaaaaaaaa`, `capibm-e2e-old222-roks \(ID c0stale2aaaaaaaaaaaa`} {
+		g.Expect(report.String()).To(MatchRegexp(`(?m)^deleted ` + deleted + `, created [^)]+\), asking IBM to delete its persistent storage$`))
+	}
 	for _, path := range fake.deletes() {
 		for _, cluster := range janitorFixture() {
 			g.Expect(path).NotTo(HaveSuffix("/"+cluster["name"].(string)), "a DELETE addressed a cluster by name")
@@ -350,14 +352,14 @@ func TestExecutePlanRefusesAPlanWithoutAStorageChoice(t *testing.T) {
 	}
 }
 
-// TestPlansChooseThePersistentStorage locks which plan asks IBM to delete the persistent storage: the backstop's plan of
-// the run's own clusters asks IBM to delete it, the janitor's plan of stale clusters to keep it, also when they select
-// nothing.
+// TestPlansChooseThePersistentStorage locks that both plans ask IBM to delete the persistent storage of the clusters
+// they delete: the backstop's plan of the run's own clusters and the janitor's plan of stale clusters alike, also when
+// they select nothing, so that no e2e deletion leaves billed volumes behind.
 func TestPlansChooseThePersistentStorage(t *testing.T) {
 	g := NewWithT(t)
 	stale, err := PlanStaleClusters(nil, DefaultNamePrefix, JanitorMinimumAge, janitorNow)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(stale.PersistentStorage).To(Equal(kubernetesservice.RetainPersistentStorage))
+	g.Expect(stale.PersistentStorage).To(Equal(kubernetesservice.DeletePersistentStorage))
 	run, err := PlanRunClusters(nil, []string{"capibm-e2e-abc123-iks"}, janitorNow)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(run.PersistentStorage).To(Equal(kubernetesservice.DeletePersistentStorage))

@@ -59,18 +59,22 @@ type DeletionPlan struct {
 	// Skipped are the matching clusters that stay.
 	Skipped []SkippedCluster
 	// PersistentStorage is what each DELETE asks IBM to do with the persistent storage of every cluster in Delete.
-	// PlanRunClusters sets Delete: the run's own clusters are test clusters, and their volumes must not outlive them
-	// (IBM's documentation conflicts on whether VPC Block volumes go even then). PlanStaleClusters sets Retain: it
-	// selects by a name prefix and an age only, weaker evidence than the run's whole names and start time, and a
-	// deleted volume cannot be recovered, so a cluster it deletes by mistake keeps its data. ExecutePlan refuses a plan
-	// with any other value.
+	// Both plans set Delete, because every cluster they select is an e2e test cluster whose volumes must not outlive
+	// it (IBM's documentation conflicts on whether VPC Block volumes go even then). For PlanStaleClusters this matters
+	// most: the janitor runs before the lane takes its inventory baseline, so storage it kept for a crashed run's
+	// cluster would never show in any leftover check and would stay billed until someone found it by hand. The price
+	// is that a cluster the janitor deletes by mistake loses its volumes too, which cannot be undone; the selection
+	// (the e2e name prefix, an age beyond the longest lane, the Boskos lease that holds the account for one managed run
+	// at a time, and E2E_MANAGED_JANITOR=false for an account shared with other runs) is what guards against that. The
+	// choice stays explicit in the plan, rather than implied by ExecutePlan, so that the report says what each DELETE
+	// asked and ExecutePlan can refuse a plan that names neither Retain nor Delete.
 	PersistentStorage kubernetesservice.PersistentStorage
 }
 
 // PlanStaleClusters selects the clusters a crashed or interrupted run left behind: the name starts with
 // "<prefix>-", IBM's createdDate is at least minAge before now, and the cluster is not already being deleted.
-// A cluster whose createdDate does not parse stays (fail safe). The plan asks IBM to keep the persistent storage of the
-// clusters it deletes (see DeletionPlan.PersistentStorage).
+// A cluster whose createdDate does not parse stays (fail safe). The plan asks IBM to delete the persistent storage of
+// the clusters it deletes too, like the run's own deletions (see DeletionPlan.PersistentStorage).
 //
 // Parameters:
 //   - clusters is a ListClusters result.
@@ -86,7 +90,7 @@ func PlanStaleClusters(clusters []Cluster, prefix string, minAge time.Duration, 
 		return DeletionPlan{}, fmt.Errorf("janitor minimum age %s is shorter than %s: the janitor deletes only clusters "+
 			"of runs that have ended, never a young cluster", minAge, JanitorMinimumAge)
 	}
-	plan := DeletionPlan{PersistentStorage: kubernetesservice.RetainPersistentStorage}
+	plan := DeletionPlan{PersistentStorage: kubernetesservice.DeletePersistentStorage}
 	for _, cluster := range clusters {
 		if !strings.HasPrefix(cluster.Name, prefix+"-") {
 			continue
@@ -263,7 +267,8 @@ type JanitorOptions struct {
 	DryRun bool
 }
 
-// RunJanitor lists the clusters and deletes, by ID, those PlanStaleClusters selects.
+// RunJanitor lists the clusters and deletes, by ID, those PlanStaleClusters selects, asking IBM to delete their
+// persistent storage too.
 //
 // Parameters:
 //   - ctx bounds the requests.

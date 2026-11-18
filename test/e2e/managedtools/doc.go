@@ -24,8 +24,8 @@ limitations under the License.
 //     that shape, so both sides share one validated builder.
 //   - The janitor (janitor.go): it deletes, by IBM cluster ID only, the clusters a crashed run left behind (name
 //     starts with "<prefix>-", older than four hours) and, as the backstop of a lane's cleanup, the run's own clusters.
-//     The backstop asks IBM to delete the persistent storage of the run's clusters too; the janitor asks IBM to keep
-//     that of stale clusters, whose selection by prefix and age proves less.
+//     Both ask IBM to delete the persistent storage of the clusters they delete too, because storage kept for a test
+//     cluster stays billed; for a stale cluster no later leftover check would even report it.
 //     A wrong deletion in a shared account is the most expensive mistake an e2e tool can make, so the selection rules
 //     are pure functions with table tests and the HTTP calls are tested against httptest servers.
 //   - The inventory diff (inventory.go): a snapshot of clusters, VPC load balancers, VPE gateways, security groups

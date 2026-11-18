@@ -1376,9 +1376,10 @@ func (l *managedLane) capiCleanup(ctx SpecContext) {
 }
 
 // ibmBackstop deletes, by ID and asking IBM to delete its persistent storage too, the run's own IBM cluster if it still
-// exists after the CAPI deletion: an interrupted or failed lane must not leave a billable cluster until the janitor's
-// next run, nor billable volumes at all, because the janitor asks IBM to keep those. It fails the lane when the CAPI
-// deletion had reported success, because then CAPIBM let the Cluster go while IBM still had the cluster.
+// exists after the CAPI deletion: an interrupted or failed lane must not leave a billable cluster and its billable
+// volumes until the janitor's next run, which may be far off, or never come with E2E_MANAGED_JANITOR=false. It fails
+// the lane when the CAPI deletion had reported success, because then CAPIBM let the Cluster go while IBM still had the
+// cluster.
 func (l *managedLane) ibmBackstop(ctx SpecContext) {
 	if l.runStart.IsZero() {
 		return

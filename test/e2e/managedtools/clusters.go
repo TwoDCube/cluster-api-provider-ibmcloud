@@ -96,8 +96,8 @@ func deleteResourcesQuery(storage kubernetesservice.PersistentStorage) (string, 
 	case kubernetesservice.DeletePersistentStorage:
 		return "true", nil
 	default:
-		return "", fmt.Errorf("the persistent storage choice %q is neither %q nor %q; the janitor asks IBM to keep the "+
-			"storage of stale clusters, the backstop asks IBM to delete the storage of the run's own clusters", storage,
+		return "", fmt.Errorf("the persistent storage choice %q is neither %q nor %q; the janitor and the backstop ask "+
+			"IBM to delete the storage of every e2e cluster they delete", storage,
 			kubernetesservice.RetainPersistentStorage, kubernetesservice.DeletePersistentStorage)
 	}
 }
