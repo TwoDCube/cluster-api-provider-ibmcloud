@@ -657,7 +657,7 @@ func TestDeleteCluster(t *testing.T) {
 	// A choice that is neither Retain nor Delete, including the zero value of a forgotten argument and the API's
 	// lower-case typo, is refused before anything is sent: the data's fate is never guessed.
 	for _, storage := range []PersistentStorage{"", "delete", "true", "Keep"} {
-		t.Run(fmt.Sprintf("the persistent storage choice %q is refused before sending", storage), func(t *testing.T) {
+		t.Run(`the persistent storage choice "`+string(storage)+`" is refused before sending`, func(t *testing.T) {
 			g := NewWithT(t)
 			fake := newFakeIKS(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 			service, limiter := newTestService(t, fake)
