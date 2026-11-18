@@ -68,8 +68,10 @@ IBM's documentation conflicts on what `Delete` removes:
 
 Both pages say that statically provisioned storage and storage of a storage class with `reclaimPolicy: Retain` remain,
 and are billed (IBM deletes only their PersistentVolume and PersistentVolumeClaim); the first adds that the storage of a
-cluster deleted in an unhealthy state may remain as well. Which volumes IBM deletes with `Delete` is not yet verified
-against IBM Cloud. So treat `Delete` as a request, not a guarantee: before you delete the Cluster, list its persistent
+cluster deleted in an unhealthy state may remain as well. Observed on IBM Cloud (IKS 1.36 on VPC, a volume of IBM's
+default storage class `ibmc-vpc-block-10iops-tier` with `reclaimPolicy: Delete`): with `Delete` the volume was gone
+when IBM reported the cluster deleted; with `Retain` it remained, unattached. That covers one storage class on a healthy
+cluster, so treat `Delete` as a request, not a guarantee: before you delete the Cluster, list its persistent
 volumes on the workload cluster, and after the deletion delete the VPC Block volumes that remain. The IBM VPC Block CSI
 driver names each volume after its PersistentVolume (`pvc-<uid>`), and the PersistentVolume's volume handle is the
 volume's ID:
