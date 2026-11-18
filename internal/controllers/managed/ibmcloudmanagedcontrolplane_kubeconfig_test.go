@@ -52,6 +52,7 @@ import (
 	"sigs.k8s.io/cluster-api/util/kubeconfig"
 
 	controlplanev1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/managed/controlplane/v1alpha1"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/credentials"
 	managedscope "sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/scope/managed"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice"
 	ksmock "sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/kubernetesservice/mock"
@@ -1523,6 +1524,43 @@ func TestControlPlaneKubeconfigFailures(t *testing.T) {
 		g.Expect(f.kubeconfigSecret()).To(BeNil())
 		g.Expect(prober.calls()).To(BeEmpty(), "nothing to verify")
 	})
+
+	// A refused API key reads as it does on IBMClusterProvisioned: IBM's 401 and the IAM token service's refusal are
+	// told apart, and IAM's status is named as IAM's, never as an answer of IBM Cloud Kubernetes Service.
+	for _, tc := range []struct {
+		name        string
+		err         error
+		wantRefusal string
+	}{
+		{name: "a_401_of_the_admin_kubeconfig_fetch_names_IBM_and_its_status",
+			err: ibmError(kubernetesservice.OpGetAdminKubeconfig, http.StatusUnauthorized, ""),
+			wantRefusal: "IBM Cloud rejected the credentials of the CAPIBM controller identity with HTTP 401 while fetching " +
+				"the admin kubeconfig of IBM cluster iksclusterid00000001"},
+		{name: "an_IAM_refusal_of_the_admin_kubeconfig_fetch_names_IAM_and_its_status",
+			err: iamRejectedError(kubernetesservice.OpGetAdminKubeconfig),
+			wantRefusal: "The IAM token service of IBM Cloud rejected the credentials of the CAPIBM controller identity with " +
+				"HTTP 400 while fetching the admin kubeconfig of IBM cluster iksclusterid00000001, so the request was not sent"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			f, prober := newKubeconfigFixture(t, nil)
+			gomock.InOrder(f.expectObserve(cpCluster("normal")),
+				f.kube.EXPECT().GetAdminKubeconfig(gomock.Any(), cpIKSClusterID).Return(nil, tc.err))
+
+			result, err := f.reconcile()
+
+			g.Expect(err).NotTo(HaveOccurred())
+			expectRequeue(g, result, 5*time.Minute) // the steady interval, with only this identity's authenticator rebuilt
+			g.Expect(f.builder.invalidated).To(Equal([]credentials.IdentityKey{credentials.ControllerKey()}))
+			condition := expectCondition(g, f.controlPlane(), controlplanev1.IBMCloudManagedControlPlaneKubeconfigReadyCondition,
+				metav1.ConditionFalse, controlplanev1.IBMCloudManagedControlPlaneKubeconfigReadyCredentialFetchFailedReason)
+			g.Expect(condition.Message).To(Equal(tc.wantRefusal + "; CAPIBM rebuilds its authenticator; check that the API key " +
+				"of the CAPIBM controller identity is valid and not deleted; CAPIBM writes Secret dev-kubeconfig only once a new " +
+				"kubeconfig passes the probe, and tries again after a backoff"))
+			g.Expect(f.kubeconfigSecret()).To(BeNil())
+			g.Expect(prober.calls()).To(BeEmpty(), "nothing to verify")
+		})
+	}
 
 	t.Run("a failed Secret write is retried with backoff and reported", func(t *testing.T) {
 		g := NewWithT(t)

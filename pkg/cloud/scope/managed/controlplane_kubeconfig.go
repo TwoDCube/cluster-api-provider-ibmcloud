@@ -1436,9 +1436,13 @@ func (s *ControlPlaneScope) unusablePartsReport(ctx context.Context, c *kubernet
 
 // fetchFailed reports a failed GetAdminKubeconfig or GetCACertificate call as CredentialFetchFailed, with IBM's error
 // code only (IBM's incident ID changes with every answer, so it goes to the controller log) and the identity by its
-// Description, and maps its error class to the outcome: a 401 rebuilds only this identity's authenticator and is
-// retried at the steady interval (5 m), a 403 or a 400 at terminalRecheck (15 m), a 429 after max(Retry-After, 30 s),
-// and a 5xx or a network failure returns the error for controller-runtime's backoff. The stored Secret stays as it is.
+// Description, and maps its error class to the outcome: a 401, or the IAM token service's refusal of the API key
+// before the request was sent, rebuilds only this identity's authenticator and is retried at the steady interval
+// (5 m), a 403 or a 400 at terminalRecheck (15 m), a 429 after max(Retry-After, 30 s), and a 5xx or a network failure
+// returns the error for controller-runtime's backoff. A refused API key is reported like on IBMClusterProvisioned
+// (credentialsRejection), with IAM's status, so that it is not read as an answer of IBM Cloud Kubernetes Service; the
+// message names no retry time, because the refresh ends it with its own note on when it tries again
+// (refreshFailureNote). The stored Secret stays as it is.
 //
 // Parameters:
 //   - ctx carries the reconcile's logger.
@@ -1456,8 +1460,8 @@ func (s *ControlPlaneScope) fetchFailed(ctx context.Context, clients *controlPla
 	case kubernetesservice.ClassUnauthorized:
 		s.params.ClientBuilder.InvalidateAuthenticator(clients.identity.Key)
 		return &kubeconfigReport{reason: reason, outcome: NotDone(IntervalSteadyState, reason),
-			message: fmt.Sprintf("IBM Cloud rejected the credentials of %s while %s; CAPIBM rebuilds its authenticator; check "+
-				"that the API key of %s is valid and not deleted", identity, action, identity)}
+			message: fmt.Sprintf("%s; CAPIBM rebuilds its authenticator; check that the API key of %s is valid and not deleted",
+				credentialsRejection(identity, action, err), identity)}
 	case kubernetesservice.ClassPermissionDenied:
 		return &kubeconfigReport{reason: reason, outcome: NotDone(IntervalTerminalRecheck, reason),
 			message: cpPermissionDeniedMessage(identity, action, cpIBMCode(err), s.InfraCluster.Spec.ResourceGroup.ID)}
