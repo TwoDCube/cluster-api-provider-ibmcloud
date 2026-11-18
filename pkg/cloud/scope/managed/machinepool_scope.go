@@ -449,9 +449,15 @@ func (s *MachinePoolScope) findPool(ctx context.Context, clients *poolClients) (
 	}
 	if pool.Flavor != s.Pool.Spec.Flavor {
 		reason := infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyPoolConflictReason
+		// spec.poolName and spec.flavor are immutable, so on the CAPIBM side the fix is a new pool object under another
+		// name. The message does not suggest removing the foreign IBM pool, which CAPIBM never touches and which may be
+		// someone else's; once it is gone, a later check finds no pool and creates this object's own. The message says
+		// that deleting this object leaves the IBM pool alone, so that nobody hesitates to delete it for fear of losing
+		// the foreign pool's workers.
 		message := fmt.Sprintf("IBM worker pool %s of cluster %s has flavor %s, but spec.flavor is %s; it is not this "+
-			"object's pool, so CAPIBM neither publishes its workers, sizes it nor removes it; choose another spec.poolName",
-			pool.Name, clusterID, pool.Flavor, s.Pool.Spec.Flavor)
+			"object's pool, so CAPIBM neither publishes its workers, sizes it nor removes it; spec.poolName is immutable, "+
+			"so delete MachinePool %s, which leaves that IBM pool alone, and create the pool again with another spec.poolName",
+			pool.Name, clusterID, pool.Flavor, s.Pool.Spec.Flavor, s.MachinePool.Name)
 		s.report(reason, message)
 		return nil, Terminal(reason, message), true
 	}
@@ -844,10 +850,12 @@ func (s *MachinePoolScope) reportReadiness(pool *kubernetesservice.WorkerPool, w
 }
 
 // ibmProblem turns a failed IBM Cloud Kubernetes Service call into an outcome by its kubernetesservice.Classify
-// class. A 401 invalidates only this identity's authenticator; 401 and 403 messages name the identity by its
-// Description; a 400 and a 403 need a human. Transient failures and 429 leave the conditions as they are, so a blip
-// does not flip a ready pool. Messages carry the HTTP status and IBM's code, never IBM's description or incident ID,
-// so a repeated failure writes nothing new; the outcome hands the full error to the controller log.
+// class. A 401, or the IAM token service's refusal of the API key before the request was sent, invalidates only this
+// identity's authenticator; 401 and 403 messages name the identity by its Description; a 400 and a 403 need a human.
+// Transient failures and 429 leave the conditions as they are, so a blip does not flip a ready pool. Messages carry
+// the HTTP status and IBM's code, never IBM's description or incident ID, so a repeated failure writes nothing new; a
+// refused API key carries IAM's status instead and says so (credentialsRejection), like the control plane's
+// conditions. The outcome hands the full error to the controller log.
 //
 // Parameters:
 //   - clients are this reconcile's IBM clients; their identity made the call.
@@ -883,10 +891,12 @@ func (s *MachinePoolScope) ibmProblemOn(report func(reason, message string), cli
 	}
 	switch kubernetesservice.Classify(op, err) {
 	case kubernetesservice.ClassUnauthorized:
-		// Only this identity's authenticator is rebuilt, on its next use; other identities keep theirs.
+		// Only this identity's authenticator is rebuilt, on its next use; other identities keep theirs. The message names
+		// no retry time: a refused worker removal call is repeated once its flow's DisruptionSettleDelay has passed, not
+		// at the steady interval.
 		s.params.ClientBuilder.InvalidateAuthenticator(clients.identity.Key)
-		report(reason, fmt.Sprintf("IBM Cloud rejected the credentials of %s while %s; CAPIBM rebuilds them and retries",
-			clients.identity.Description, action))
+		report(reason, fmt.Sprintf("%s; CAPIBM rebuilds its authenticator and retries; check that the API key of %s is "+
+			"valid and not deleted", credentialsRejection(clients.identity.Description, action, err), clients.identity.Description))
 		return NotDone(IntervalSteadyState, reason)
 	case kubernetesservice.ClassPermissionDenied, kubernetesservice.ClassAutoscaled:
 		// IBM's autoscaled-pool 403 means ExternallyAutoscaled only for a pool IBM reports autoscaleEnabled, and every

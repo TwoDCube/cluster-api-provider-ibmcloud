@@ -616,14 +616,21 @@ func TestMachinePoolScopeFindsThePool(t *testing.T) {
 	t.Run("a_pool_of_another_flavor_is_not_ours", func(t *testing.T) {
 		g := NewWithT(t)
 		f := newPoolFixture(t)
+		f.machinePool.Name = "workers-machines"
 		f.pool.Spec.ProviderIDList = []string{providerIDOf("w0")}
 		foreign := ibmPool("workers", 2, "us-south-1", "us-south-2")
 		foreign.Flavor = "cx2.2x4"
 		f.ibm.EXPECT().ListWorkerPools(gomock.Any(), poolTestClusterID).Return([]kubernetesservice.WorkerPool{foreign}, nil)
 		outcome := f.scope().ReconcileNormal(context.Background())
 		g.Expect(outcome.Kind).To(Equal(OutcomeTerminal))
-		g.Expect(condition(f.pool, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCondition).Reason).
-			To(Equal(infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyPoolConflictReason))
+		ready := condition(f.pool, infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyCondition)
+		g.Expect(ready.Reason).To(Equal(infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyPoolConflictReason))
+		// spec.poolName is immutable, so the message asks for a new pool object under another name and says that
+		// deleting this one leaves the foreign pool alone.
+		g.Expect(ready.Message).To(Equal("IBM worker pool workers of cluster " + poolTestClusterID + " has flavor cx2.2x4, " +
+			"but spec.flavor is " + poolTestFlavor + "; it is not this object's pool, so CAPIBM neither publishes its " +
+			"workers, sizes it nor removes it; spec.poolName is immutable, so delete MachinePool workers-machines, which " +
+			"leaves that IBM pool alone, and create the pool again with another spec.poolName"))
 		g.Expect(f.pool.Status.PoolID).To(BeEmpty())
 		g.Expect(f.pool.Spec.ProviderIDList).To(Equal([]string{providerIDOf("w0")}))
 		g.Expect(f.pool.Status.Ready).To(BeNil())
@@ -1225,7 +1232,20 @@ func TestMachinePoolScopeIBMErrors(t *testing.T) {
 	}{
 		{
 			name: "401 rebuilds the identity's authenticator", err: apiError(kubernetesservice.OpListWorkerPools, http.StatusUnauthorized, ""),
-			wantKind: OutcomeNotDone, wantCondition: "IBM Cloud rejected the credentials of the CAPIBM controller identity while listing the worker pools",
+			wantKind: OutcomeNotDone,
+			wantCondition: "IBM Cloud rejected the credentials of the CAPIBM controller identity with HTTP 401 while listing " +
+				"the worker pools of IBM cluster " + poolTestClusterID + "; CAPIBM rebuilds its authenticator and retries; check " +
+				"that the API key of the CAPIBM controller identity is valid and not deleted",
+			invalidated: true,
+		},
+		{
+			// IAM's status is no answer of IBM Cloud Kubernetes Service, so the message names the IAM token service.
+			name: "an IAM refusal names IAM and its status and rebuilds the identity's authenticator",
+			err:  iamRejected(kubernetesservice.OpListWorkerPools), wantKind: OutcomeNotDone,
+			wantCondition: "The IAM token service of IBM Cloud rejected the credentials of the CAPIBM controller identity with " +
+				"HTTP 400 while listing the worker pools of IBM cluster " + poolTestClusterID + ", so the request was not sent; " +
+				"CAPIBM rebuilds its authenticator and retries; check that the API key of the CAPIBM controller identity is " +
+				"valid and not deleted",
 			invalidated: true,
 		},
 		{
@@ -1277,7 +1297,13 @@ func TestMachinePoolScopeIBMProblemOn(t *testing.T) {
 	}{
 		{name: "401 rebuilds the identity's authenticator", err: apiError(kubernetesservice.OpReplaceWorker, http.StatusUnauthorized, ""),
 			wantKind: OutcomeNotDone, invalidated: true,
-			wantMessage: "IBM Cloud rejected the credentials of the test identity while " + action + "; CAPIBM rebuilds them and retries"},
+			wantMessage: "IBM Cloud rejected the credentials of the test identity with HTTP 401 while " + action + "; CAPIBM " +
+				"rebuilds its authenticator and retries; check that the API key of the test identity is valid and not deleted"},
+		{name: "an IAM refusal names IAM and its status", err: iamRejected(kubernetesservice.OpReplaceWorker),
+			wantKind: OutcomeNotDone, invalidated: true,
+			wantMessage: "The IAM token service of IBM Cloud rejected the credentials of the test identity with HTTP 400 while " +
+				action + ", so the request was not sent; CAPIBM rebuilds its authenticator and retries; check that the API key " +
+				"of the test identity is valid and not deleted"},
 		{name: "403 names the roles and the code only", err: apiError(kubernetesservice.OpReplaceWorker, http.StatusForbidden, "E3e8a"),
 			wantKind: OutcomeTerminal,
 			wantMessage: "IBM Cloud refused the test identity (HTTP 403, code E3e8a) while " + action + "; grant it the Administrator " +
