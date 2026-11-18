@@ -211,15 +211,17 @@ type DeletionSpec struct {
 	// Retain sends IBM's DELETE with deleteResources=false: IBM keeps the storage of the cluster's persistent volumes,
 	// such as their VPC Block volumes, and it stays in the account, and is billed, until you delete it.
 	// Delete sends deleteResources=true, the API form of "ibmcloud ks cluster rm --delete-storage": CAPIBM asks IBM to
-	// delete the cluster's persistent storage, and what IBM deletes cannot be recovered. What IBM deletes is not certain,
-	// because IBM's documentation conflicts: its page on removing VPC Block storage says that IBM deletes the storage
-	// that a storage class with reclaimPolicy Delete provisioned, while its newer page on removing clusters says that
-	// VPC Block Storage is not removed automatically, even with such a storage class. Both pages say that statically
+	// delete the cluster's persistent storage, and what IBM deletes cannot be recovered. IBM's documentation conflicts
+	// on what that is: its page on removing VPC Block storage says that IBM deletes the storage that a storage class
+	// with reclaimPolicy Delete provisioned, while its newer page on removing clusters says that VPC Block Storage is
+	// not removed automatically, even with such a storage class. Observed on IBM Cloud (IKS 1.36 on VPC, a volume of
+	// IBM's default storage class ibmc-vpc-block-10iops-tier, reclaimPolicy Delete): with Delete the volume was gone
+	// when IBM reported the cluster deleted; with Retain it remained, unattached. Both pages say that statically
 	// provisioned storage and storage of a storage class with reclaimPolicy Retain remain; the first adds that the
-	// storage of a cluster deleted in an unhealthy state may remain too. So with Delete, VPC Block volumes may remain
-	// and stay billed: check for them after the deletion and delete those that remain. Which volumes IBM deletes is not
-	// yet verified against IBM Cloud. On VPC, Delete asks for nothing else: IBM deletes subnets with a cluster only on
-	// classic infrastructure, and CAPIBM never deletes VPC resources.
+	// storage of a cluster deleted in an unhealthy state may remain too. So with Delete, such VPC Block volumes may
+	// remain and stay billed: check for them after the deletion and delete those that remain. On VPC, Delete asks for
+	// nothing else: IBM deletes subnets with a cluster only on classic infrastructure, and CAPIBM never deletes VPC
+	// resources.
 	// Neither value deletes the OpenShift registry bucket in the Cloud Object Storage instance.
 	// CAPIBM reads this field each time it sends IBM's DELETE, so set it before the Cluster is deleted: a change made
 	// after CAPIBM sent its DELETE takes effect only if CAPIBM sends the DELETE again, which it does when IBM does not
