@@ -126,11 +126,13 @@ func TestPoolGuards(t *testing.T) {
 			},
 			wantReason: infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyPoolNameConflictReason,
 			// The whole message: spec.poolName cannot be changed, so the fix is a deletion of every claimant but the one
-			// that already manages the IBM pool.
+			// that already manages the IBM pool, and deleting every claimant removes the IBM pool, which the message must
+			// not deny.
 			wantMessage: []string{`IBMCloudManagedMachinePool pool-c also set spec.poolName "default"; while more than one ` +
 				"object of the Cluster claims an IBM worker pool, none of them creates, sizes or publishes it; spec.poolName " +
 				"is immutable, so delete the MachinePool of every claimant but one, and keep the one whose status.poolID is " +
-				"set, if any"},
+				"set, if any; a claimant's deletion leaves the IBM pool alone only while another claimant that is not being " +
+				"deleted remains, so deleting all of them removes the IBM pool and its workers"},
 			wantStops: true,
 		},
 		{

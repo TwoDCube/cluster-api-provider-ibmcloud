@@ -178,11 +178,15 @@ func PoolGuards(in PoolGuardInput) (PoolGuardResult, error) {
 		result.Reason = infrav1.IBMCloudManagedMachinePoolWorkerPoolReadyPoolNameConflictReason
 		result.StopsPublication = true
 		// The fix is a deletion, because spec.poolName is immutable. The message names the claimant to keep: the one
-		// whose status.poolID is set already manages the IBM pool, so keeping it changes nothing for that pool.
+		// whose status.poolID is set already manages the IBM pool, so keeping it changes nothing for that pool. A
+		// deletion can remove the IBM pool: a claimant's deletion leaves it alone only while another claimant that is not
+		// being deleted remains (MachinePoolScope.liveClaimants), so the last one to go removes it like any other pool.
+		// The message says so, because deleting every claimant to start over would drain and remove the workers.
 		result.Message = fmt.Sprintf("IBMCloudManagedMachinePool %s also set spec.poolName %q; while more than one "+
 			"object of the Cluster claims an IBM worker pool, none of them creates, sizes or publishes it; spec.poolName is "+
 			"immutable, so delete the MachinePool of every claimant but one, and keep the one whose status.poolID is set, "+
-			"if any", boundedList(others), in.Pool.Spec.PoolName)
+			"if any; a claimant's deletion leaves the IBM pool alone only while another claimant that is not being deleted "+
+			"remains, so deleting all of them removes the IBM pool and its workers", boundedList(others), in.Pool.Spec.PoolName)
 		return result, nil
 	}
 	if reason, message := in.zoneGuard(zones); reason != "" {

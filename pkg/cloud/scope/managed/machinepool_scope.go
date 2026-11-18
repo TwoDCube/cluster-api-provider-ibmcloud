@@ -452,8 +452,8 @@ func (s *MachinePoolScope) findPool(ctx context.Context, clients *poolClients) (
 		// spec.poolName and spec.flavor are immutable, so on the CAPIBM side the fix is a new pool object under another
 		// name. The message does not suggest removing the foreign IBM pool, which CAPIBM never touches and which may be
 		// someone else's; once it is gone, a later check finds no pool and creates this object's own. The message says
-		// that deleting this object leaves the IBM pool alone, so that nobody hesitates to delete it for fear of losing
-		// the foreign pool's workers.
+		// that deleting this object leaves the IBM pool alone (poolToRemove skips a pool of another flavor), so that
+		// nobody hesitates to delete it for fear of losing the foreign pool's workers.
 		message := fmt.Sprintf("IBM worker pool %s of cluster %s has flavor %s, but spec.flavor is %s; it is not this "+
 			"object's pool, so CAPIBM neither publishes its workers, sizes it nor removes it; spec.poolName is immutable, "+
 			"so delete MachinePool %s, which leaves that IBM pool alone, and create the pool again with another spec.poolName",
