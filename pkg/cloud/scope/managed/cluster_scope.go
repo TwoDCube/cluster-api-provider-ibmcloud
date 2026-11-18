@@ -538,11 +538,15 @@ func (s *ClusterScope) callProblem(identity credentials.Identity, action, role s
 		notFound.outcome = Terminal(notFound.reason, notFound.message)
 		return notFound
 	case status == http.StatusUnauthorized:
-		// Only this identity's authenticator is rebuilt, on its next use; other identities keep theirs.
+		// Only this identity's authenticator is rebuilt, on its next use; other identities keep theirs. The message ends
+		// like the IAM refusal's above, because the fix is the same: no role is missing, the API key is not accepted.
+		// Unlike the IAM refusal, the request reached the service, so the message names its status.
 		s.params.ClientBuilder.InvalidateAuthenticator(identity.Key)
 		return &networkProblem{
-			reason:  reason,
-			message: fmt.Sprintf("IBM Cloud rejected the credentials of %s (HTTP 401) while %s; CAPIBM rebuilds them and retries", identity.Description, action),
+			reason: reason,
+			message: fmt.Sprintf("IBM Cloud rejected the credentials of %s with HTTP 401 while %s; CAPIBM rebuilds its "+
+				"authenticator and retries in about 5 minutes; check that the API key of %s is valid and not deleted",
+				identity.Description, action, identity.Description),
 			outcome: NotDone(IntervalSteadyState, reason),
 		}
 	case status == http.StatusForbidden:

@@ -474,12 +474,15 @@ func TestReconcileNetworkClassifiesIBMErrors(t *testing.T) {
 		wantInvalidated bool
 	}{
 		{
-			name:            "401 invalidates the identity's authenticator and rechecks at the steady interval",
-			response:        status(http.StatusUnauthorized),
-			wantKind:        OutcomeNotDone,
-			wantInterval:    IntervalSteadyState,
-			wantCondition:   metav1.ConditionFalse,
-			wantMessage:     "IBM Cloud rejected the credentials of the CAPIBM controller identity (HTTP 401) while getting resource group",
+			// The whole message: the status, the retry and the API key to check, as after an IAM refusal.
+			name:          "401 invalidates the identity's authenticator and rechecks at the steady interval",
+			response:      status(http.StatusUnauthorized),
+			wantKind:      OutcomeNotDone,
+			wantInterval:  IntervalSteadyState,
+			wantCondition: metav1.ConditionFalse,
+			wantMessage: "IBM Cloud rejected the credentials of the CAPIBM controller identity with HTTP 401 while getting " +
+				"resource group 0123456789abcdef0123456789abcdef; CAPIBM rebuilds its authenticator and retries in about 5 " +
+				"minutes; check that the API key of the CAPIBM controller identity is valid and not deleted",
 			wantInvalidated: true,
 		},
 		{
