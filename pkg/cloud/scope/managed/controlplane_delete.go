@@ -448,7 +448,9 @@ func LeftoverResourcesMessage(clusterID, vpcID string, distribution controlplane
 //     the newer "Removing clusters" (https://cloud.ibm.com/docs/containers?topic=containers-remove, last updated
 //     2026-08-03) says in its removal steps that VPC Block Storage is not removed automatically, even with a Delete
 //     storage class. Both say that statically provisioned storage and storage of a reclaimPolicy Retain class remain.
-//     A user who asked for the deletion must therefore learn that VPC Block volumes may remain, stay billed, and need
+//     Observed on IBM Cloud (IKS 1.36, a volume of ibmc-vpc-block-10iops-tier, reclaimPolicy Delete), the volume was
+//     gone when IBM reported the cluster deleted, but that covers one storage class on a healthy cluster. A user who
+//     asked for the deletion must therefore still learn that VPC Block volumes may remain, stay billed, and need
 //     checking.
 //
 // Parameters:

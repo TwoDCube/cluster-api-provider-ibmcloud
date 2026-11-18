@@ -212,11 +212,13 @@ const (
 	RetainPersistentStorage PersistentStorage = "Retain"
 	// DeletePersistentStorage sends deleteResources=true, the API form of "ibmcloud ks cluster rm --delete-storage":
 	// it asks IBM to delete the cluster's persistent storage (on VPC nothing else: IBM removes subnets with a cluster
-	// only on classic infrastructure), and deleted data cannot be recovered. What IBM deletes is uncertain: its page
-	// "Removing Block Storage for VPC" (last updated 2026-05-14) says the storage that a storage class with
-	// reclaimPolicy Delete provisioned goes with the cluster, while its newer page "Removing clusters" (last updated
-	// 2026-08-03) says that VPC Block Storage is not removed automatically, even with such a storage class. Callers must
-	// not report the storage as deleted.
+	// only on classic infrastructure), and deleted data cannot be recovered. IBM's documentation conflicts on what it
+	// deletes: its page "Removing Block Storage for VPC" (last updated 2026-05-14) says the storage that a storage class
+	// with reclaimPolicy Delete provisioned goes with the cluster, while its newer page "Removing clusters" (last
+	// updated 2026-08-03) says that VPC Block Storage is not removed automatically, even with such a storage class.
+	// Observed on IBM Cloud (IKS 1.36, a volume of ibmc-vpc-block-10iops-tier, reclaimPolicy Delete): the volume was
+	// gone when IBM reported the cluster deleted. Other storage (static, reclaimPolicy Retain, an unhealthy cluster)
+	// may remain, so callers must not report the storage as deleted.
 	DeletePersistentStorage PersistentStorage = "Delete"
 )
 
