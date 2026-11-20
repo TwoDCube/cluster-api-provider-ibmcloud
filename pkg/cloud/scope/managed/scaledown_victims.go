@@ -30,9 +30,10 @@ import (
 // This file predicts which workers IBM removes when CAPIBM shrinks a pool. resizeWorkerPool cannot name a victim, and
 // removeWorker would disable IBM's auto-rebalance for the pool (ts-worker-autorebalance.md:37-50), so CAPIBM predicts
 // IBM's victims from IBM's documented order, drains them before the resize, and verifies the prediction afterwards
-// (UnexpectedScaleDownVictim). Whether resizeWorkerPool follows the documented order is not yet verified against IBM
-// Cloud; the fallback, resizing without the prediction, is ScaleDownMode in assumptions.go. The order below is IBM's
-// documentation, not a live fact, which is why it lives here.
+// (UnexpectedScaleDownVictim). Observed on IBM Cloud (IKS, workers all deployed, normal and on one version):
+// resizeWorkerPool removed exactly the predicted victims. Not yet verified for workers in other states or on several
+// versions, nor on ROKS; the fallback, resizing without the prediction, is ScaleDownMode in assumptions.go. The order
+// below is IBM's documentation, which is why it lives here.
 
 // workerStateDeploying is the lifecycle.actualState of a worker IBM is deploying (observed on IBM Cloud: provisioning,
 // then deploying, then deployed).

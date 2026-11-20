@@ -47,7 +47,8 @@ import (
 
 const (
 	// EventUnexpectedScaleDownVictim is the Warning event emitted when IBM's resize removes other workers than the
-	// predicted victims. It names both sets. That IBM removes the predicted victims is not yet verified against IBM Cloud.
+	// predicted victims. It names both sets. IBM removed exactly the predicted victims when observed on IBM Cloud (IKS,
+	// healthy workers on one version); other cases are not yet verified.
 	EventUnexpectedScaleDownVictim = "UnexpectedScaleDownVictim"
 
 	// EventNodeUncordoned is the Normal event emitted when a removal is given up before its IBM call and CAPIBM reverts

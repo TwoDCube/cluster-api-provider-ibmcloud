@@ -699,21 +699,22 @@ func PoolMutationAllowed(state string, op PoolOperation) bool {
 
 // Scale-down.
 
-// ScaleDownStrategy is how a pool shrinks. Not yet verified against IBM Cloud (see ScaleDownMode).
+// ScaleDownStrategy is how a pool shrinks. Partly verified against IBM Cloud (see ScaleDownMode).
 type ScaleDownStrategy string
 
 const (
 	// ScaleDownPredictThenResize predicts the workers IBM removes, drains them, resizes, and verifies the prediction.
-	// Not yet verified against IBM Cloud (see ScaleDownMode).
+	// Observed on IBM Cloud for healthy IKS workers; other cases are not yet verified (see ScaleDownMode).
 	ScaleDownPredictThenResize ScaleDownStrategy = "PredictThenResize"
 	// ScaleDownResizeOnly resizes without draining first; the book warns that PodDisruptionBudgets are then not
 	// honoured. Not yet verified against IBM Cloud (see ScaleDownMode).
 	ScaleDownResizeOnly ScaleDownStrategy = "ResizeOnly"
 )
 
-// ScaleDownMode is the strategy the pool controller uses. Not yet verified against IBM Cloud: whether
-// resizeWorkerPool removes exactly the predicted victims, and whether a cordon changes IBM's ranking; default
-// ScaleDownPredictThenResize; fallback: ScaleDownResizeOnly.
+// ScaleDownMode is the strategy the pool controller uses: default ScaleDownPredictThenResize; fallback:
+// ScaleDownResizeOnly. Observed on IBM Cloud (IKS, healthy workers on one version, the predicted victims cordoned):
+// resizeWorkerPool removed exactly the predicted victims, so a cordon did not change IBM's ranking there. Not yet
+// verified for workers in other states or on several versions, nor on ROKS.
 const ScaleDownMode = ScaleDownPredictThenResize
 
 // Master minor update.
