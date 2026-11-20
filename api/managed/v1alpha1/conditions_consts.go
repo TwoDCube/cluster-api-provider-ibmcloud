@@ -71,7 +71,7 @@ const (
 	IBMCloudManagedClusterNetworkReadySubnetNameAmbiguousReason = "SubnetNameAmbiguous"
 
 	// IBMCloudManagedClusterNetworkReadyIBMAPIErrorReason surfaces any other classified IBM Cloud API error; the message
-	// carries the normalised IBM text and incident ID.
+	// names the call and its HTTP status, never IBM's free text or trace ID, which change with every answer.
 	IBMCloudManagedClusterNetworkReadyIBMAPIErrorReason = "IBMAPIError"
 
 	// IBMCloudManagedClusterPausedCondition reports whether reconciliation is paused (util/paused).
