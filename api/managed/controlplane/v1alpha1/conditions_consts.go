@@ -21,8 +21,8 @@ import (
 )
 
 // This file is the condition catalogue of IBMCloudManagedControlPlane. Only condition types and reasons live here;
-// IBM text goes into the condition message (normalised, with the IBM incident ID), never into a reason, so reasons
-// stay stable CamelCase tokens that tooling can match.
+// what IBM answered goes into the condition message (its HTTP status and error code, never its incident ID, which
+// changes with every answer), never into a reason, so reasons stay stable CamelCase tokens that tooling can match.
 //
 // Naming follows the CAPI v1beta2 constants and api/managed/v1alpha1:
 //   - a condition type is IBMCloudManagedControlPlane<Condition>Condition;
